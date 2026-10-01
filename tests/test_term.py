@@ -1,5 +1,6 @@
 """The side-panel terminal: /api/term, a hand-written WebSocket onto one shared PTY session.
-The agent is bash, so the tests can drive it."""
+The agent is bash, so the tests can drive it. Linux only: they read /proc and rely on GNU
+tools."""
 import itertools
 import os
 import signal
@@ -10,7 +11,9 @@ import time
 
 import pytest
 
-from helpers import WS, alive, gone_within
+from helpers import WS, alive, gone_within, needs_linux
+
+pytestmark = needs_linux
 
 BASH = "bash --norc --noprofile"
 SEQ = itertools.count(1)
@@ -262,6 +265,22 @@ def test_protocol_errors_close_with_the_right_code(srv):
         main.close()
 
 
+def test_oversized_message_is_drained_after_the_close(srv):
+    """After a 1009 the server reads on (and discards) what the browser is still sending, so
+    the connection ends with our close frame and a FIN, not a reset that could lose it."""
+    c = srv.ws()
+    try:
+        c.wait_status()
+        c.send_frame(2, b"", length=4 * 1024 * 1024 + 1)   # the header, then part of the payload
+        c.sock.sendall(b"p" * (1 << 20))
+        assert c.wait(c.close_frames, 5) and c.close_frames()[0].payload == struct.pack("!H", 1009)
+        assert c.wait_eof(5)
+        time.sleep(0.2)
+        c.sock.sendall(b"p" * (256 << 10))   # the server is still reading: no reset
+    finally:
+        c.abort()
+
+
 def test_replay_and_broadcast_to_a_second_client(srv):
     c1 = running(srv)
     c2 = None
@@ -425,6 +444,67 @@ def test_exec_failure_is_reported(md_editor, tmp_path):
 
 
 # ---------------------------------------------------------------- shutdown and slow clients
+
+def test_a_client_that_stops_answering_pings_is_dropped(md_editor):
+    srv = md_editor(agent=BASH, env={"MDEDIT_WS_PING": "0.5"})
+    gone, live = srv.ws(pong=False), srv.ws()
+    try:
+        for c in (gone, live):
+            c.wait_status()
+        live.resize(100, 30)
+        assert live.wait_status(lambda s: s["state"] == "running")
+        assert gone.wait_eof(5), "dropped after a ping went unanswered"
+        assert [f.op for f in gone.frames if f.op in (9, 10)][:1] == [9]
+        time.sleep(1.5)
+        assert not live.eof and sum(f.op == 9 for f in live.frames) >= 3, "pinged, answered, kept"
+        assert roundtrip(live)
+    finally:
+        gone.abort()
+        live.close()
+
+
+def test_agent_exit_with_a_straggler_holding_the_pty(md_editor, tmp_path):
+    """The agent exits, leaving a process (that ignores SIGHUP) with the PTY open: a second
+    after the PTY goes quiet the session has exited, and the straggler is killed with it."""
+    pidfile = tmp_path / "straggler.pid"
+    srv = md_editor(agent=f"sh -c 'trap \"\" HUP; sleep 1000 & echo $! > {pidfile}; echo AGENT-DONE; exit 3'")
+    c = srv.ws()
+    try:
+        c.wait_status()
+        t0 = time.monotonic()
+        c.resize(80, 24)
+        st = c.wait_status(lambda s: s["state"] == "exited", 15)
+        assert st and st["id"] == 1 and st["code"] == 3, c.statuses()
+        assert time.monotonic() - t0 < 8, "1 s of quiet, then up to 3 s from SIGHUP to SIGKILL"
+        assert c.wait_out("AGENT-DONE")
+        assert gone_within([int(pidfile.read_text())])
+    finally:
+        c.close()
+
+
+def test_restart_kills_a_straggler_that_outlives_the_agent(md_editor, tmp_path):
+    """While a straggler keeps writing after the agent has exited the session still runs (its
+    output is shown), and Restart kills the old group."""
+    pidfile = tmp_path / "straggler.pid"
+    srv = md_editor(agent=f"sh -c 'trap \"\" HUP; (while :; do echo TICK; sleep 0.2; done) & "
+                          f"echo $! > {pidfile}; exit 0'")
+    c = srv.ws()
+    try:
+        c.wait_status()
+        c.resize(80, 24)
+        assert c.wait_status(lambda s: s["state"] == "running")
+        assert c.wait_out("TICK")
+        straggler = int(pidfile.read_text())
+        time.sleep(2)
+        since = c.mark()
+        assert c.wait_out("TICK", since) and alive(straggler)
+        assert not any(s["state"] == "exited" for s in c.statuses())
+        c.send_json({"type": "restart"})
+        assert c.wait_status(lambda s: s["id"] == 2)
+        assert gone_within([straggler])
+    finally:
+        c.close()
+
 
 def test_sigterm_ends_the_whole_session(srv):
     c = running(srv)

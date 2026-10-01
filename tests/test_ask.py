@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from helpers import FAKES, gone_within
+from helpers import FAKES, LINUX_REASON, LINUX_TOOLS, gone_within, needs_linux
 
 from md_collab_editor import server as S
 
@@ -51,8 +51,14 @@ def session_file(srv, sid):
     return next(Path(d) / f for d, _, fs in os.walk(srv.state / "sessions") for f in fs if f == sid + ".json")
 
 
+def same_path(a, b):
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
 @pytest.fixture
 def launcher(md_editor):
+    if not LINUX_TOOLS:   # fakes/fake-sandbox needs Linux tools
+        pytest.skip(LINUX_REASON)
     return md_editor(ask_agent=LAUNCHER)
 
 
@@ -131,8 +137,9 @@ def test_first_card_makes_a_base_then_forks_it(launcher, root):
     assert d["last_request"] and not d["last_doc"], "the card's own message holds no document"
     assert res["session"] == d["session"] != base["session"]
     assert d["tools"] == ["Skill,Read"] and d["allowed"] == ["Skill,Read"] and d["model"] == "haiku"
-    # inside the "container": claude's stdin is a terminal, in the fixed folder
-    assert d["tty"] is True and d["cwd"] == "/tmp/md-editor-ask"
+    # inside the "container": claude's stdin is a terminal, in the fixed folder under ~/.cache,
+    # which claude-sandbox's wrapper always binds into its jail
+    assert d["tty"] is True and same_path(d["cwd"], launcher.state / "container-home/.cache/md-editor/ask")
 
 
 def test_launcher_runs_on_a_pty_with_the_prompt_in_a_private_file(launcher, root):
@@ -148,7 +155,8 @@ def test_launcher_runs_on_a_pty_with_the_prompt_in_a_private_file(launcher, root
         assert run["cwd"] == str(root)
         assert re.fullmatch(re.escape(str(root)) + r"/\.md-editor-ask-[0-9a-f]{32}\.txt", run["prompt_file"])
         assert run["mode"] == "600"
-        assert run["script"].startswith("mkdir -p /tmp/md-editor-ask && cd /tmp/md-editor-ask && prompt=$(cat ")
+        assert run["script"].startswith('mkdir -p "$HOME"/.cache/md-editor/ask && cd "$HOME"/.cache/md-editor/ask '
+                                        "&& prompt=$(cat ")
         assert run["script"].endswith(' -- "$prompt"')
     assert len({r["prompt_file"] for r in runs}) == 2, "a new file per call"
     assert prompt_files(root) == []
@@ -254,6 +262,20 @@ def test_retry_and_refine_fork_the_cards_own_session(launcher):
     assert len(launcher.bases()) == 1
 
 
+def test_retry_after_a_model_switch_forks_the_new_models_base(launcher):
+    """A card's session belongs to the model it was made with: a Retry with another model
+    forks that model's base, not the card's session."""
+    status, res = ask(launcher)
+    status, res2 = ask(launcher, session=res["session"], previous="Attempt one.", instruction="Shorter",
+                       model="sonnet")
+    assert status == 200 and res2["forked"], res2
+    bases = launcher.bases()
+    assert [b["model"] for b in bases] == ["haiku", "sonnet"]
+    d = echo(res2)
+    assert d["parent"] == bases[1]["session"] != res["session"] and d["model"] == "sonnet"
+    assert d["n"] == 2, "the new base's document, then this request"
+
+
 def test_unknown_session_forks_the_base(launcher):
     """A session the server doesn't know (e.g. from before a restart) isn't resumed: the request
     goes to a fork of the document's base session, with the previous attempt in it."""
@@ -287,6 +309,31 @@ def test_failed_base_fork_is_dropped(launcher):
     launcher.flag("fail-resume", False)
     status, res = ask(launcher)
     assert res["forked"] and len(launcher.bases()) == 2, "the next card makes a new base"
+
+
+@pytest.mark.parametrize("failure", ["is-error", "broken-launcher"])
+def test_other_fork_failures_keep_the_base(launcher, failure):
+    """Only claude's own "No conversation found" drops a base: after an API error or a launcher
+    failure the next card forks the same base, without sending the document again."""
+    ask(launcher)
+    base = launcher.bases()[0]["session"]
+    launcher.flag(failure)
+    status, res = ask(launcher)
+    assert status == 502, res
+    launcher.flag(failure, False)
+    status, res = ask(launcher)
+    assert status == 200 and res["forked"] and echo(res)["parent"] == base
+    assert len(launcher.bases()) == 1
+
+
+def test_missing_session_message_is_claudes(tmp_path):
+    """The fake reports a missing session in the words of the real CLI (Claude Code 2.1), on
+    stderr, which is how the server knows to drop it."""
+    (tmp_path / "fail-resume").touch()
+    proc = subprocess.run([NATIVE, "-p", "--resume", "0000", "hi"], capture_output=True, text=True,
+                          env=dict(os.environ, FAKE_CLAUDE_STATE=str(tmp_path)))
+    assert proc.returncode == 1 and proc.stdout == ""
+    assert proc.stderr == f"{S.SESSION_MISSING} 0000\n"
 
 
 def test_system_prompt_is_the_same_for_every_call(launcher):
@@ -348,7 +395,7 @@ def test_ask_needs_a_matching_origin(launcher):
     assert launcher.calls() == []
 
 
-@pytest.mark.parametrize("agent", [LAUNCHER, NATIVE], ids=["launcher", "native"])
+@pytest.mark.parametrize("agent", [pytest.param(LAUNCHER, marks=needs_linux), NATIVE], ids=["launcher", "native"])
 def test_timeout_is_504_and_kills_claude(md_editor, root, agent):
     srv = md_editor(ask_agent=agent, env={"MDEDIT_ASK_TIMEOUT": "2"})
     srv.flag("hang")
@@ -360,6 +407,7 @@ def test_timeout_is_504_and_kills_claude(md_editor, root, agent):
     # the md_editor fixture checks that the hung fake is gone once the server stops
 
 
+@needs_linux
 def test_stopping_md_editor_ends_a_running_call(md_editor, root):
     """The request's thread dies with the server, so the server itself must end the launcher
     (which here ignores the PTY hang-up) and delete the prompt file, and must not start the
@@ -391,8 +439,8 @@ def test_native_mode_uses_pipes_in_a_fixed_folder(native, root):
     assert status == 200 and res["forked"], res
     d = echo(res)
     assert d["n"] == 2 and d["tty"] is False
-    tmp = native.logpath.parent / "tmp"   # the server's TMPDIR
-    assert os.path.realpath(d["cwd"]) == os.path.realpath(tmp / "md-editor-ask")
+    ask_dir = native.logpath.parent / "cache" / "md-editor" / "ask"   # the server's $XDG_CACHE_HOME/...
+    assert same_path(d["cwd"], ask_dir) and ask_dir.stat().st_mode & 0o777 == 0o700
     assert "--" not in native.calls()[-1]["argv"], "the prompt goes on stdin"
     assert native.sandbox_calls() == [] and prompt_files(root) == []
     status, res2 = ask(native, session=res["session"], previous="x", instruction="Shorter")
@@ -461,9 +509,25 @@ def test_base_sessions_one_per_key_and_at_most_32(monkeypatch):
         S.base_session(("cmd", "/r", f"f{i}.md", ""), DOC)
     assert len(S.ASK_BASES) == 32
     assert ("cmd", "/r", "f0.md", "") not in S.ASK_BASES and ("cmd", "/r", "f39.md", "") in S.ASK_BASES
-    assert len(S.ASK_KEY_LOCKS) <= 33
+    assert S.ASK_KEY_LOCKS == {}, "a key's lock lives only while a call holds or waits for it"
     S.forget_session(S.ASK_BASES[("cmd", "/r", "f39.md", "")]["session"])
     assert ("cmd", "/r", "f39.md", "") not in S.ASK_BASES
+
+
+def test_native_ask_dir_is_private(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
+    d = Path(S.native_ask_dir())
+    assert d == tmp_path / "xdg/md-editor/ask" and d.stat().st_mode & 0o777 == 0o700
+    d.chmod(0o777)
+    assert S.native_ask_dir() == str(d) and d.stat().st_mode & 0o777 == 0o700, "made private again"
+    d.rmdir()
+    (tmp_path / "elsewhere").mkdir()
+    d.symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(RuntimeError, match="must be a folder of your own"):
+        S.native_ask_dir()
+    monkeypatch.setenv("XDG_CACHE_HOME", "relative/path")   # ignored, as the XDG spec says
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    assert S.native_ask_dir() == str(tmp_path / "home/.cache/md-editor/ask")
 
 
 def test_read_pty_timeout_and_stragglers(tmp_path):

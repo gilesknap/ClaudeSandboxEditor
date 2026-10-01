@@ -2,8 +2,9 @@
 # Stand-in for `uvx claude-sandbox@latest`: like `podman exec -it` it needs a TTY, it prints
 # launcher noise (colours, a title escape, CRLF line ends from the PTY), and it runs
 # `shell -c SCRIPT` with this folder first on the PATH, so `claude` is the fake next to this
-# file, which then behaves like the container's shadow wrapper (see claude). Like the real
-# `shell` verb it runs SCRIPT in $CLAUDE_SANDBOX_SHELL (bash when unset or missing).
+# file, which then behaves like the container's shadow wrapper (see claude), and with HOME
+# set to $FAKE_CLAUDE_STATE/container-home. Like the real `shell` verb it runs SCRIPT in
+# $CLAUDE_SANDBOX_SHELL (bash when unset or missing).
 # Flag file in $FAKE_CLAUDE_STATE: broken-launcher (fail like a missing container).
 FAKES="$(cd "$(dirname "$0")" && pwd)"
 if [ ! -t 0 ]; then
@@ -30,6 +31,11 @@ print(json.dumps({"script": sys.argv[1], "cwd": os.getcwd(), "prompt_file": sys.
                   "claudecode": os.environ.get("CLAUDECODE"), "shell": os.environ.get("CLAUDE_SANDBOX_SHELL"),
                   "child_session": os.environ.get("CLAUDE_CODE_CHILD_SESSION")}))' \
         "$3" "$pf" "$mode" >> "$FAKE_CLAUDE_STATE/sandbox.log"
+fi
+# the container has a home of its own
+if [ -n "$FAKE_CLAUDE_STATE" ]; then
+    export HOME="$FAKE_CLAUDE_STATE/container-home"
+    mkdir -p "$HOME"
 fi
 want="${CLAUDE_SANDBOX_SHELL:-bash}"
 command -v "$want" >/dev/null || want=bash

@@ -27,7 +27,9 @@ class Servers:
         """start(root=..., agent="none", ask_agent="none", args=(), env=None) -> Server"""
         work = self.base / f"server{len(self.servers)}"
         (work / "tmp").mkdir(parents=True)
-        kw["env"] = dict({"TMPDIR": str(work / "tmp")}, **(kw.get("env") or {}))
+        # native Ask Claude runs in $XDG_CACHE_HOME/md-editor/ask: not the real ~/.cache
+        kw["env"] = dict({"TMPDIR": str(work / "tmp"), "XDG_CACHE_HOME": str(work / "cache")},
+                         **(kw.get("env") or {}))
         srv = Server(root or self.root, work, **kw)
         self.servers.append(srv)
         return srv

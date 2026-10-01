@@ -1,5 +1,5 @@
-"""Test helpers, stdlib only: a running md-editor server, raw HTTP requests, and a WebSocket
-client that can also send malformed frames."""
+"""Test helpers, stdlib and pytest only: a running md-editor server, raw HTTP requests, and a
+WebSocket client that can also send malformed frames."""
 import base64
 import hashlib
 import http.client
@@ -15,11 +15,31 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 TESTS = Path(__file__).resolve().parent
 SRC = TESTS.parent / "src"
 FAKES = TESTS / "fakes"
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 MARKER = "MDEDIT_TEST_RUN"   # set in each server's environment, so its leftovers can be found
+
+
+def _linux_tools():
+    """Linux with util-linux script(1): fakes/claude runs under it as claude-sandbox's wrapper
+    does (BSD script, as on macOS, takes other options), fakes/fake-sandbox uses GNU stat,
+    and the terminal tests drive bash and read /proc."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        out = subprocess.run(["script", "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "util-linux" in out.stdout + out.stderr
+
+
+LINUX_TOOLS = _linux_tools()
+LINUX_REASON = "needs Linux with util-linux script(1)"
+needs_linux = pytest.mark.skipif(not LINUX_TOOLS, reason=LINUX_REASON)
 
 
 # ---------------------------------------------------------------- processes
@@ -280,8 +300,9 @@ class WS:
     """A WebSocket client for /api/term with a reader thread that keeps every frame. It can
     send any frame (unmasked, fragmented, with reserved bits or a false length)."""
 
-    def __init__(self, port, host=None, origin="same", headers=None, pipeline=b"", path="/api/term"):
+    def __init__(self, port, host=None, origin="same", headers=None, pipeline=b"", path="/api/term", pong=True):
         host = host or f"127.0.0.1:{port}"
+        self.pong = pong            # answer pings, as browsers do
         if origin == "same":
             origin = f"http://{host}"
         self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -375,6 +396,11 @@ class WS:
                         if f.op == 2:
                             self.outbuf += f.payload
                         self.cond.notify_all()
+                    if f.op == 9 and self.pong:
+                        try:
+                            self.send_frame(10, f.payload)
+                        except OSError:
+                            pass
                 chunk = self.sock.recv(1 << 20)
                 if not chunk:
                     break

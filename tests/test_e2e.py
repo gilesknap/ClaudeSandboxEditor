@@ -9,7 +9,7 @@ import re
 
 import pytest
 
-from helpers import FAKES
+from helpers import FAKES, needs_linux
 
 REQUIRE = os.environ.get("MD_EDITOR_E2E") == "require"
 try:
@@ -20,7 +20,7 @@ except ImportError:
         raise
     pytest.skip("Playwright is not installed (it needs Python 3.10+)", allow_module_level=True)
 
-pytestmark = pytest.mark.e2e
+pytestmark = [pytest.mark.e2e, needs_linux]   # fakes/fake-sandbox needs Linux tools
 
 DOC = "# E2E\n\nFirst paragraph here, long enough to select.\n\nSecond paragraph.\n"
 SELECTED = "First paragraph here, long enough to select."
@@ -134,6 +134,25 @@ def test_theme_toggle(page):
     page.locator("#term").click()
     page.keyboard.type("echo theme-$((1+1))\n")
     wait_term_line(page, "theme-2")
+
+
+def test_an_idle_page_answers_pings(browser, shared_servers):
+    """The server drops a client that leaves a ping unanswered; the browser answers them by
+    itself, so an idle page keeps its one connection."""
+    srv = shared_servers.start(agent="bash --norc --noprofile -i", env={"MDEDIT_WS_PING": "0.3"})
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    try:
+        pg = ctx.new_page()
+        pg.goto(srv.base)
+        pg.locator("#term").click()
+        pg.keyboard.type("echo ping-$((2+3))\n")
+        wait_term_line(pg, "ping-5")
+        pg.wait_for_timeout(2000)
+        pg.keyboard.type("echo still-$((3+4))\n")
+        wait_term_line(pg, "still-7")
+        assert srv.logtext().count('"GET /api/term HTTP/1.1" 101') == 1, "never dropped and reconnected"
+    finally:
+        ctx.close()
 
 
 def test_panel_width_drag_persists(page):

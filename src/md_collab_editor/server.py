@@ -31,6 +31,7 @@ import shlex
 import shutil
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import tempfile
@@ -238,7 +239,16 @@ def wait_fd(fd, write=False, timeout=None):
 
 def _child_setup():
     """Runs in the child after setsid(): make the PTY (already fd 0) its controlling terminal,
-    and undo SIG_IGN inherited from e.g. `nohup md-editor &`, so SIGHUP still ends the session."""
+    and undo SIG_IGN inherited from e.g. `nohup md-editor &`, so SIGHUP still ends the session.
+
+    This is a preexec_fn in a threaded server, which the subprocess docs call unsafe: a lock
+    another thread held at fork time could deadlock the child before exec. The hazard is
+    accepted: CPython re-creates its own locks in the child, glibc makes malloc fork-safe,
+    and this makes only ioctl and sigaction calls. No safer route keeps Python 3.9 and
+    subprocess's exec-error reporting (the terminal's "Could not start ..." status):
+    os.login_tty (3.11+) must also run in the child, posix_spawn cannot set a controlling
+    terminal, and a helper process that sets it and then execs the agent would report a
+    failed exec as the agent's own output."""
     try:
         fcntl.ioctl(0, termios.TIOCSCTTY, 0)
     except (OSError, AttributeError):
@@ -337,13 +347,24 @@ try:  # seconds per claude call; the tests shorten it
     ASK_TIMEOUT = float(os.environ.get("MDEDIT_ASK_TIMEOUT") or 600)
 except ValueError:
     ASK_TIMEOUT = 600
-ASK_ARG_MAX = 100_000  # bytes; launcher mode passes the prompt as one argument (Linux caps one at 128 KiB)
+# Bytes of prompt in launcher mode, which passes it to claude as an argument. The binding
+# limit is not that argument: claude-sandbox's wrapper hands its whole jailed command line
+# (bwrap's arguments, claude's and the prompt, each quoted by bash's printf %q, which can
+# make the prompt longer) to `script -c` as ONE string, and Linux caps one at 128 KiB. A
+# 97 kB prompt leaves about 28 kB to spare; past the cap the launcher fails with "Argument
+# list too long", which run_launcher reports as a request that is too large.
+ASK_ARG_MAX = 100_000
 ASK_CONTEXT = 300      # characters of context either side of a selection
 ASK_BASES_MAX, ASK_CARDS_MAX = 32, 256
+# claude reports a --resume of a session it does not have with this, on stderr
+SESSION_MISSING = "No conversation found with session ID:"
+# where launcher mode runs claude, in the container: claude-sandbox's wrapper always binds
+# ~/.cache into its jail, whatever folder it is set to make writable (`workspace-root`)
+LAUNCHER_ASK_DIR = '"$HOME"/.cache/md-editor/ask'
 ASK_LOCK = threading.Lock()              # guards the five below
 ASK_BASES = collections.OrderedDict()   # key → {"session", "doc"}: a session holding the document
 ASK_CARDS = collections.OrderedDict()   # card session id → {"key", "doc"}: the document it was asked about
-ASK_KEY_LOCKS = {}                       # key → Lock, so concurrent cards wait for a single base
+ASK_KEY_LOCKS = {}                       # key → [Lock, callers], so concurrent cards wait for a single base
 ASK_RUNNING = {}                         # prompt file → its launcher Popen (None until started)
 ASK_CLOSING = False                      # md-editor is exiting: start no more launcher calls
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)?|[ -/]*[0-~])")
@@ -404,13 +425,32 @@ def parse_result(text):
     return fallback
 
 
-def run_native(args, prompt):
-    """`claude -p` on pipes, in a fixed folder: no project CLAUDE.md, and --resume finds the
-    sessions it made. Returns its output."""
-    exe = shutil.which(ASK_CMD[0]) or ASK_CMD[0]
-    cwd = os.path.join(tempfile.gettempdir(), "md-editor-ask")
+def native_ask_dir():
+    """The folder native `claude -p` runs in, ~/.cache/md-editor/ask: always the same, so
+    --resume finds the sessions made there (and they stay out of ROOT's /resume list), and
+    the user's own, so no one else can plant a CLAUDE.md or .claude/settings.json in it."""
+    base = os.environ.get("XDG_CACHE_HOME") or ""
+    if not os.path.isabs(base):
+        base = os.path.join(os.path.expanduser("~"), ".cache")
+    d = os.path.join(base, "md-editor", "ask")
     try:
-        os.makedirs(cwd, exist_ok=True)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
+            raise RuntimeError(f"Ask Claude runs claude in {d}, which must be a folder of your own.")
+        if st.st_mode & 0o077:
+            os.chmod(d, 0o700)
+    except OSError as exc:
+        raise RuntimeError(f"Ask Claude cannot use {d}: {exc.strerror or exc}")
+    return d
+
+
+def run_native(args, prompt):
+    """`claude -p` on pipes, in native_ask_dir(), which holds no project CLAUDE.md. Returns
+    its output."""
+    exe = shutil.which(ASK_CMD[0]) or ASK_CMD[0]
+    cwd = native_ask_dir()
+    try:
         proc = subprocess.run([exe] + ASK_CMD[1:] + args, input=prompt, capture_output=True,
                               encoding="utf-8", errors="replace", timeout=ASK_TIMEOUT, cwd=cwd,
                               env=child_env())
@@ -450,7 +490,7 @@ def run_launcher(args, prompt):
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         # the fixed folder keeps these sessions out of ROOT's /resume list and lets --resume find them
-        script = ("mkdir -p /tmp/md-editor-ask && cd /tmp/md-editor-ask && "
+        script = (f"mkdir -p {LAUNCHER_ASK_DIR} && cd {LAUNCHER_ASK_DIR} && "
                   f"prompt=$(cat {shlex.quote(str(pf))}) && exec claude "
                   + " ".join(shlex.quote(a) for a in args) + ' -- "$prompt"')
         # the `shell` verb otherwise runs the shell md-editor was started from (zsh, fish, ...)
@@ -567,38 +607,47 @@ def ask_key(req):
 def base_session(key, doc):
     """The base session for key: one holding `doc`, or a version close enough to send a
     diff, made if need be. Returns (session id, diff to send)."""
+    with ASK_LOCK:  # the key's lock lives while any caller holds or waits for it
+        entry = ASK_KEY_LOCKS.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            return _base_session_locked(key, doc)
+    finally:
+        with ASK_LOCK:
+            entry[1] -= 1
+            if not entry[1]:
+                del ASK_KEY_LOCKS[key]
+
+
+def _base_session_locked(key, doc):
     path, model = key[2], key[3]
     with ASK_LOCK:
-        lock = ASK_KEY_LOCKS.setdefault(key, threading.Lock())
-    with lock:
-        with ASK_LOCK:
-            base = ASK_BASES.get(key)
-        if base is not None:
-            diff = doc_diff(base["doc"], doc, path)
-            if diff is not None:
-                with ASK_LOCK:
-                    if key in ASK_BASES:
-                        ASK_BASES.move_to_end(key)
-                return base["session"], diff
-        t0 = time.time()
-        msg = (doc_tag(path, doc) + "\n\nThis is the document the user is editing. Each later message "
-               "is one independent request about it. Reply with just OK.")
-        data = run_claude(claude_args(model), msg)
-        sid = data.get("session_id")
-        if not sid:
-            raise RuntimeError("claude gave no session id")
-        u = data.get("usage") or {}
-        print(f"[ask] base session {sid} for {path} ({len(doc)} chars) in {time.time() - t0:.1f}s; input tokens: "
-              f"{u.get('input_tokens')} new, {u.get('cache_read_input_tokens')} cached, "
-              f"{u.get('cache_creation_input_tokens')} written to the cache", flush=True)
-        with ASK_LOCK:
-            ASK_BASES[key] = {"session": sid, "doc": doc}
-            ASK_BASES.move_to_end(key)
-            while len(ASK_BASES) > ASK_BASES_MAX:
-                old = ASK_BASES.popitem(last=False)[0]
-                if old in ASK_KEY_LOCKS and not ASK_KEY_LOCKS[old].locked():
-                    del ASK_KEY_LOCKS[old]
-        return sid, ""
+        base = ASK_BASES.get(key)
+    if base is not None:
+        diff = doc_diff(base["doc"], doc, path)
+        if diff is not None:
+            with ASK_LOCK:
+                if key in ASK_BASES:
+                    ASK_BASES.move_to_end(key)
+            return base["session"], diff
+    t0 = time.time()
+    msg = (doc_tag(path, doc) + "\n\nThis is the document the user is editing. Each later message "
+           "is one independent request about it. Reply with just OK.")
+    data = run_claude(claude_args(model), msg)
+    sid = data.get("session_id")
+    if not sid:
+        raise RuntimeError("claude gave no session id")
+    u = data.get("usage") or {}
+    print(f"[ask] base session {sid} for {path} ({len(doc)} chars) in {time.time() - t0:.1f}s; input tokens: "
+          f"{u.get('input_tokens')} new, {u.get('cache_read_input_tokens')} cached, "
+          f"{u.get('cache_creation_input_tokens')} written to the cache", flush=True)
+    with ASK_LOCK:
+        ASK_BASES[key] = {"session": sid, "doc": doc}
+        ASK_BASES.move_to_end(key)
+        while len(ASK_BASES) > ASK_BASES_MAX:
+            ASK_BASES.popitem(last=False)
+    return sid, ""
 
 
 def forget_session(sid):
@@ -624,8 +673,11 @@ def ask_forked(req, key):
         parent, diff = base_session(key, doc)
     try:
         data = run_claude(claude_args(key[3], resume=parent), build_request(req, diff))
-    except RuntimeError:
-        forget_session(parent)
+    except RuntimeError as exc:
+        # forget the parent only when claude no longer has it: a failure of the launcher, a
+        # request too large to pass, or a passing API error leaves it good for the next card
+        if SESSION_MISSING + " " + parent in " ".join(str(exc).split()):
+            forget_session(parent)
         raise
     sid = data.get("session_id")
     if sid:
@@ -841,16 +893,26 @@ class TermSession:
         return rec
 
     def _read_loop(self, rec):
+        quiet = None  # since when the agent has been gone and the PTY silent
+        held = False  # the agent exited, but something it started still holds the PTY
         while True:
             try:
                 data = os.read(rec.fd, 65536)
             except BlockingIOError:
-                wait_fd(rec.fd)
+                if rec.proc.poll() is not None:  # as in read_pty: a second of quiet ends it
+                    now = time.monotonic()
+                    if quiet is None:
+                        quiet = now
+                    elif now - quiet > 1:
+                        held = True
+                        break
+                wait_fd(rec.fd, timeout=0.25)
                 continue
             except OSError:  # EIO once every slave fd is closed
                 data = b""
             if not data:
                 break
+            quiet = None
             if rec.retired:
                 continue
             with self.lock:
@@ -860,6 +922,8 @@ class TermSession:
         rec.closed = True  # a writer waiting for room gives up and releases wlock
         with rec.wlock, self.lock:
             os.close(rec.fd)
+        if held and not rec.retired:  # end the stragglers, as Restart would (it does when retired)
+            terminate_group(rec.proc)
         code = rec.proc.wait()
         print(f"[term] exited {code}", flush=True)
         with self.lock:
@@ -927,6 +991,11 @@ TERM = TermSession()
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_MAX_MESSAGE = 4 * 1024 * 1024
 WS_SEND_TIMEOUT = 10  # seconds; a browser that stops reading for longer is dropped
+try:  # seconds between pings; a browser that has not answered one by the next is dropped
+    WS_PING_INTERVAL = float(os.environ.get("MDEDIT_WS_PING") or 30)  # the tests shorten it
+except ValueError:
+    WS_PING_INTERVAL = 30
+WS_DRAIN = 2, 16 << 20  # after a protocol error, read on for up to 2 s or 16 MiB before closing
 OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 
 
@@ -955,13 +1024,16 @@ class WSClient:
 
     Output is broadcast under TermSession.lock, so a browser that stops reading would stall
     the session for everyone: a frame that cannot be sent within WS_SEND_TIMEOUT drops the
-    client and shuts its socket, and the page reconnects and gets the replay.
+    client and shuts its socket, and the page reconnects and gets the replay. A browser that
+    went away without closing the connection (a suspended laptop, a dropped port forward)
+    stops answering pings, and keepalive() drops it.
     """
 
     def __init__(self, sock):
         self.sock = sock
         self.send_lock = threading.Lock()
         self.alive = True
+        self.last_seen = time.monotonic()  # when a frame last came from the browser
         try:  # bounds each blocking send(), not reads, which wait as long as the browser is idle
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 1, 0))
         except (OSError, AttributeError, struct.error):
@@ -984,12 +1056,29 @@ class WSClient:
                         pass
                 return True
             except (OSError, ValueError):  # includes TimeoutError
-                self.alive = False
-                try:
-                    self.sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
+                self._drop_locked()
                 return False
+
+    def _drop_locked(self):
+        """Stop using the socket; shutting it also ends the handler's blocked read."""
+        self.alive = False
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def keepalive(self, stop):
+        """Ping every WS_PING_INTERVAL until `stop` is set; drop the client when nothing (not
+        even the pong browsers send by themselves) has come back since the last ping."""
+        pinged = None
+        while not stop.wait(WS_PING_INTERVAL):
+            if pinged is not None and self.last_seen < pinged:
+                with self.send_lock:
+                    self._drop_locked()
+                return
+            pinged = time.monotonic()
+            if not self.send_frame(ws_frame(OP_PING)):
+                return
 
     def close(self, code=None):
         self.send_frame(ws_frame(OP_CLOSE, b"" if code is None else struct.pack("!H", code)))
@@ -1226,27 +1315,60 @@ class Handler(SimpleHTTPRequestHandler):
         client = WSClient(self.connection)  # wfile is unbuffered: the 101 has gone
         if not TERM.attach(client):
             return
+        stop = threading.Event()
+        threading.Thread(target=client.keepalive, args=(stop,), daemon=True).start()
         try:
             self.ws_loop(client)
         except WSProtocolError as exc:
             client.close(exc.code)
+            self.ws_drain()
         except (OSError, EOFError, ValueError):
             pass
         finally:
+            stop.set()
             TERM.detach(client)
             with client.send_lock:
                 client.alive = False
 
-    def ws_read(self, n):
-        data = self.rfile.read(n) if n else b""
-        if len(data) < n:
-            raise EOFError
-        return data
+    def ws_drain(self):
+        """After a close frame for a protocol error: send FIN, then read and discard what the
+        browser is still sending (say the rest of an oversized message) until it closes, for
+        up to WS_DRAIN. Closing with unread data would reset the connection, which can lose
+        the close frame, so the browser would see 1006 instead of our code."""
+        seconds, left = WS_DRAIN
+        deadline = time.monotonic() + seconds
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+            while left > 0:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    break
+                self.connection.settimeout(wait)
+                chunk = self.connection.recv(min(left, 65536))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        except OSError:  # includes the timeout
+            pass
+
+    def ws_read(self, n, client=None):
+        """n bytes from the browser, else EOFError. Each 64 KiB of a long payload counts as
+        hearing from the browser (`client.last_seen`): it cannot answer a ping mid-frame."""
+        data = bytearray()
+        while len(data) < n:
+            chunk = self.rfile.read(min(n - len(data), 1 << 16))
+            if not chunk:
+                raise EOFError
+            data += chunk
+            if client is not None:
+                client.last_seen = time.monotonic()
+        return bytes(data)
 
     def ws_loop(self, client):
         parts, part_op, part_len = None, None, 0
         while True:
             b0, b1 = self.ws_read(2)
+            client.last_seen = time.monotonic()
             fin, op, n = b0 & 0x80, b0 & 0x0F, b1 & 0x7F
             if b0 & 0x70 or not b1 & 0x80:  # no extensions negotiated; clients must mask
                 raise WSProtocolError(1002)
@@ -1260,7 +1382,7 @@ class Handler(SimpleHTTPRequestHandler):
             elif (part_len if op == OP_CONT else 0) + n > WS_MAX_MESSAGE:
                 raise WSProtocolError(1009)
             key = self.ws_read(4)
-            payload = ws_unmask(self.ws_read(n), key)
+            payload = ws_unmask(self.ws_read(n, client), key)
             if op == OP_CLOSE:
                 client.send_frame(ws_frame(OP_CLOSE, payload[:2]))  # echo the status code
                 return
