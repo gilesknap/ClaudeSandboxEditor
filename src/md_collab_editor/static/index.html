@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <link rel="stylesheet" href="app.css">
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
@@ -24,6 +25,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/search.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/jump-to-line.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.js"></script>
 </head>
 <body>
 <header id="topbar">
@@ -88,8 +92,22 @@
     <article id="preview" class="markdown-body"></article>
   </section>
 
-  <aside id="claude">
-    <div class="side-head"><span>✦ Claude</span><button id="clear-cards" class="small-btn">Clear done</button></div>
+  <aside id="claude" data-tab="terminal">
+    <div id="panel-resize" title="Drag to resize the panel (double-click to reset)"></div>
+    <div class="side-head" id="panel-head">
+      <div id="panel-tabs" role="tablist">
+        <button type="button" class="tab" role="tab" data-tab="terminal" id="tab-terminal" title="Claude Code in the open folder">Terminal</button>
+        <button type="button" class="tab" role="tab" data-tab="suggestions" id="tab-suggestions" title="Ask Claude suggestions for the selected text">Suggestions<span id="cards-count" class="count" hidden></span></button>
+      </div>
+      <span class="tab-actions">
+        <button type="button" id="term-restart" class="small-btn" title="End this Claude session and start a new one in the open folder">Restart</button>
+        <button type="button" id="clear-cards" class="small-btn">Clear done</button>
+      </span>
+    </div>
+    <div id="term-wrap">
+      <div id="term-notice" hidden></div>
+      <div id="term"></div>
+    </div>
     <div id="cards">
       <p class="muted hint" id="cards-empty">Highlight text in the editor or the preview, then pick an action from the pop-up (or press <kbd>Ctrl</kbd>+<kbd>J</kbd>). With nothing selected, the request applies to the whole document.</p>
     </div>
@@ -124,6 +142,7 @@
 
 <script src="render.js"></script>
 <script src="spell.js"></script>
+<script src="term.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
