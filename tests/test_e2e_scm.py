@@ -417,6 +417,18 @@ def test_gutter_change_bars(page):
     assert merge_values(page)[1] == page.evaluate("() => Tabs.model('src/app.py').doc.getValue()")
 
 
+def test_gutter_change_bars_for_a_renamed_file(page, repo):
+    """A file renamed since HEAD (git mv) is compared with HEAD's file of the old name."""
+    git(repo, "mv", "docs/guide.md", "docs/howto.md")
+    (repo / "docs" / "howto.md").write_text("# Guide\n\nOther text.\n", encoding="utf-8")
+    page.evaluate("() => SCM.refresh()")
+    page.wait_for_function("() => SCM.status('docs/howto.md')?.status === 'R'")
+    page.evaluate("() => Tabs.open('docs/howto.md', {preview: false})")
+    expect(page.locator("#doc-name")).to_have_text("docs/howto.md")
+    expect(page.locator("#editor .CodeMirror-gutter-background.scm-mod")).to_have_count(1)
+    expect(page.locator("#editor .CodeMirror-gutter-background")).to_have_count(1)
+
+
 # ---------------------------------------------------------------- review fixes
 
 LINES = "".join(f"l{i}\n" for i in range(1, 9))

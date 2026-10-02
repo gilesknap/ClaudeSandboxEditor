@@ -318,6 +318,21 @@ def decode_text(data):
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def disk_text(p):
+    """File p's text as GET /api/file gives it, "" if there is no file, or None if it is not text
+    (binary, not UTF-8, over TEXT_MAX, or not a file)."""
+    try:
+        if not p.exists():  # as version_of: version "0"
+            return ""
+        if not p.is_file() or p.stat().st_size > TEXT_MAX:
+            return None
+        return decode_text(p.read_bytes())
+    except FileNotFoundError:  # deleted just now
+        return ""
+    except OSError:
+        return None
+
+
 def uses_crlf(p):
     """Whether the file's first line ends in CRLF."""
     try:
@@ -412,13 +427,15 @@ def api_tree(q):
     return {"dir": base, "entries": entries}
 
 
-def dir_stamp(rel):
+def dir_stamp(rel, top=None, memo=None):
     """A short hash of a folder's direct entries (name, is folder), or "0" if it is gone: what
     its rows in the tree show, so saving a file in it does not make the page list it again. A
-    .gitignore's mtime is in it too, since that file decides which entries are ignored."""
+    .gitignore's mtime is in it too, since that file decides which entries are ignored, and in
+    work tree `top` (ws_git()) so are the other files with ignore rules for it (ignore_rules)."""
     try:
         items = []
-        with os.scandir(safe_path(rel)) as it:
+        d = safe_path(rel)
+        with os.scandir(d) as it:
             for e in it:
                 if e.name == ".git":
                     continue
@@ -430,7 +447,31 @@ def dir_stamp(rel):
     except (ValueError, OSError):
         return "0"
     items.sort()
-    return hashlib.sha1(repr(items).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+    rules = ignore_rules(d, top, {} if memo is None else memo) if top is not None else []
+    return hashlib.sha1(repr((items, rules)).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
+def ignore_rules(d, top, memo):
+    """The mtimes of the files, other than its own .gitignore, whose rules decide which of folder
+    d's entries git ignores: the repository's info/exclude and the .gitignore in each folder
+    above d up to the work tree's top. memo: path → mtime, shared by one poll's folders."""
+    files = [git_exclude_file(top)]
+    if top in d.parents:
+        for p in d.parents:
+            files.append(p / ".gitignore")
+            if p == top:
+                break
+    out = []
+    for f in files:
+        if f is None:
+            continue
+        if f not in memo:
+            try:
+                memo[f] = os.stat(f).st_mtime_ns
+            except OSError:
+                memo[f] = 0
+        out.append(memo[f])
+    return out
 
 
 def api_stat(req):
@@ -445,7 +486,8 @@ def api_stat(req):
             versions[rel] = version_of(p) if p.is_file() else "0"
         except (ValueError, OSError):
             versions[rel] = "0"
-    return {"versions": versions, "dirs": {rel: dir_stamp(rel) for rel in dirs}}
+    top, memo = (ws_git() if dirs else None), {}
+    return {"versions": versions, "dirs": {rel: dir_stamp(rel, top, memo) for rel in dirs}}
 
 
 def api_new(req):
@@ -493,7 +535,11 @@ def api_rename(req):
     if os.path.lexists(dst):
         # only a change of case on a case-insensitive file system names the same file
         same = src.parent == dst.parent and src.name.lower() == dst.name.lower() and src.name != dst.name
-        if not (same and os.path.samefile(src, dst)):
+        try:
+            same = same and os.path.samefile(src, dst)
+        except OSError:  # e.g. one of them is a dangling symlink
+            same = False
+        if not same:
             raise ApiError(409, "a file or folder of that name already exists")
     if src.is_dir() and not src.is_symlink() and src in dst.parents:
         raise ValueError("cannot move a folder into itself")
@@ -860,9 +906,17 @@ def grep_walk(pat, globs, regex, deadline):
     whole file differently from its lines, so it goes line by line."""
     inc = [glob_re(g) for g, neg in globs if not neg]
     exc = [glob_re(g) for g, neg in globs if neg]
+    # in md-editor's own process (a plain-text search) it stops when its client goes away, as
+    # search_child's Watchdog stops a regex search
+    conn, look = getattr(REQUEST, "conn", None), 0.0
     for rel in walk_files():
-        if time.monotonic() > deadline:
+        now = time.monotonic()
+        if now > deadline:
             raise ApiError(504, "the search took too long")
+        if conn is not None and now >= look:
+            if client_gone(conn):
+                raise ApiError(499, "the search was cancelled")
+            look = now + 0.2
         if (inc and not any(r.fullmatch(rel) for r in inc)) or any(r.fullmatch(rel) for r in exc):
             continue
         p = ROOT / rel
@@ -1035,22 +1089,28 @@ GIT_OPTS = ["-c", "color.ui=false", "-c", "core.quotePath=false", "-c", "diff.re
             "-c", "grep.fullName=false", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
             "-c", "submodule.recurse=false"]
 FILTER_CMDS = ("status", "diff", "restore", "checkout", "rm")  # the ones that run filter drivers
-# Git LFS's own filter commands (as `git lfs install` writes them) are left alone
+# Git LFS's own filter commands (as `git lfs install` writes them) are left alone, unless the
+# configuration also names commands for git-lfs itself to run: LFS extensions (run on every clean
+# and smudge) and custom transfer agents. git-lfs never downloads either (GIT_LFS_SKIP_SMUDGE), so
+# no transfer agent, credential helper or ssh command from the configuration runs for a smudge.
 LFS_FILTER = {"clean": ("git-lfs clean -- %f",), "smudge": ("git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"),
               "process": ("git-lfs filter-process", "git-lfs filter-process --skip")}
+LFS_COMMAND_KEYS = ("lfs.extension.", "lfs.customtransfer.", "lfs.standalonetransferagent")
 GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_LITERAL_PATHSPECS",
                 "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
 GIT_TTL = 3              # seconds that ROOT's work tree is remembered (git init / rm -rf .git)
 GIT_REPOS = {}           # ROOT → (expiry, git_repo() answer)
 GIT_FEATURES = {}        # "pcre", "restore" → bool, found out once
+GIT_EXCLUDE = {}         # work tree top → its info/exclude file (git_exclude_file)
 SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 def git_env(literal=False):
     env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_DROP}
-    # no index.lock for status while the terminal's Claude runs git; never ask for a password
-    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0")
+    # no index.lock for status while the terminal's Claude runs git; never ask for a password;
+    # git-lfs smudges from its local store only (see LFS_FILTER)
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1")
     if literal:
         env["GIT_LITERAL_PATHSPECS"] = "1"
     return env
@@ -1058,18 +1118,24 @@ def git_env(literal=False):
 
 def filter_opts(cwd):
     """-c options that switch off every clean/smudge filter driver in git's configuration, except
-    Git LFS's: the commands in FILTER_CMDS would otherwise run whatever a driver names for files
-    that .gitattributes gives it. Reading the configuration runs nothing. (Something that keeps
-    rewriting .git/config could still slip a driver in between this and the command itself.)"""
-    r = subprocess.run(["git"] + GIT_OPTS + ["config", "-z", "--get-regexp", r"^filter\."], cwd=str(cwd),
+    Git LFS's (see LFS_FILTER): the commands in FILTER_CMDS would otherwise run whatever a driver
+    names for files that .gitattributes gives it. Reading the configuration runs nothing.
+    (Something that keeps rewriting .git/config could still slip a driver in between this and the
+    command itself.)"""
+    r = subprocess.run(["git"] + GIT_OPTS + ["config", "-z", "--get-regexp", r"^(filter|lfs)\."], cwd=str(cwd),
                        capture_output=True, stdin=subprocess.DEVNULL, env=git_env(), timeout=60)
-    drivers = {}
+    drivers, lfs_commands = {}, False
     for item in r.stdout.split(b"\0") if r.returncode == 0 else ():
         key, _, value = os.fsdecode(item).partition("\n")
+        if key.lower().startswith(LFS_COMMAND_KEYS):  # git-lfs reads its keys in any case
+            lfs_commands = True
+            continue
         name, _, var = key[len("filter."):].rpartition(".")
         if key.startswith("filter.") and name and var in ("clean", "smudge", "process"):
             safe = value.strip() in LFS_FILTER[var] if name == "lfs" else False
             drivers[name] = drivers.get(name, True) and safe
+    if lfs_commands and "lfs" in drivers:
+        drivers["lfs"] = False
     opts = []
     for name, safe in drivers.items():
         if safe:
@@ -1118,6 +1184,20 @@ def git_repo():
         repo["reason"] = f"git is not available: {exc}"
     GIT_REPOS[root] = (now + GIT_TTL, repo)
     return repo
+
+
+def git_exclude_file(top):
+    """The info/exclude file of the repository whose work tree is `top` (a linked worktree's is
+    in the main one's .git), found out once per work tree; None if git cannot say."""
+    if top not in GIT_EXCLUDE:
+        try:
+            r = git(["rev-parse", "--git-path", "info/exclude"], top)
+            out = os.fsdecode(r.stdout.rstrip(b"\n")) if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        if out:
+            GIT_EXCLUDE[top] = top / out
+    return GIT_EXCLUDE.get(top)
 
 
 def ws_git():
@@ -2692,9 +2772,11 @@ class Handler(SimpleHTTPRequestHandler):
             req = self.read_json()
             p = safe_path(req["path"])
             base = req.get("base_version")
-            if not req.get("force") and base is not None and version_of(p) != base:
-                return self.send_json({"error": "conflict", "version": version_of(p),
-                                       "text": p.read_text(encoding="utf-8") if p.exists() else ""}, 409)
+            version = version_of(p)
+            if not req.get("force") and base is not None and version != base:
+                # the disk's text as GET /api/file gives it; null when it is not text any more
+                # (binary, not UTF-8, over 5 MB), which the page can only overwrite
+                return self.send_json({"error": "conflict", "version": version, "text": disk_text(p)}, 409)
             text, mode = req["text"], None
             if p.is_file():  # keep an existing file's permissions (a script stays executable) and CRLFs
                 mode = p.stat().st_mode & 0o7777

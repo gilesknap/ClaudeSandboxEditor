@@ -656,7 +656,7 @@ def test_send_without_a_terminal_keeps_the_side_bar(browser, srv, repo):
     ctx.close()
 
 
-def test_a_file_name_that_is_not_utf8_opens(page, repo):
+def test_a_file_name_that_is_not_utf8_opens(page, repo, browser, srv):
     with open(os.path.join(os.fsencode(repo), b"lat\xe9.txt"), "w") as f:
         f.write("latin-1 name\n")
     page.wait_for_function("() => [...document.querySelectorAll('#tree .tree-row')].some(r => r.dataset.path.startsWith('lat'))",
@@ -668,3 +668,50 @@ def test_a_file_name_that_is_not_utf8_opens(page, repo):
     page.keyboard.press("Control+s")
     expect(page.locator("#save-state")).to_have_text("Saved")
     assert open(os.path.join(os.fsencode(repo), b"lat\xe9.txt")).read() == "latin-1 name\nmore\n"
+    # a URL names it too: the hash has the name's bytes %-escaped, which decodeURIComponent refuses
+    pg, errors = open_page(browser, srv)
+    pg.evaluate("location.hash = '#lat%E9.txt'")
+    pg.reload()
+    expect(pg.locator("#doc-name")).to_have_text(re.compile(r"^lat.\.txt$"))
+    assert pg.evaluate(r"""() => ['a b/c%d.md', 'lat\udce9.txt', 'd\u00e9j\u00e0 \ud83d\ude42', '\udce2\udc82A', '%zz', '\udced\udca0\udc80']
+                                  .filter(s => UI.decPath(UI.encPath(s)) !== s)""") == []
+    pg.context.close()
+    assert not errors, errors
+
+
+def test_a_menu_opened_from_the_keyboard_gives_focus_back(page):
+    page.locator("#tree").focus()
+    page.keyboard.press("Home")
+    menu = page.locator(".ctx-menu")
+    for key in ("Shift+F10", "ContextMenu"):
+        page.keyboard.press(key)
+        expect(menu.get_by_role("menuitem").first).to_be_focused()
+        page.keyboard.press("Escape")
+        expect(menu).to_have_count(0)
+        expect(page.locator("#tree")).to_be_focused()
+
+
+def test_a_file_that_is_no_longer_text_on_disk_can_be_overwritten(browser, srv, repo):
+    page, errors = open_page(browser, srv)
+    row(page, "src").click()
+    row(page, "src/util.js").dblclick()
+    type_at_end(page, "// mine\n")
+    banner = page.locator("#banner")
+    # a save that finds it changed (before the poll does): a 409 with no text to load
+    page.route("**/api/stat", lambda r: r.abort())
+    (repo / "src" / "util.js").write_bytes(b"caf\xe9\n")
+    page.keyboard.press("Control+s")
+    expect(banner).to_contain_text("util.js is no longer a text file on disk (binary).")
+    expect(banner.get_by_role("button")).to_have_text(["Keep mine (overwrite)"])
+    banner.get_by_role("button", name="Keep mine (overwrite)").click()
+    expect(banner).to_be_hidden()
+    assert disk(repo, "src/util.js") == "const a = 1;\n// mine\n"
+    page.unroute("**/api/stat")
+    # the poll finds it
+    (repo / "src" / "util.js").write_bytes(b"x\0y")
+    expect(banner).to_contain_text("util.js is no longer a text file on disk (binary).", timeout=5000)
+    banner.get_by_role("button", name="Keep mine (overwrite)").click()
+    expect(banner).to_be_hidden()
+    assert disk(repo, "src/util.js") == "const a = 1;\n// mine\n"
+    page.context.close()
+    assert [e for e in errors if "409 (Conflict)" not in e and "ERR_FAILED" not in e] == [], errors

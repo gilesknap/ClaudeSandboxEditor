@@ -429,15 +429,17 @@ const SCM = (() => {
 
   // ---------------------------------------------------------------- gutter change bars
 
-  let headCache = new Map();   // path → Promise</api/git/show answer against HEAD>
-  function headText(path) {
-    if (!headCache.has(path)) {
+  // path (+ "\0" + old path for a rename) → Promise</api/git/show answer against HEAD>
+  let headCache = new Map();
+  function headText(path, old = null) {
+    const key = old ? `${path}\0${old}` : path;
+    if (!headCache.has(key)) {
       const cache = headCache;
-      const p = UI.api('GET', `/api/git/show?path=${UI.encPath(path)}&base=head`);
-      p.catch(() => { if (cache.get(path) === p) cache.delete(path); });
-      cache.set(path, p);
+      const p = UI.api('GET', `/api/git/show?path=${UI.encPath(path)}&base=head${old ? `&old_path=${UI.encPath(old)}` : ''}`);
+      p.catch(() => { if (cache.get(key) === p) cache.delete(key); });
+      cache.set(key, p);
     }
-    return headCache.get(path);
+    return headCache.get(key);
   }
 
   const gut = new WeakMap();   // model → {marks: [[line handle, class]], chunks}
@@ -480,11 +482,16 @@ const SCM = (() => {
     if (!isRepo()) { await paint(m, null); return; }
     const ep = epoch;
     let base = null;
-    try { base = await headText(m.path); } catch {}
+    const f = byPath.get(m.path);
+    try {
+      base = await headText(m.path);
+      // renamed since HEAD (Uncommitted: git mv): its HEAD text is under the old name
+      if (base && !base.exists && f?.status === 'R' && f.old_path) base = await headText(m.path, f.old_path);
+    } catch {}
     if (ep !== epoch || Tabs.active() !== t || t.closed) return;
     let text = null;
     if (base && base.exists && !base.binary && !base.too_large) text = base.text;
-    else if (base && !base.exists && ['U', 'A'].includes(byPath.get(m.path)?.status)) text = '';   // new: all added
+    else if (base && !base.exists && ['U', 'A'].includes(f?.status)) text = '';   // new: all added
     await paint(m, text);
   }
 
@@ -1133,6 +1140,7 @@ const SCM = (() => {
       } else if (m) await Tabs.reload(m);
     }
     headCache.delete(f.path);
+    if (f.old_path) headCache.delete(`${f.path}\0${f.old_path}`);
     UI.toast(f.status === 'U' ? `Deleted ${f.path}` : `Discarded the changes to ${f.path}`);
     window.Explorer?.refresh();
     refresh();

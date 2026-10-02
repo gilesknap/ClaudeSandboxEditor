@@ -196,6 +196,30 @@ def test_stat_dir_stamps_change_when_entries_come_and_go(srv, ws):
     assert stat(srv, dirs=[""])["dirs"][""] == top
 
 
+def test_stat_dir_stamps_follow_ignore_rules_from_above(srv, tmp_path):
+    """Which entries a folder shows also depends on the .gitignore files above it (up to the work
+    tree's top, past ROOT) and on .git/info/exclude: a change to any of them changes its stamp."""
+    repo = make_repo(tmp_path / "repo", {"ws/src/a.py": "", "README.md": ""})
+    write(repo, {"ws/src/build/out.txt": "o"})   # untracked: a rule can ignore it
+    open_root(srv, repo / "ws")
+    assert names(tree(srv, "src")) == ["build", "a.py"]
+
+    def stamp():
+        return stat(srv, dirs=["src"])["dirs"]["src"]
+    first = stamp()
+    assert stamp() == first, "steady when nothing changes"
+    stamps = [first]
+    for rules, step in ((repo / "ws" / ".gitignore", "ROOT's .gitignore"), (repo / ".gitignore", "above ROOT"),
+                        (repo / ".git" / "info" / "exclude", "info/exclude")):
+        rules.parent.mkdir(exist_ok=True)
+        rules.write_text("build/\n")
+        os.utime(rules, ns=(len(stamps), len(stamps)))
+        assert stamp() not in stamps, step
+        stamps.append(stamp())
+        assert names(tree(srv, "src")) == ["a.py"], step
+        rules.unlink()
+
+
 def test_stat_rejects_bad_input(srv, ws):
     assert srv.post("/api/stat", {"paths": "a.md"})[0] == 400
     assert srv.post("/api/stat", ["a.md"])[0] == 400
@@ -244,6 +268,25 @@ def test_save_keeps_crlf_line_ends_and_permissions(srv, ws):
     assert (ws / "run.sh").stat().st_mode & 0o777 == 0o750
     status, _ = srv.put("/api/file", {"path": "lf.txt", "text": "a\nb\n"})
     assert status == 200 and (ws / "lf.txt").read_bytes() == b"a\nb\n"
+
+
+def test_a_save_over_a_newer_disk_version_is_a_conflict_whatever_the_disk_holds(srv, ws):
+    """The 409 carries the disk's text as GET /api/file gives it, or null once it is not text,
+    which the page can still overwrite (force)."""
+    write(ws, {"n.md": "old\r\n"})
+    v = file(srv, "n.md")[1]["version"]
+    os.utime(ws / "n.md", ns=(1, 1))
+    assert srv.put("/api/file", {"path": "n.md", "text": "mine\n", "base_version": v}) == (
+        409, {"error": "conflict", "version": "1", "text": "old\n"})
+    for disk in (b"caf\xe9\n", b"x\0y"):
+        (ws / "n.md").write_bytes(disk)
+        status, res = srv.put("/api/file", {"path": "n.md", "text": "mine\n", "base_version": v})
+        assert status == 409 and res["text"] is None and res["version"] != "0", disk
+    with open(ws / "n.md", "wb") as f:
+        f.truncate(S.TEXT_MAX + 1)
+    assert srv.put("/api/file", {"path": "n.md", "text": "mine\n", "base_version": v})[1]["text"] is None
+    assert srv.put("/api/file", {"path": "n.md", "text": "mine\n", "base_version": v, "force": True})[0] == 200
+    assert (ws / "n.md").read_bytes() == b"mine\n"
 
 
 # ---------------------------------------------------------------- new
@@ -313,6 +356,10 @@ def test_rename_refusals(srv, ws, tmp_path):
     assert (ws / "a.md").read_text() == "A" and (ws / "b.md").read_text() == "B"
     assert rename(srv, "a.md", "d")[0] == 409
     assert rename(srv, "missing.md", "c.md")[0] == 404
+    os.symlink("nowhere", ws / "A.md")   # a change of case onto a dangling symlink of that name
+    assert rename(srv, "a.md", "A.md")[0] == 409
+    assert (ws / "a.md").read_text() == "A" and os.path.islink(ws / "A.md")
+    os.unlink(ws / "A.md")
     assert rename(srv, "d", "d/inner/d")[0] == 400
     for src, dst in (("", "x"), (".", "x"), ("a.md", ""), ("a.md", "../a.md"), ("../ws/a.md", "../a2.md"),
                      ("a.md", ".git/a.md"), ("a.md", str(tmp_path / "a.md"))):

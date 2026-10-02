@@ -24,6 +24,7 @@
 //     UI.stat.now()                   poll right away; UI.stat.bump() drops in-flight results
 //   UI.encPath(path)                  encodeURIComponent for a path the server listed (also one
 //                                       that is not UTF-8); use it for every ?path= and #hash
+//   UI.decPath(s)                     its inverse (reads the #hash)
 //   UI.rawUrl(path, version?)         /raw/ URL of a ROOT-relative file
 //   UI.isMarkdown(path)               .md / .markdown
 //   UI.basename(path) / UI.dirname(path)
@@ -75,20 +76,24 @@ const UI = (() => {
 
   // ---------------------------------------------------------------- context menu
 
-  let menuEl = null;
+  let menuEl = null, menuPrev = null;
   function closeMenu() {
     if (!menuEl) return;
+    // focus goes back where it was (a menu opened from the keyboard), unless it has moved on
+    const back = menuEl.contains(document.activeElement) ? menuPrev : null;
     menuEl.remove();
-    menuEl = null;
+    menuEl = menuPrev = null;
     document.removeEventListener('mousedown', outside, true);
     window.removeEventListener('blur', closeMenu);
     window.removeEventListener('resize', closeMenu);
     document.removeEventListener('scroll', closeMenu, true);
+    if (back && back.isConnected && typeof back.focus === 'function') back.focus({ preventScroll: true });
   }
   function outside(e) { if (menuEl && !menuEl.contains(e.target)) closeMenu(); }
 
   function menu(items, x, y) {
     closeMenu();
+    const prev = document.activeElement;
     const el = document.createElement('div');
     el.className = 'ctx-menu';
     el.setAttribute('role', 'menu');
@@ -124,6 +129,7 @@ const UI = (() => {
     el.style.left = Math.max(4, Math.min(x, innerWidth - w - 4)) + 'px';
     el.style.top = Math.max(4, y + h > innerHeight - 4 ? y - h : y) + 'px';
     menuEl = el;
+    menuPrev = prev;
     setTimeout(() => {
       document.addEventListener('mousedown', outside, true);
       window.addEventListener('blur', closeMenu);
@@ -283,6 +289,28 @@ const UI = (() => {
     }
     return out + encodeURIComponent(p.slice(from));
   }
+  // encPath's inverse (decodeURIComponent throws on %80-%FF that are not UTF-8): the bytes as
+  // UTF-8, any byte that is not part of a valid sequence as U+DC80-U+DCFF, as the server does
+  function decPath(s) {
+    const bytes = [], enc = new TextEncoder(), dec = new TextDecoder('utf-8', { fatal: true });
+    for (let i = 0; i < s.length;) {
+      if (s[i] === '%' && /^[0-9a-fA-F]{2}$/.test(s.slice(i + 1, i + 3))) { bytes.push(parseInt(s.slice(i + 1, i + 3), 16)); i += 3; continue; }
+      const ch = String.fromCodePoint(s.codePointAt(i));
+      bytes.push(...enc.encode(ch));
+      i += ch.length;
+    }
+    let out = '';
+    for (let i = 0; i < bytes.length;) {
+      const b = bytes[i];
+      const n = b < 0x80 ? 1 : b >= 0xc2 && b < 0xe0 ? 2 : b >= 0xe0 && b < 0xf0 ? 3 : b >= 0xf0 && b < 0xf5 ? 4 : 0;
+      if (n && i + n <= bytes.length) {
+        try { out += dec.decode(new Uint8Array(bytes.slice(i, i + n))); i += n; continue; } catch {}
+      }
+      out += String.fromCharCode(0xdc00 + b);
+      i++;
+    }
+    return out;
+  }
   const rawUrl = (p, v) => '/raw/' + p.split('/').map(encPath).join('/') + (v ? `?v=${encodeURIComponent(v)}` : '');
 
   // ---------------------------------------------------------------- send to the Claude terminal
@@ -317,7 +345,7 @@ const UI = (() => {
   return {
     api, store, esc, on, emit, ready, root: () => root,
     menu, closeMenu, dialog, confirm, toast, statusItem, stat,
-    isMarkdown, basename, dirname, encPath, rawUrl, sendToTerminal,
+    isMarkdown, basename, dirname, encPath, decPath, rawUrl, sendToTerminal,
   };
 })();
 window.UI = UI;

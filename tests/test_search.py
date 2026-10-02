@@ -276,6 +276,25 @@ def test_a_search_stops_when_the_page_gives_up_on_it(srv, tmp_path):
     assert srv.get("/api/search?q=word")[0] == 200
 
 
+def test_a_plain_text_walk_stops_when_the_page_gives_up_on_it(tmp_path, monkeypatch):
+    """A plain-text search walks in md-editor's own process: it checks its client as it goes,
+    so a search a newer one replaced doesn't read the rest of the folder."""
+    write(tmp_path, {f"d{i}/f{j}.txt": "foo\n" for i in range(3) for j in range(3)})
+    monkeypatch.setattr(S, "ROOT", tmp_path.resolve())
+    pat = S.search_pattern("foo", False, False, False)
+    mine, page = socket.socketpair()
+    try:
+        monkeypatch.setattr(S.REQUEST, "conn", mine, raising=False)
+        assert len(list(S.grep_walk(pat, [], False, time.monotonic() + 60))) == 9, "while the page waits"
+        page.close()
+        with pytest.raises(S.ApiError) as exc:
+            list(S.grep_walk(pat, [], False, time.monotonic() + 60))
+        assert exc.value.status == 499
+    finally:
+        mine.close()
+        page.close()
+
+
 # ---------------------------------------------------------------- units
 
 def test_globs():

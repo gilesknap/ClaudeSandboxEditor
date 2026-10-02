@@ -343,12 +343,23 @@ const Tabs = (() => {
     return true;
   }
 
+  // text null: the disk's version is not text any more (a 409 for a binary file), so it can
+  // only be overwritten
   function conflict(m, text, version) {
+    if (typeof text !== 'string') { notText(m, version, 'binary'); return; }
     m.seenVersion = version;
     setBanner(m, {
       msg: `${UI.basename(m.path)} was changed on disk while you were editing.`,
       actions: [['Load disk version', () => applyRemote(m, text, version)],
                 ['Keep mine (overwrite)', () => save(m, true)]],
+    });
+  }
+
+  function notText(m, version, what) {
+    m.seenVersion = version;
+    setBanner(m, {
+      msg: `${UI.basename(m.path)} is no longer a text file on disk (${what}).`,
+      actions: [['Keep mine (overwrite)', () => save(m, true)]],
     });
   }
 
@@ -388,11 +399,7 @@ const Tabs = (() => {
     catch { f = null; }
     finally { m.checking = false; }
     if (!f || models.get(m.path) !== m || m.saving || f.version === m.version) return;
-    if (f.kind && f.kind !== 'text') {
-      m.seenVersion = f.version;
-      setBanner(m, { msg: `${UI.basename(m.path)} is no longer a text file on disk (${f.kind === 'too_large' ? 'over 5 MB' : 'binary'}); saving will overwrite it.`, actions: [] });
-      return;
-    }
+    if (f.kind && f.kind !== 'text') { notText(m, f.version, f.kind === 'too_large' ? 'over 5 MB' : 'binary'); return; }
     if (m.deleted) { m.deleted = false; renderStrip(); }
     if (f.text === m.doc.getValue()) {
       m.version = f.version;

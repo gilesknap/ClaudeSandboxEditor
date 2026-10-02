@@ -1100,7 +1100,7 @@ $('#panel-resize').addEventListener('dblclick', () => {
   buildPresets();
   // read before the remembered tabs come back: activating one rewrites the URL
   let fromHash = '';
-  try { fromHash = decodeURIComponent(location.hash.slice(1)); } catch {}
+  try { fromHash = UI.decPath(location.hash.slice(1)); } catch {}
   // the file named on the command line, once per browser tab (a reload keeps the tab on screen)
   let initial = conf.initial;
   try {
