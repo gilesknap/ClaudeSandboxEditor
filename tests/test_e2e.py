@@ -6,6 +6,8 @@ MD_EDITOR_E2E=require turns the skip into a failure, as in CI. The page loads it
 from CDNs, so these tests need internet access."""
 import os
 import re
+import shlex
+import sys
 
 import pytest
 
@@ -71,6 +73,12 @@ def wait_term_line(page, pattern, timeout=10000):
         """re => [...document.querySelectorAll('#term .xterm-rows > div')]
                  .some(d => new RegExp(re).test(d.textContent.replace(/\\u00a0/g, ' ').trimEnd()))""",
         arg=f"^{pattern}$", timeout=timeout)
+
+
+def term_text(page):
+    """Every terminal row, joined with newlines."""
+    return page.evaluate("""() => [...document.querySelectorAll('#term .xterm-rows > div')]
+                                  .map(d => d.textContent.replace(/\\u00a0/g, ' ').trimEnd()).join('\\n')""")
 
 
 def panel_width(page):
@@ -153,6 +161,43 @@ def test_an_idle_page_answers_pings(browser, shared_servers):
         assert srv.logtext().count('"GET /api/term HTTP/1.1" 101') == 1, "never dropped and reconnected"
     finally:
         ctx.close()
+
+
+def test_a_full_screen_agent_is_restored_after_a_reload(browser, shared_servers):
+    """fakes/tui sets its modes at the start, as Claude Code does, then writes more than the
+    replay holds. After a reload the terminal is back in those modes: on the alternate screen
+    (so nothing to scroll back), reporting focus and the mouse, sending application cursor
+    keys and bracketing pastes. And the agent was made to redraw (SIGWINCH)."""
+    srv = shared_servers.start(agent=shlex.join([sys.executable, str(FAKES / "tui")]))
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    errors = []
+    try:
+        pg = ctx.new_page()
+        pg.on("console", lambda m: errors.append(m.text) if m.type == "error" else None)
+        pg.on("pageerror", lambda e: errors.append(str(e)))
+        pg.goto(srv.base)
+        wait_term_line(pg, "READY", 30000)
+        pg.reload()
+        wait_term_line(pg, "READY")
+        wait_term_line(pg, r"WINCH \d+x\d+")
+        viewport = pg.locator("#term .xterm-viewport")
+        assert viewport.evaluate("v => v.scrollHeight <= v.clientHeight + 1"), "on the alternate screen"
+        expect(pg.locator("#term .xterm")).to_have_class(re.compile(r"\benable-mouse-events\b"))
+        pg.locator("#term").click()
+        pg.wait_for_function("""() => [...document.querySelectorAll('#term .xterm-rows > div')]
+                                .some(d => d.textContent.includes('^[[<0;'))""")   # an SGR mouse press
+        assert "^[[I" in term_text(pg), "focus reported"
+        pg.keyboard.press("ArrowUp")
+        wait_term_line(pg, r"GOT \^\[OA")
+        pg.locator("#term .xterm-helper-textarea").evaluate("""ta => {
+            const dt = new DataTransfer();
+            dt.setData('text/plain', 'pasted');
+            ta.dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+        }""")
+        wait_term_line(pg, r"GOT \^\[\[200~pasted\^\[\[201~")
+    finally:
+        ctx.close()
+    assert not errors, errors
 
 
 def test_panel_width_drag_persists(page):

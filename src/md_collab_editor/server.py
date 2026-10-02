@@ -23,6 +23,7 @@ import collections
 import difflib
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
@@ -192,6 +193,16 @@ def list_skills():
 
 # ---------------------------------------------------------------- processes
 
+def env_seconds(name, default):
+    """A number of seconds from the environment variable `name` (the tests shorten some), or
+    `default` when it is unset, unparsable, zero, negative or not finite."""
+    try:
+        value = float(os.environ.get(name) or default)
+    except ValueError:
+        return default
+    return value if 0 < value < math.inf else default
+
+
 def parse_command(value):
     """--agent / --ask-agent value → argv list, or None when the feature is turned off."""
     if value is None or value.strip().lower() in ("", "none"):
@@ -347,10 +358,7 @@ def read_pty(proc, fd, timeout, limit=8 << 20):
 # changed a little), and Retry / Refine fork the card's own session. If a fork fails, the
 # card falls back to one stateless call carrying the whole document.
 
-try:  # seconds per claude call; the tests shorten it
-    ASK_TIMEOUT = float(os.environ.get("MDEDIT_ASK_TIMEOUT") or 600)
-except ValueError:
-    ASK_TIMEOUT = 600
+ASK_TIMEOUT = env_seconds("MDEDIT_ASK_TIMEOUT", 600)  # seconds per claude call
 # Bytes of prompt in launcher mode, which passes it to claude as an argument. The binding
 # limit is not that argument: claude-sandbox's wrapper hands its whole jailed command line
 # (bwrap's arguments, claude's and the prompt, each quoted by bash's printf %q, which can
@@ -373,7 +381,7 @@ ASK_KEY_LOCKS = {}                       # key → [Lock, callers], so concurren
 ASK_RUNNING = {}                         # call id → [its Popen (None until started), its prompt file or None]
 ASK_CLOSING = False                      # md-editor is exiting: start no more claude calls
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)?|[ -/]*[0-~])")
-CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # JSON never holds these raw
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f]")  # JSON never holds these raw (it may hold DEL)
 
 
 def ask_mode():
@@ -810,6 +818,37 @@ def export_pdf(req):
 # ---------------------------------------------------------------- term
 
 SCROLLBACK_MAX = 512 * 1024
+NUDGE_SECONDS = 0.25  # how long a reattaching browser's PTY is one row short (see resize)
+CSI_RE = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
+DEC_MODE_RE = re.compile(rb"\x1b\[\?([0-9;]*)([hl])")
+# The DEC private modes (CSI ? Pm h / l) that change how xterm.js draws or what it sends, by
+# slot. The modes in a slot replace each other, as in xterm.js: there is one screen buffer,
+# one mouse protocol and one mouse encoding, and resetting any mode of a slot resets the slot.
+# They are listed in the order a replay restores them, the alternate screen first.
+DEC_SLOTS = {47: "alt", 1047: "alt", 1049: "alt", 1: "cursor-keys", 7: "wrap", 45: "reverse-wrap",
+             25: "cursor", 66: "keypad", 9: "mouse", 1000: "mouse", 1002: "mouse", 1003: "mouse",
+             1006: "mouse-encoding", 1016: "mouse-encoding", 1004: "focus", 2004: "paste"}
+DEC_DEFAULTS = {"wrap": 7, "cursor": 25}  # the slots a terminal reset leaves set, by this mode
+
+
+def track_modes(modes, data, end):
+    """Apply the DEC private mode changes in data[:end] to `modes`, slot → the mode set in it,
+    or 0 once it is reset."""
+    for m in DEC_MODE_RE.finditer(data, 0, end):
+        for p in m.group(1).split(b";"):
+            slot = DEC_SLOTS.get(int(p)) if p.isdigit() else None
+            if slot:
+                modes[slot] = int(p) if m.group(2) == b"h" else 0
+
+
+def mode_prefix(modes):
+    """The sequences that take a terminal just reset to `modes`, alternate screen first."""
+    out = []
+    for slot in dict.fromkeys(DEC_SLOTS.values()):
+        mode, default = modes.get(slot), DEC_DEFAULTS.get(slot, 0)
+        if mode is not None and mode != default:
+            out.append(f"\x1b[?{mode}h" if mode else f"\x1b[?{default}l")
+    return "".join(out).encode()
 
 
 def agent_display():
@@ -851,6 +890,13 @@ class TermSession:
     is broadcast, so a new client gets status + replay + live output in order and a
     new session's status always reaches clients before its output. `op_lock`
     serialises spawn / restart / first-resize so two of them never race.
+
+    A browser resets its terminal before the replay, which holds only the last 512 KiB
+    of output, so an agent's terminal modes, set once at its start, would be lost from a
+    long session: `replay_modes` follows the modes in force where the scrollback begins,
+    and the replay restores them first. The replay then sets the rest in their order,
+    so the browser ends in the modes the agent last set, and draws the alternate screen's
+    output there only if that is where it went.
     """
 
     def __init__(self):
@@ -866,6 +912,7 @@ class TermSession:
         self.message = None
         self.size = (80, 24)     # cols, rows
         self.scrollback = bytearray()
+        self.replay_modes = {}   # DEC private modes in force where the scrollback begins
         self.closing = False
 
     # -- clients (call with self.lock held unless noted)
@@ -887,7 +934,8 @@ class TermSession:
             # the replay; sent even when empty for a running or ended session, because the
             # client takes the first binary frame after the status to be the replay
             if ok and (self.scrollback or self.state in ("running", "exited")):
-                ok = client.send_frame(ws_frame(OP_BIN, bytes(self.scrollback)))
+                replay = mode_prefix(self.replay_modes) + bytes(self.scrollback)
+                ok = client.send_frame(ws_frame(OP_BIN, replay))
             if ok:
                 self.clients.add(client)
         return ok
@@ -902,7 +950,13 @@ class TermSession:
         excess = len(sb) - SCROLLBACK_MAX
         if excess > 0:  # keep the tail, starting just after a newline when one is close
             nl = sb.find(b"\n", excess, excess + 4096)
-            del sb[:nl + 1 if nl >= 0 else excess]
+            cut = nl + 1 if nl >= 0 else excess
+            esc = sb.rfind(b"\x1b", max(0, cut - 64), cut)
+            m = CSI_RE.match(sb, esc) if esc >= 0 else None
+            if m and m.end() > cut:  # never cut a control sequence in two: drop all of it
+                cut = m.end()
+            track_modes(self.replay_modes, sb, cut)
+            del sb[:cut]
 
     # -- process
 
@@ -912,6 +966,7 @@ class TermSession:
         self.id, self.state, self.cwd = self.next_id, "running", str(ROOT)
         self.code = self.message = None
         self.scrollback = bytearray()
+        self.replay_modes = {}
         cols, rows = self.size
         try:
             proc, master = spawn_pty(AGENT_CMD, self.cwd, agent_env(), cols, rows)
@@ -977,14 +1032,17 @@ class TermSession:
                 self.cur, self.state, self.code = None, "exited", code
                 self._broadcast_status()
 
-    def write(self, data):
+    def write(self, data, alive=lambda: True):
+        """Type `data` into the agent. While it is not reading, wait (holding wlock, so other
+        writes queue behind) until it does, the session ends or is replaced, or `alive()`
+        turns false: the browser that sent it has gone (see WSClient.keepalive)."""
         with self.lock:
             rec = self.cur
         if rec is None:
             return
         with rec.wlock:  # not under self.lock: a blocked write must not stall the output
             view = memoryview(data)
-            while view and not rec.closed and not rec.retired:
+            while view and not rec.closed and not rec.retired and alive():
                 try:
                     view = view[os.write(rec.fd, view):]
                 except BlockingIOError:  # the agent is not reading: wait for room
@@ -992,17 +1050,37 @@ class TermSession:
                 except OSError:
                     return
 
-    def resize(self, cols, rows):
+    def resize(self, cols, rows, nudge=False):
+        """Size the PTY (the kernel sends the agent SIGWINCH when that changes it); the first
+        resize of all starts the session. `nudge`: this is a newly attached browser's first
+        resize. Its terminal has only the replay, so the agent should redraw it, but an
+        unchanged size sends no SIGWINCH: the PTY is one row short for NUDGE_SECONDS, long
+        enough for the agent to see (Node reads the size when it handles the signal, and
+        ignores a SIGWINCH that leaves it unchanged), and then the right size again."""
         cols, rows = max(1, min(1000, cols)), max(1, min(1000, rows))
         with self.lock:
+            nudged = nudge and (cols, rows) == self.size
             self.size = (cols, rows)
             rec = self.cur
             if rec is not None and not rec.closed:
                 try:
-                    set_winsize(rec.fd, cols, rows)  # the kernel sends SIGWINCH
+                    if nudged:
+                        set_winsize(rec.fd, cols, rows - 1 if rows > 1 else 2)
+                    else:
+                        set_winsize(rec.fd, cols, rows)
                 except OSError:
-                    pass
+                    nudged = False
+            else:
+                nudged = False
             first = self.state == "none" and not self.closing
+        if nudged:
+            time.sleep(NUDGE_SECONDS)
+            with self.lock:
+                if self.cur is rec and not rec.closed:
+                    try:
+                        set_winsize(rec.fd, *self.size)  # the latest, should another browser have resized
+                    except OSError:
+                        pass
         if first:
             with self.op_lock, self.lock:
                 if self.state == "none" and not self.closing:
@@ -1037,10 +1115,8 @@ TERM = TermSession()
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_MAX_MESSAGE = 4 * 1024 * 1024
 WS_SEND_TIMEOUT = 10  # seconds; a browser that stops reading for longer is dropped
-try:  # seconds between pings; a browser that has not answered one by the next is dropped
-    WS_PING_INTERVAL = float(os.environ.get("MDEDIT_WS_PING") or 30)  # the tests shorten it
-except ValueError:
-    WS_PING_INTERVAL = 30
+# seconds between pings; a browser that has not answered one by the next is dropped
+WS_PING_INTERVAL = env_seconds("MDEDIT_WS_PING", 30)
 WS_DRAIN = 2, 16 << 20  # after a protocol error, read on for up to 2 s or 16 MiB before closing
 OP_CONT, OP_TEXT, OP_BIN, OP_CLOSE, OP_PING, OP_PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 
@@ -1081,6 +1157,7 @@ class WSClient:
         self.alive = True
         self.last_seen = time.monotonic()  # when a frame last came from the browser
         self.writing = False               # the handler is in TERM.write, so it reads no frames
+        self.sized = False                 # it has sent a resize
         try:  # bounds each blocking send(), not reads, which wait as long as the browser is idle
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 1, 0))
         except (OSError, AttributeError, struct.error):
@@ -1116,19 +1193,25 @@ class WSClient:
 
     def keepalive(self, stop):
         """Ping every WS_PING_INTERVAL until `stop` is set; drop the client when nothing (not
-        even the pong browsers send by themselves) has come back since the last ping. While
-        the handler is blocked in a PTY write (a paste the agent is not reading) the pongs
-        wait unread behind it, so the client is neither pinged nor judged until it is done."""
+        even the pong browsers send by themselves) has come back since the last ping.
+
+        While the handler is blocked in a PTY write (a paste the agent is not reading) the
+        pongs wait unread behind it, so the client is pinged but not judged until it is done.
+        A browser that closed its end meanwhile makes a ping fail (the first draws a reset,
+        the next fails), which drops it, and TERM.write then abandons its paste. One that
+        vanished without closing (a suspended laptop) goes unnoticed until TCP gives up on
+        it; till then its paste, with this thread and its handler, waits until the agent
+        reads its input again or the session is restarted."""
         pinged = None
         while not stop.wait(WS_PING_INTERVAL):
             if self.writing:
                 pinged = None
-                continue
-            if pinged is not None and self.last_seen < pinged:
+            elif pinged is not None and self.last_seen < pinged:
                 with self.send_lock:
                     self._drop_locked()
                 return
-            pinged = time.monotonic()
+            else:
+                pinged = time.monotonic()
             if not self.send_frame(ws_frame(OP_PING)):
                 return
 
@@ -1467,7 +1550,7 @@ class Handler(SimpleHTTPRequestHandler):
         if op == OP_BIN:
             client.writing = True
             try:
-                return TERM.write(payload)
+                return TERM.write(payload, lambda: client.alive)
             finally:
                 client.last_seen = time.monotonic()  # before keepalive() may judge it again
                 client.writing = False
@@ -1482,7 +1565,8 @@ class Handler(SimpleHTTPRequestHandler):
                 cols, rows = int(msg["cols"]), int(msg["rows"])
             except (KeyError, TypeError, ValueError, OverflowError):
                 return
-            TERM.resize(cols, rows)
+            nudge, client.sized = not client.sized, True
+            TERM.resize(cols, rows, nudge)
         elif msg.get("type") == "restart":
             TERM.restart()
 

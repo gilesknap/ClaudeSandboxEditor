@@ -25,20 +25,22 @@ MARKER = "MDEDIT_TEST_RUN"   # set in each server's environment, so its leftover
 
 
 def _linux_tools():
-    """Linux with util-linux script(1): fakes/claude runs under it as claude-sandbox's wrapper
-    does (BSD script, as on macOS, takes other options), fakes/fake-sandbox uses GNU stat,
-    and the terminal tests drive bash and read /proc."""
+    """Linux with util-linux script(1) 2.35 or later: fakes/claude runs under it with the
+    options claude-sandbox's wrapper uses, --echo (-E) among them, which 2.35 added (BSD
+    script, as on macOS, takes other options); fakes/fake-sandbox uses GNU stat, and the
+    terminal tests drive bash and read /proc."""
     if not sys.platform.startswith("linux"):
         return False
     try:
-        out = subprocess.run(["script", "--version"], capture_output=True, text=True, timeout=10)
+        version = subprocess.run(["script", "--version"], capture_output=True, text=True, timeout=10)
+        usage = subprocess.run(["script", "--help"], capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return False
-    return "util-linux" in out.stdout + out.stderr
+    return "util-linux" in version.stdout + version.stderr and "--echo" in usage.stdout + usage.stderr
 
 
 LINUX_TOOLS = _linux_tools()
-LINUX_REASON = "needs Linux with util-linux script(1)"
+LINUX_REASON = "needs Linux with util-linux script(1) 2.35+"
 needs_linux = pytest.mark.skipif(not LINUX_TOOLS, reason=LINUX_REASON)
 
 

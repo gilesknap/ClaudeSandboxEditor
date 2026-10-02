@@ -169,7 +169,8 @@ const Term = (() => {
   function onStatus(m) {
     const first = fresh;
     fresh = false;
-    // a new connection replays the scrollback, and a new session starts clean
+    // a new connection replays the scrollback (the server puts the terminal modes in force
+    // where it begins first), and a new session starts clean
     if (first || m.id !== shownId) { term.reset(); shownId = m.id; }
     expectReplay = first && (m.state === 'running' || m.state === 'exited');
     status = m;

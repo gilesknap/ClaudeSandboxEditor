@@ -35,7 +35,7 @@ The editor itself needs only Python 3.9+ (standard library, no dependencies). By
 
 The server listens on 127.0.0.1 only and checks the `Host` and `Origin` of every request, so other websites can't use it, even by DNS rebinding; forwarding the port to another local port (8765 to 8766, say) still works.
 
-To work on the editor itself, clone the repo and run `uv run md-editor docs`, which uses the code in the checkout. Run the tests with `uv run pytest`; the browser tests also need `uv run playwright install chromium` (and Python 3.10 or later), and are skipped without it. The tests use stand-ins for claude-sandbox and Claude Code, so they need neither, and GitHub Actions runs them on Python 3.9 and 3.13 for every push and pull request. The terminal tests, the browser tests and the tests that go through the claude-sandbox stand-in need Linux (they use util-linux `script`, GNU tools and `/proc`), so on other systems they are skipped.
+To work on the editor itself, clone the repo and run `uv run md-editor docs`, which uses the code in the checkout. Run the tests with `uv run pytest`; the browser tests also need `uv run playwright install chromium` (and Python 3.10 or later), and are skipped without it. The tests use stand-ins for claude-sandbox and Claude Code, so they need neither, and GitHub Actions runs them on Python 3.9 and 3.13 for every push and pull request. The terminal tests, the browser tests and the tests that go through the claude-sandbox stand-in need Linux (they use util-linux 2.35+ `script`, GNU tools and `/proc`), so on other systems they are skipped.
 
 ## Working with Claude
 
@@ -65,7 +65,7 @@ The ✦ panel has two tabs: **Suggestions** holds the *Ask Claude* cards, and **
 
 By default the terminal runs `uvx claude-sandbox@latest`, which runs Claude Code inside a [claude-sandbox](https://pypi.org/project/claude-sandbox/) container for the open folder. That needs [uv](https://docs.astral.sh/uv/), rootless podman (or docker) and `/dev/net/tun` on the host; the first start pulls the container image, so it takes a while.
 
-- The session starts the first time the Terminal tab is shown. It survives page reloads (the scrollback is replayed) and ends when md-editor quits.
+- The session starts the first time the Terminal tab is shown. It survives page reloads and ends when md-editor quits. After a reload or reconnect the last 512 KiB of output is replayed, the terminal modes Claude Code set (its full screen, mouse reporting, bracketed paste) are restored, and Claude Code redraws its screen.
 - There is one session, shared by every browser tab, so it is best open in one tab at a time: it has one size, set by the tab that resized it last, and other tabs draw it wrongly until they resize it.
 - **Restart** ends the session and starts a new one in the open folder. When a session ends by itself, press <kbd>Enter</kbd> to start another.
 - If you open a different folder, the session stays where it was and a notice offers to restart it in the new folder.

@@ -487,6 +487,18 @@ def test_parse_result_and_escape_stripping():
     assert S.parse_result('{"type":"result","result":"a"}\n{"result":"b"}\n')["result"] == "a"
     assert S.parse_result("Error: podman not found\n{not json\n") is None
     assert S.parse_result('{"type":"result","result":"z"}junk')["result"] == "z"
+    raw = '\x1b[?25l{"type":"result","result":"a\x7fb \u00e9"}\x1b[?25h\r\n'   # JSON may hold DEL raw
+    assert S.parse_result(S.CTRL_RE.sub("", S.ANSI_RE.sub("", raw)))["result"] == "a\x7fb \u00e9"
+
+
+def test_env_seconds(monkeypatch):
+    """MDEDIT_ASK_TIMEOUT and MDEDIT_WS_PING: only a positive, finite number counts."""
+    for value, want in (("2.5", 2.5), ("0.3", 0.3), ("", 30), ("0", 30), ("-1", 30), ("abc", 30),
+                        ("nan", 30), ("inf", 30), ("1e400", 30)):
+        monkeypatch.setenv("MDEDIT_TEST_SECONDS", value)
+        assert S.env_seconds("MDEDIT_TEST_SECONDS", 30) == want, value
+    monkeypatch.delenv("MDEDIT_TEST_SECONDS")
+    assert S.env_seconds("MDEDIT_TEST_SECONDS", 600) == 600
 
 
 def test_base_sessions_one_per_key_and_at_most_32(monkeypatch):
