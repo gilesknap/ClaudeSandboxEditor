@@ -22,18 +22,21 @@
 // file's model: md-editor writes nothing; Claude writes the file itself after an Accept), so
 // it can be edited and each change put back with the arrows between the sides. Accept sends
 // the right-hand text, Reject (or closing the tab) tells Claude no. While it waits, the
-// file's own tab is read-only under a banner and is not saved (Tabs.hold). A proposal that
+// file's own tab is read-only under a banner and is not saved (Tabs.hold); after an Accept it
+// stays so until Claude's write arrives, and its unsaved changes are never saved over that
+// write (Claude's edit would fail): they meet it as a conflict. Nor are they saved when the
+// server withdraws the proposal (answered in the terminal, perhaps with Yes). A proposal that
 // arrives while the user is typing in an editor opens beside it, not over it. The tabs belong
-// to the session, not the folder: opening another folder keeps them (Tabs `waiting`), as
-// does Close saved. They are not remembered across reloads: the server sends the waiting
-// proposals again.
+// to the session, not the folder: opening another folder keeps them (Tabs `waiting`), as do
+// the tab menu's Close others / to the right / saved / all. They are not remembered across
+// reloads: the server sends the waiting proposals again.
 
 const Proposals = (() => {
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
   const KEYS = isMac ? { accept: '⌘Enter', reject: '⌘⇧Enter' } : { accept: 'Ctrl+Enter', reject: 'Ctrl+Shift+Enter' };
   const svg = body => `<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
   const ICON = { up: svg('<path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/>'), down: svg('<path d="M8 3v10M3.5 8.5 8 13l4.5-4.5"/>') };
-  const HOLD_AFTER_ACCEPT = 4000;   // ms the file stays read-only after Accept, until Claude writes it
+  const WRITE_WAIT = 60000;   // ms the file stays read-only after Accept at most, waiting for Claude's write
   // bytes of an Accept's text as JSON: the answer goes in one /api/term message, and the server
   // closes the socket on one over 4 MiB (WS_MAX_MESSAGE); it shows proposals of at most 3 MiB
   const ANSWER_MAX = (4 << 20) - 4096;
@@ -247,14 +250,30 @@ const Proposals = (() => {
       return;
     }
     answer(p, { accept: true, contents });
-    // Claude writes the file next: keep it read-only until the change arrives (or a moment)
-    const release = p.release;
-    p.release = null;
-    if (release) {
-      const off = Tabs.on('disk-change', m => { if (m.path === p.path) { off(); release(); } });
-      setTimeout(() => { off(); release(); }, HOLD_AFTER_ACCEPT);
-    }
+    awaitWrite(p);
     closeTab(p);
+  }
+
+  // Claude writes the file next. Its tab stays read-only until the change arrives (or for
+  // WRITE_WAIT, or until the user stops waiting), and unsaved changes in it are not saved when
+  // it is released: saved before Claude's write, they would make that write fail; after it,
+  // they meet it as a conflict (the banner's Load disk version / Keep mine).
+  function awaitWrite(p) {
+    const held = p.release;
+    p.release = null;
+    if (!held) return;
+    const path = p.path;
+    if (!Tabs.model(path)) { held(); return; }   // not open: nothing here to save over it
+    let off = null, timer = null;
+    const done = () => { if (off) off(); clearTimeout(timer); release({ save: false }); };
+    const release = Tabs.hold(path, {
+      msg: m => `You accepted Claude's change to ${p.name}: it stays read-only until Claude writes it.`
+        + (m.dirty ? ' Its unsaved changes here are kept, not saved: then you can load Claude\'s version or keep yours.' : ''),
+      actions: [['Stop waiting', done]],
+    });
+    held({ save: false });
+    off = Tabs.on('disk-change', m => { if (m.path === path) done(); });
+    timer = setTimeout(done, WRITE_WAIT);
   }
 
   function reject(p) {
@@ -268,10 +287,12 @@ const Proposals = (() => {
     else dispose(p);
   }
 
-  // the tab closed: by an answer, by the server, or by the user (which is a rejection)
+  // the tab closed: by an answer, by the server, or by the user (which is a rejection). The
+  // unsaved changes the hold kept back are saved now, unless the server withdrew it: answered
+  // in the terminal, perhaps with Yes, so Claude may be about to write the file.
   function dispose(p) {
     if (!p.answered) answer(p, { accept: false });
-    if (p.release) { p.release(); p.release = null; }
+    if (p.release) { p.release({ save: !p.withdrawn }); p.release = null; }
     if (p.mv) { try { p.mv.editor().swapDoc(new CodeMirror.Doc('')); } catch {} }
     p.mv = null;
     shown.delete(p.id);
@@ -284,6 +305,7 @@ const Proposals = (() => {
     const p = shown.get(id);
     if (!p) return;
     p.answered = true;
+    p.withdrawn = true;
     closeTab(p);
   }
 

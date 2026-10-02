@@ -1148,7 +1148,16 @@ const SCM = (() => {
 
   // ---------------------------------------------------------------- discard
 
+  // Claude's proposed change to the file waits for an answer (Tabs.hold): git must not change
+  // the file under it (the proposal's left side would go stale, and an Accept would then fail)
+  function heldFile(f) {
+    const p = [f.path, f.old_path].filter(Boolean).find(x => Tabs.held(x));
+    if (p) UI.toast(`Claude has proposed a change to ${UI.basename(p)}: accept or reject it before discarding.`, { kind: 'err' });
+    return !!p;
+  }
+
   async function discard(f) {
+    if (heldFile(f)) return;
     const name = UI.basename(f.path);
     const dirty = [f.path, f.old_path].filter(Boolean).some(p => Tabs.model(p)?.dirty);
     let msg, ok = 'Discard';
@@ -1160,7 +1169,7 @@ const SCM = (() => {
       default: msg = `Discard the changes to “${name}”? It goes back to how it is in HEAD, and the changes cannot be recovered.`;
     }
     if (dirty) msg += ' Its unsaved changes in the editor will be lost too.';
-    if (!(await UI.confirm(msg, { title: f.status === 'U' ? 'Delete file' : 'Discard changes', ok, danger: true }))) return;
+    if (!(await UI.confirm(msg, { title: f.status === 'U' ? 'Delete file' : 'Discard changes', ok, danger: true })) || heldFile(f)) return;
     // stop a pending autosave (and let any write under way finish) before git rewrites the file,
     // so the discarded edits are not written back on top of the restored HEAD version
     for (const p of [f.path, f.old_path].filter(Boolean)) {

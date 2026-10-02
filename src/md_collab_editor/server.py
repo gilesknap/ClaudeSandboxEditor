@@ -1889,9 +1889,13 @@ class TermSession:
     def _broadcast_json(self, obj):
         self._broadcast(ws_frame(OP_TEXT, json.dumps(obj).encode()))
 
-    def _broadcast(self, frame):
-        for c in [c for c in self.clients if not c.send_frame(frame)]:
+    def _broadcast(self, frame, binary=False):
+        for c in [c for c in self.clients if not (binary and c.joined) and not c.send_frame(frame)]:
             self.clients.discard(c)
+
+    def _output(self, data):
+        """The agent's output to every browser with a terminal (not those only joined)."""
+        self._broadcast(ws_frame(OP_BIN, data), binary=True)
 
     def _broadcast_status(self):
         self._broadcast(ws_frame(OP_TEXT, json.dumps(self.status()).encode()))
@@ -1900,8 +1904,9 @@ class TermSession:
         with self.lock:
             ok = client.send_frame(ws_frame(OP_TEXT, json.dumps(self.status()).encode()))
             # the replay; sent even when empty for a running or ended session, because the
-            # client takes the first binary frame after the status to be the replay
-            if ok and (self.scrollback or self.state in ("running", "exited")):
+            # client takes the first binary frame after the status to be the replay (a page
+            # only joined, with no terminal, gets no output at all)
+            if ok and not client.joined and (self.scrollback or self.state in ("running", "exited")):
                 replay = mode_prefix(self.replay_modes) + bytes(self.scrollback)
                 ok = client.send_frame(ws_frame(OP_BIN, replay))
             # the proposed edits still waiting for an answer, for a page that was reloaded
@@ -1941,7 +1946,7 @@ class TermSession:
         cols, rows = self.size
         # the IDE link listens and writes its lock file before the agent starts: Claude Code
         # looks for it only for 30 s
-        args, env, self.bridge, self.ide_reason = [], agent_env(), None, None
+        cmd, env, self.bridge, self.ide_reason = AGENT_CMD, agent_env(), None, None
         mode = ide_mode() if IDE_LINK != "off" else None
         if IDE_LINK == "off":
             self.ide_reason = "The IDE link is turned off (--ide-link off)."
@@ -1951,12 +1956,12 @@ class TermSession:
         else:
             try:
                 self.bridge = IdeBridge(self, self.cwd, mode)
-                args, env = self.bridge.args, dict(env, **self.bridge.env)
+                cmd, env = self.bridge.argv or AGENT_CMD, dict(env, **self.bridge.env)
             except IdeUnavailable as exc:
                 self.ide_reason = str(exc)
                 print(f"[ide] no IDE link: {exc}", flush=True)
         try:
-            proc, master = spawn_pty(AGENT_CMD + args, self.cwd, env, cols, rows)
+            proc, master = spawn_pty(cmd, self.cwd, env, cols, rows)
         except (OSError, subprocess.SubprocessError) as exc:
             self._close_bridge()
             self.cur, self.state = None, "failed"
@@ -1965,7 +1970,7 @@ class TermSession:
             line = f"\r\n\x1b[31m{self.message}\x1b[0m\r\n".encode()
             self.scrollback += line
             self._broadcast_status()
-            self._broadcast(ws_frame(OP_BIN, line))
+            self._output(line)
             return
         # the master is non-blocking, so a write to an agent that stops reading its input can
         # still give up when the session ends or is replaced, instead of hanging that browser
@@ -2018,7 +2023,7 @@ class TermSession:
                     # the glyph may be split between two reads
                     if not rec.prompted and PROMPT_GLYPH in self.scrollback[-(len(data) + len(PROMPT_GLYPH) - 1):]:
                         rec.prompted = True
-                    self._broadcast(ws_frame(OP_BIN, data))
+                    self._output(data)
         rec.closed = True  # a writer waiting for room gives up and releases wlock
         with rec.wlock, self.lock:
             os.close(rec.fd)
@@ -2339,8 +2344,9 @@ class WSClient:
     stops answering pings, and keepalive() drops it.
     """
 
-    def __init__(self, sock):
+    def __init__(self, sock, joined=False):
         self.sock = sock
+        self.joined = joined               # no terminal on the page: no output is sent to it
         self.send_lock = threading.Lock()
         self.alive = True
         self.last_seen = time.monotonic()  # when a frame last came from the browser
@@ -2626,6 +2632,47 @@ def ide_mode():
     return None
 
 
+def agent_settings(argv):
+    """The settings the agent command gives Claude Code itself, as (start, end, value): the
+    argv slice of its last --settings (the one Claude Code takes) and its value parsed, a dict,
+    or None when it is not a JSON object (a file's path). None when it gives none."""
+    found, i = None, 1
+    while i < len(argv):
+        if argv[i] == "--settings" and i + 1 < len(argv):
+            found, i = (i, i + 2, argv[i + 1]), i + 2
+            continue
+        if argv[i].startswith("--settings="):
+            found = (i, i + 1, argv[i][len("--settings="):])
+        i += 1
+    if found is None:
+        return None
+    try:
+        value = json.loads(found[2])
+    except (ValueError, RecursionError):
+        value = None
+    return found[0], found[1], value if isinstance(value, dict) else None
+
+
+def with_settings(argv, ours):
+    """The agent command with the link's settings for Claude Code (`ours`: env and a
+    SessionStart hook) added. Claude Code takes only the last --settings it is given, so when
+    the command has its own (a JSON object; a file is refused before this), ours are merged into
+    it: its env gains ours, and our hook joins its SessionStart hooks."""
+    found = agent_settings(argv)
+    if found is None:
+        return list(argv) + ["--settings", json.dumps(ours)]
+    start, end, theirs = found
+    merged = dict(theirs)
+    env = theirs.get("env")
+    merged["env"] = dict(env if isinstance(env, dict) else {}, **ours["env"])
+    hooks = theirs.get("hooks")
+    hooks = dict(hooks) if isinstance(hooks, dict) else {}
+    first = hooks.get("SessionStart")
+    hooks["SessionStart"] = (list(first) if isinstance(first, list) else []) + ours["hooks"]["SessionStart"]
+    merged["hooks"] = hooks
+    return list(argv[:start]) + ["--settings", json.dumps(merged)] + list(argv[end:])
+
+
 def ide_lock_dir(mode):
     """Where Claude Code looks for lock files: natively its config folder's ide/; in launcher
     mode the jail's ~/.claude/ide, which claude-sandbox shares from its config folder here."""
@@ -2763,6 +2810,36 @@ def _sweep_lock(d, dfd, name, port):
             os.unlink(sock)
     except OSError:
         pass
+
+
+def sweep_ide_sockets(folder, keep):
+    """Delete the IDE link sockets in `folder` (a session's, in launcher mode) that nothing
+    answers on, except `keep` (the new link's): ones a crashed md-editor left whose lock files
+    have gone too (sweep_ide_locks finds a socket only through its lock). The folder is the
+    agent's to write, so only a socket of ours is touched, by name in the folder opened once,
+    and one made in the last minute is left (another md-editor's, between bind and listen).
+    Runs in a thread of its own: a socket that is busy can take a second to answer."""
+    try:
+        dfd = os.open(folder, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    except OSError:
+        return
+    try:
+        for name in os.listdir(dfd):
+            if name == keep or not IDE_SOCK_RE.fullmatch(name):
+                continue
+            try:
+                st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+                if (not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid() or time.time() - st.st_mtime < 60
+                        or socket_alive(os.path.join(folder, name))):
+                    continue
+                os.unlink(name, dir_fd=dfd)
+                print(f"[ide] removed a stale socket: {os.path.join(folder, name)}", flush=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    finally:
+        os.close(dfd)
 
 
 def inside(path, folder):
@@ -2964,7 +3041,7 @@ class IdeBridge:
         self.diffs = {}
         self.waiters = {}          # our request id → [Event, IdeConn, its reply]
         self.req_ids = itertools.count(1)
-        self.args, self.env = [], {}
+        self.argv, self.env = None, {}   # the agent's command line (None: as given) and environment
         self.sock_path = None
         self.file_lock = threading.Lock()  # the lock file: written again, or deleted
         self.next_check = time.monotonic() + IDE_LOCK_CHECK
@@ -2981,6 +3058,11 @@ class IdeBridge:
             if not os.path.isdir(os.path.dirname(d)):
                 raise IdeUnavailable(f"{os.path.dirname(d)} does not exist: claude-sandbox has not run yet, or keeps "
                                      "its configuration elsewhere (set CLAUDE_SANDBOX_SHARED_CONFIG).")
+            found = agent_settings(AGENT_CMD)
+            if found and found[2] is None:
+                raise IdeUnavailable("The agent command gives Claude Code a settings file (--settings), and Claude "
+                                     "Code takes only the last --settings, so the link's would replace it: give "
+                                     "those settings as JSON instead, and md-editor adds the link's to them.")
         dfd = open_lock_dir(d)
         try:
             self._bind(native, d, dfd)
@@ -2996,9 +3078,12 @@ class IdeBridge:
             settings = {"env": {"CLAUDE_CODE_SSE_PORT": str(self.port)},
                         "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command":
                                   f"(setsid {relay} </dev/null >/dev/null 2>&1 &)"}]}]}}
-            self.args = ["--settings", json.dumps(settings)]
+            self.argv = with_settings(AGENT_CMD, settings)
         self.server.bridge = self
         threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True).start()
+        if self.sock_path and os.stat in os.supports_dir_fd:
+            threading.Thread(target=sweep_ide_sockets, args=(self.cwd, os.path.basename(self.sock_path)),
+                             daemon=True).start()
         where = self.sock_path or f"127.0.0.1:{self.port}"
         print(f"[ide] waiting for Claude Code on {where} (lock file {self.lock_path})", flush=True)
 
@@ -3279,6 +3364,10 @@ class IdeBridge:
             new = old
         if not all(isinstance(v, str) for v in (old, new, contents, title)):
             return rpc_error(rid, -32602, "openDiff needs old_file_path, new_file_path, new_file_contents and tab_name")
+        with self.lock:  # first, so a refusal reads nothing (checked again below, as one is added)
+            full = len(self.diffs) >= IDE_DIFFS_MAX
+        if full:
+            return rpc_result(rid, tool_text("too many changes are waiting in md-editor", error=True))
         why, real, disk, exists = None, None, None, True
         try:
             real = os.path.realpath(old)
@@ -3720,7 +3809,7 @@ class Handler(WSReader, SimpleHTTPRequestHandler):
                 return self.send_json({"root": str(ROOT), "initial": INITIAL, "skills": list_skills(),
                                        "files": list_files(), "agent": agent_info()})
             if u.path == "/api/term":
-                return self.term_socket()
+                return self.term_socket(join=q.get("join") == "1")
             if u.path == "/api/download":
                 p = safe_path(q["path"])
                 if not p.is_file() or p.suffix.lower() != ".pdf":
@@ -3826,7 +3915,9 @@ class Handler(WSReader, SimpleHTTPRequestHandler):
 
     # -- /api/term: hand-written RFC 6455 WebSocket onto the shared TermSession
 
-    def term_socket(self):
+    def term_socket(self, join=False):
+        """join: a page with no terminal on screen (term.js while the panel is hidden), for the
+        IDE link's messages only: it is sent no output (no replay, no PTY bytes)."""
         # browsers apply no CORS to WebSockets: do_GET's guard has already insisted on an
         # Origin that matches our own local Host
         key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
@@ -3843,7 +3934,7 @@ class Handler(WSReader, SimpleHTTPRequestHandler):
         # written by hand: send_response would say HTTP/1.0, and browsers reject a 1.0 101
         self.wfile.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
                           f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n").encode())
-        client = WSClient(self.connection)  # wfile is unbuffered: the 101 has gone
+        client = WSClient(self.connection, joined=join)  # wfile is unbuffered: the 101 has gone
         if not TERM.attach(client):
             return
         stop = threading.Event()

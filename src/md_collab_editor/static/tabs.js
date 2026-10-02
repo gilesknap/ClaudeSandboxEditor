@@ -59,18 +59,21 @@
 //   Tabs.restore() → Promise           reopen the tabs remembered for the current root
 //   Tabs.setStatus(text, cls)          message in the top bar's save-state slot
 //   Tabs.autosave(category) → bool     the autosave setting for 'md' / 'other'
-//   Tabs.hold(path, {msg, actions}) → release()   while Claude's proposed change to a file
-//                                      waits for an answer (proposal.js): its tab is read-only
-//                                      under a banner (msg, [[label, fn]…]; msg may be a
+//   Tabs.hold(path, {msg, actions}) → release({save}?)   while Claude's proposed change to a
+//                                      file waits for an answer (proposal.js): its tab is
+//                                      read-only under a banner (msg, [[label, fn]…]; msg may be a
 //                                      function of the model) and it is not saved, so nothing
 //                                      races Claude's own write. Also for a file opened later;
-//                                      holds stack. Tabs.held(model) → bool
+//                                      holds stack. release() autosaves the unsaved changes held
+//                                      back; release({save: false}) leaves them unsaved (after an
+//                                      Accept: Claude writes the file). Tabs.held(model or path) → bool
 //   Tabs.on(event, fn) → off()         events:
 //       'activate' (tab, prevTab)   'deactivate' (tab)   'open' (tab)   'close' (tab)
 //       'change' (model, change)    any edit of a model's doc (also from linked docs)
 //       'dirty' (model)             its dirty flag flipped
 //       'saved' (model)             written to disk by us
-//       'disk-change' (model, {deleted}) reloaded / found changed or deleted on disk
+//       'disk-change' (model, {deleted, conflict}) reloaded / found changed (conflict: over
+//                                   unsaved changes, so not loaded) or deleted on disk
 //       'dispose' (model)           closed: nothing uses it any more
 //       'hold' (path)               a hold on the file began or ended (Tabs.held says which)
 //       'rename' (from, to)         after renamePath
@@ -379,6 +382,7 @@ const Tabs = (() => {
       actions: [['Load disk version', () => applyRemote(m, text, version)],
                 ['Keep mine (overwrite)', () => save(m, true)]],
     });
+    emit('disk-change', m, { deleted: false, conflict: true });
   }
 
   function notText(m, version, what) {
@@ -387,6 +391,7 @@ const Tabs = (() => {
       msg: `${UI.basename(m.path)} is no longer a text file on disk (${what}).`,
       actions: [['Keep mine (overwrite)', () => save(m, true)]],
     });
+    emit('disk-change', m, { deleted: false, conflict: true });
   }
 
   // ---------------------------------------------------------------- on-disk changes (polled)
@@ -432,6 +437,7 @@ const Tabs = (() => {
       m.seenVersion = null;
       if (m.dirty) { m.cleanGen = m.doc.changeGeneration(true); setDirty(m, false); setState(m, 'Saved'); }
       setBanner(m, null);
+      emit('disk-change', m, { deleted: false });
       return;
     }
     if (!m.dirty) applyRemote(m, f.text, f.version);
@@ -499,22 +505,22 @@ const Tabs = (() => {
     const rec = { root: UI.root(), banner };
     if (!holds.has(path)) holds.set(path, []);
     holds.get(path).push(rec);
-    const changed = () => {
+    const changed = (save = true) => {
       const m = models.get(path);
       if (!m) return;
       if (heldBy(m)) clearTimeout(m.saveT);
-      else if (m.dirty && autosave(m.category) && !m.deleted) scheduleSave(m);   // what waited
+      else if (save && m.dirty && autosave(m.category) && !m.deleted) scheduleSave(m);   // what waited
       if (activeModel() === m) { renderBanner(); syncReadOnly(); }
       emit('hold', path);
     };
     changed();
     let done = false;
-    return () => {
+    return ({ save = true } = {}) => {
       if (done) return;
       done = true;
       const list = (holds.get(path) || []).filter(x => x !== rec);
       if (list.length) holds.set(path, list); else holds.delete(path);
-      changed();
+      changed(save);
     };
   }
 
@@ -642,12 +648,13 @@ const Tabs = (() => {
     if (!t) return;
     e.preventDefault();
     const others = tabs.filter(x => x !== t);
+    const right = tabs.slice(tabs.indexOf(t) + 1);
     UI.menu([
       { label: 'Close', kbd: 'Alt+W', action: () => close(t) },
-      { label: 'Close others', disabled: !others.length, action: () => closeMany(others) },
-      { label: 'Close to the right', disabled: tabs.indexOf(t) === tabs.length - 1, action: () => closeMany(tabs.slice(tabs.indexOf(t) + 1)) },
-      { label: 'Close saved', action: () => closeMany(tabs.filter(x => !tabDirty(x) && !waits(x))) },
-      { label: 'Close all', action: () => closeMany(tabs.slice()) },
+      { label: 'Close others', disabled: !others.some(x => !waits(x)), action: () => closeBulk(others) },
+      { label: 'Close to the right', disabled: !right.some(x => !waits(x)), action: () => closeBulk(right) },
+      { label: 'Close saved', action: () => closeBulk(tabs.filter(x => !tabDirty(x))) },
+      { label: 'Close all', action: () => closeBulk(tabs.slice()) },
       '-',
       { label: 'Keep open', disabled: !t.preview, action: () => pin(t) },
       t.path ? { label: 'Copy relative path', action: () => navigator.clipboard?.writeText(t.path) } : null,
@@ -659,6 +666,16 @@ const Tabs = (() => {
   async function closeMany(list) {
     for (const t of list) if (!(await close(t))) return false;
     return true;
+  }
+
+  // the tab menu's Close others / to the right / saved / all: a tab waiting for the user's
+  // answer is left open (closing Claude's proposed change rejects it: only its own Close does)
+  async function closeBulk(list) {
+    const kept = list.filter(waits);
+    if (!(await closeMany(list.filter(x => !waits(x)))) || !kept.length) return;
+    UI.toast(kept.length === 1
+      ? `Left “${kept[0].title}” open: Claude waits for you to accept or reject it.`
+      : `Left ${kept.length} proposed changes open: Claude waits for you to accept or reject them.`);
   }
 
   // ---------------------------------------------------------------- tab lifecycle
@@ -1134,7 +1151,7 @@ const Tabs = (() => {
     acquire, release,
     linkedDoc,
     loadMode, save, saveAll, anyDirty, renamePath, renameBlocked, pathDeleted, reload, cancelAutosave,
-    confirmLeave, closeAll, restore, registerType, setStatus, autosave, hold, held: m => !!heldBy(m),
+    confirmLeave, closeAll, restore, registerType, setStatus, autosave, hold, held: x => !!heldBy(typeof x === 'string' ? { path: x } : x),
     on, cm: () => cm, categoryOf,
   };
 })();

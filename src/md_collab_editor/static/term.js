@@ -2,8 +2,9 @@
 // to a PTY on the server, which runs the agent command (by default claude-sandbox).
 // The terminal is created the first time the panel is really on screen, and its first resize
 // starts the session, so a hidden panel never starts a sandbox. Until then the page is joined
-// all the same (without a terminal, so the output is dropped), for the IDE link's messages:
-// the terminal makes a connection of its own when it is created, which replays the output.
+// all the same (/api/term?join=1: without a terminal, so the server sends it no output), for
+// the IDE link's messages: the terminal makes a connection of its own when it is created,
+// which replays the output.
 // app.js calls the hooks at the bottom.
 //
 // The same socket carries the editor's side of md-editor's IDE link to that session (the
@@ -161,7 +162,8 @@ const Term = (() => {
 
   function connect() {
     clearTimeout(retryT);
-    const s = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/term');
+    // with no terminal to show it, the session's output is not sent (join)
+    const s = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/api/term' + (term ? '' : '?join=1'));
     s.binaryType = 'arraybuffer';
     ws = s;
     fresh = true;

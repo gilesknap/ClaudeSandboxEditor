@@ -465,6 +465,33 @@ def test_open_diff_only_shows_text_files_in_the_session_folder(md_editor, tmp_pa
     term.close()
 
 
+def test_open_diff_names_one_file_and_few_wait_at_once(md_editor, tmp_path, agent_log, root):
+    """openDiff's two paths must name one file; and at most IDE_DIFFS_MAX proposals wait at once,
+    one more being refused before md-editor looks at its file (a path it would refuse anyway
+    gets the same answer)."""
+    (root / "target.md").write_text(DOC)
+    (root / "other.md").write_text(DOC)
+    srv, term, claude = connected(md_editor, tmp_path, agent_log)
+    reply = claude.call(tool_call(2, "openDiff", {"old_file_path": str(root / "target.md"),
+                                                  "new_file_path": str(root / "other.md"),
+                                                  "new_file_contents": "x\n", "tab_name": "two"}))
+    assert reply["result"]["isError"] is True and "one file at a time" in texts(reply)[0], reply
+    for rid in range(10, 10 + S.IDE_DIFFS_MAX):
+        claude.send(open_diff(rid, root / "target.md", f"{rid}\n", tab=f"t{rid}"))
+    assert term.wait(lambda: len(browser_msgs(term, "diff")) == S.IDE_DIFFS_MAX)
+    for path in (root / "target.md", "/etc/passwd"):
+        reply = claude.call(open_diff(99, path, "x\n", tab="one too many"))
+        assert reply["result"]["isError"] is True and "too many changes" in texts(reply)[0], (path, reply)
+    assert len(browser_msgs(term, "diff")) == S.IDE_DIFFS_MAX and "/etc/passwd" not in srv.logtext()
+    # an answer makes room
+    d = wait_browser(term, "diff", lambda m: m["title"] == "t10")
+    term.send_json({"type": "diff-decision", "id": d["id"], "accept": False})
+    assert texts(claude.reply(10)) == ["DIFF_REJECTED", "t10"]
+    claude.send(open_diff(100, root / "target.md", "y\n", tab="t100"))
+    assert wait_browser(term, "diff", lambda m: m["title"] == "t100")
+    term.close()
+
+
 def test_a_proposal_shown_can_always_be_accepted(md_editor, tmp_path, agent_log, root):
     """The page answers with the whole file as JSON in one /api/term message (at most 4 MiB):
     a proposal over IDE_DIFF_MAX as JSON (newlines and quotes count twice) is not shown, so
@@ -914,6 +941,39 @@ def test_launcher_mode_hook_relays_tcp_to_the_socket(md_editor, tmp_path, agent_
     term.close()
 
 
+def test_the_agents_own_settings_get_the_links_merged_in(md_editor, tmp_path, agent_log):
+    """Claude Code takes only the last --settings it is given, so the link's are merged into the
+    agent command's own (JSON) rather than added after them, which would drop the user's; a
+    settings file, which md-editor cannot merge into, means no link instead."""
+    (tmp_path / "shared" / ".claude").mkdir(parents=True)
+    env = {"FAKE_AGENT_LOG": str(agent_log), "CLAUDE_SANDBOX_SHARED_CONFIG": str(tmp_path / "shared")}
+    agent = shlex.quote(fake_agent(tmp_path, "claude-sandbox"))
+    theirs = {"model": "haiku", "env": {"MINE": "1"}, "hooks": {
+        "SessionStart": [{"hooks": [{"type": "command", "command": "true"}]}], "Stop": []}}
+    srv = md_editor(agent=f"{agent} --permission-mode default --settings {shlex.quote(json.dumps(theirs))} --verbose",
+                    env=env)
+    term, st, report = session(srv)
+    assert st["ide"] == "waiting"
+    argv = report["argv"]
+    assert argv[:3] == ["--permission-mode", "default", "--settings"] and argv[4:] == ["--verbose"], argv
+    merged = json.loads(argv[3])
+    port = the_lock(lock_dir(tmp_path, "launcher")).stem
+    assert merged["model"] == "haiku" and merged["hooks"]["Stop"] == []
+    assert merged["env"] == {"MINE": "1", "CLAUDE_CODE_SSE_PORT": port}
+    first, relay = merged["hooks"]["SessionStart"]
+    assert first == theirs["hooks"]["SessionStart"][0] and "socat TCP4-LISTEN:" + port in relay["hooks"][0]["command"]
+    term.close()
+    srv.stop()
+    srv = md_editor(agent=f"{agent} --settings=/home/me/claude-settings.json", env=env)
+    term, st, report = session(srv)
+    assert st["ide"] == "off" and "settings file" in st["ide_reason"], st
+    assert report["argv"] == ["--settings=/home/me/claude-settings.json"]
+    assert not list(lock_dir(tmp_path, "launcher").glob("*.lock"))
+    term.close()
+    assert S.with_settings(["x", "--settings", "{}", "--settings", '{"a": 1}'], {"env": {"P": "1"}, "hooks": {
+        "SessionStart": []}}) == ["x", "--settings", "{}", "--settings", '{"a": 1, "env": {"P": "1"}, "hooks": {"SessionStart": []}}']
+
+
 def test_an_unrecognised_agent_gets_no_link_unless_asked(md_editor, tmp_path, agent_log):
     """Only claude and claude-sandbox are linked by default: another agent (bash, say) would not
     understand the --settings the launcher link appends. --ide-link launcher links it anyway."""
@@ -1067,6 +1127,44 @@ def test_stale_lock_files_are_swept_at_start(md_editor, tmp_path, agent_log, roo
         assert (shared / "21006.lock").exists() and os.path.lexists(root / ".md-editor-ide-21006.sock")
         assert sorted(p.name for p in shared.glob("*.lock")) == ["21006.lock", "21011.lock"]
         assert "removed a stale lock file" in srv.logtext()
+    finally:
+        live.close()
+
+
+def test_dead_sockets_in_the_session_folder_are_removed_at_spawn(md_editor, tmp_path, agent_log, root):
+    """A crashed md-editor's socket whose lock file has gone as well (sweep_ide_locks finds a
+    socket only through its lock) is removed when a launcher-mode session starts, if nothing
+    answers on it; a live one, one just made (another md-editor's, perhaps, about to listen)
+    and anything else of the name are left."""
+    old = time.time() - 3600
+
+    def dead(name, made=old):
+        s = socket.socket(socket.AF_UNIX)
+        s.bind(str(root / name))
+        s.close()
+        os.utime(root / name, (made, made))
+
+    dead(".md-editor-ide-21100.sock")
+    dead(".md-editor-ide-21101.sock", made=time.time())
+    live = socket.socket(socket.AF_UNIX)
+    live.bind(str(root / ".md-editor-ide-21102.sock"))
+    live.listen(4)
+    (root / ".md-editor-ide-21103.sock").write_text("not a socket")
+    for name in (".md-editor-ide-21102.sock", ".md-editor-ide-21103.sock"):
+        os.utime(root / name, (old, old))
+    try:
+        srv = start(md_editor, tmp_path, agent_log, mode="launcher")
+        term, st, report = session(srv)
+        assert st["ide"] == "waiting"
+        deadline = time.monotonic() + 5
+        while os.path.lexists(root / ".md-editor-ide-21100.sock") and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert not os.path.lexists(root / ".md-editor-ide-21100.sock")
+        for n in (21101, 21102, 21103):
+            assert os.path.lexists(root / f".md-editor-ide-{n}.sock"), n
+        assert os.path.lexists(root / f".md-editor-ide-{the_lock(lock_dir(tmp_path, 'launcher')).stem}.sock")
+        assert "removed a stale socket" in srv.logtext()
+        term.close()
     finally:
         live.close()
 

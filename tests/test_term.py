@@ -316,6 +316,28 @@ def test_replay_and_broadcast_to_a_second_client(srv):
             c2.close()
 
 
+def test_a_page_only_joined_gets_no_output(srv):
+    """/api/term?join=1 is a page with no terminal on screen (the panel hidden), there for the
+    IDE link's messages: it gets the status, but no replay and none of the session's output."""
+    c1 = running(srv)
+    j = None
+    try:
+        assert roundtrip(c1)
+        j = srv.ws(path="/api/term?join=1")
+        assert j.code == 101, j.status_line
+        st = j.wait_status()
+        assert st["state"] == "running" and st["id"] == 1
+        assert roundtrip(c1)
+        c1.send_json({"type": "restart"})
+        assert j.wait_status(lambda s: s["id"] == 2 and s["state"] == "running")
+        assert roundtrip(c1)
+        assert not [f for f in j.frames if f.op == 2], "no output (binary frames)"
+    finally:
+        c1.close()
+        if j:
+            j.close()
+
+
 def test_reconnect_finds_the_same_session(srv):
     c1 = running(srv)
     bash = int(shell_value(c1, "$$"))

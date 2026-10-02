@@ -369,6 +369,24 @@ def test_discard_asks_first(page, repo):
     expect(badge(page)).to_be_hidden()
 
 
+def test_discard_waits_for_claudes_proposed_change(page, repo):
+    """While Claude's proposed change to a file waits for an answer (held, as proposal.js holds
+    it), Discard leaves the file alone: git would change it under the proposal."""
+    open_scm(page)
+    page.evaluate("() => { window.__release = Tabs.hold('src/app.py', { msg: 'Held.' }); }")
+    scm_row(page, "src/app.py").click(button="right")
+    page.locator(".ctx-menu").get_by_role("menuitem", name="Discard changes…").click()
+    expect(page.locator("#toast")).to_contain_text("accept or reject it before discarding")
+    expect(page.get_by_role("alertdialog")).to_have_count(0)
+    assert disk(repo, "src/app.py") == APP_NOW
+    page.evaluate("() => window.__release()")
+    scm_row(page, "src/app.py").click(button="right")
+    page.locator(".ctx-menu").get_by_role("menuitem", name="Discard changes…").click()
+    page.get_by_role("alertdialog").get_by_role("button", name="Discard").click()
+    expect_rows(page, ["new.txt U", "src/old.py D"])
+    assert disk(repo, "src/app.py") == APP
+
+
 # ---------------------------------------------------------------- the Branch base
 
 def test_branch_mode(browser, srv, tmp_path):

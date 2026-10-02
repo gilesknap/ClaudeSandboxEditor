@@ -448,6 +448,109 @@ def test_a_proposal_over_unsaved_edits_says_so_and_a_too_large_accept_waits(page
     assert page.evaluate("() => App.cm.getValue()").startswith("Unsaved.\n# Session")
 
 
+def test_accepting_over_unsaved_edits_never_saves_them_over_claudes_write(page, ide, doc):
+    """Accept, with unsaved edits held in the file's tab and autosave on, and Claude slow to
+    write the file: the held text is not saved meanwhile (Claude's edit would then fail, the
+    accepted change lost). The tab stays read-only until Claude's write lands, and then shows
+    the conflict, the disk keeping Claude's version."""
+    page.evaluate("() => App.cm.replaceRange('Unsaved.\\n', {line: 0, ch: 0})")
+    rid, tab_name = open_diff(ide, doc, PROPOSED)
+    expect(page.locator(".proposal-tab .CodeMirror-merge")).to_be_visible()
+    page.evaluate("() => UI.store.set('mdedit.autosave.md', '1')")
+    page.locator(".proposal-tab").get_by_role("button", name="Accept").click()
+    assert ide.texts(rid) == ["FILE_SAVED", PROPOSED]
+    page.wait_for_timeout(6000)   # Claude takes its time (longer than the hold once was, and an autosave's delay)
+    assert doc.read_text(encoding="utf-8") == DOC, "the held text was saved over the file Claude is to write"
+    file_tab(page).click()
+    expect(page.locator("#banner")).to_contain_text("until Claude writes it")
+    assert page.evaluate("() => App.cm.getOption('readOnly')") is True
+    doc.write_text(PROPOSED, encoding="utf-8")   # Claude's write, at last
+    expect(page.locator("#banner")).to_contain_text("was changed on disk while you were editing")
+    page.wait_for_function("() => !App.cm.getOption('readOnly')")
+    page.wait_for_timeout(1500)
+    assert doc.read_text(encoding="utf-8") == PROPOSED
+    page.locator("#banner").get_by_role("button", name="Load disk version").click()
+    assert page.evaluate("() => App.cm.getValue()") == PROPOSED
+    expect(page.locator("#banner")).to_be_hidden()
+
+
+def test_a_proposal_answered_in_the_terminal_leaves_unsaved_edits_unsaved(page, ide, doc):
+    """Answered in the terminal (Claude closes the tab), perhaps with Yes: Claude may be about
+    to write the file, so the unsaved edits the proposal held back are not autosaved then."""
+    page.evaluate("() => App.cm.replaceRange('Unsaved.\\n', {line: 0, ch: 0})")
+    rid, tab_name = open_diff(ide, doc, PROPOSED)
+    expect(proposal_tab(page)).to_be_visible()
+    page.evaluate("() => UI.store.set('mdedit.autosave.md', '1')")
+    assert ide.texts(ide.tool("close_tab", {"tab_name": tab_name})) == ["TAB_CLOSED"]
+    expect(proposal_tab(page)).to_have_count(0)
+    page.wait_for_timeout(1500)
+    assert doc.read_text(encoding="utf-8") == DOC
+    file_tab(page).click()
+    page.wait_for_function("() => !App.cm.getOption('readOnly')")
+    assert page.evaluate("() => Tabs.model('a.md').dirty") is True
+
+
+def test_closing_several_tabs_leaves_a_waiting_proposal(page, ide, doc, srv):
+    """Close to the right, Close others and Close all (like Close saved) leave Claude's proposed
+    change open and waiting: closing it is a rejection, which only its own Close makes."""
+    (srv.root / "b.md").write_text("# B\n", encoding="utf-8")
+    b_tab = page.locator(".etab", has=page.locator(".etab-name", has_text=re.compile(r"^b\.md$")))
+
+    def menu(tab, item):
+        tab.click(button="right")
+        page.locator(".ctx-menu").get_by_role("menuitem", name=item).click()
+
+    try:
+        rid, tab_name = open_diff(ide, doc, PROPOSED)
+        expect(proposal_tab(page)).to_have_class(re.compile(r"\bactive\b"))
+        page.evaluate("() => Tabs.open('b.md', { preview: false })")
+        expect(b_tab).to_have_count(1)
+        menu(file_tab(page), "Close to the right")
+        expect(b_tab).to_have_count(0)
+        expect(proposal_tab(page)).to_have_count(1)
+        expect(page.locator("#toast")).to_contain_text("Claude waits for you to accept or reject it")
+        page.evaluate("() => Tabs.open('b.md', { preview: false })")
+        menu(b_tab, "Close others")
+        expect(file_tab(page)).to_have_count(0)
+        expect(proposal_tab(page)).to_have_count(1)
+        menu(b_tab, "Close all")
+        expect(b_tab).to_have_count(0)
+        expect(proposal_tab(page)).to_have_count(1)
+        page.wait_for_timeout(300)
+        assert ide.response(rid) is None, "not rejected"
+        # with only the proposal left, there is nothing for Close others to close
+        proposal_tab(page).click(button="right")
+        expect(page.locator(".ctx-menu").get_by_role("menuitem", name="Close others")).to_be_disabled()
+        page.keyboard.press("Escape")
+        proposal_tab(page).click()
+        page.locator(".proposal-tab").get_by_role("button", name="Reject").click()
+        assert ide.texts(rid) == ["DIFF_REJECTED", tab_name]
+    finally:
+        (srv.root / "b.md").unlink()
+
+
+def test_a_decision_made_while_disconnected_is_sent_on_reconnecting(page, ide, doc):
+    """An Accept made while the page's /api/term socket is down waits in term.js's outbox and
+    goes as soon as the page is connected again."""
+    rid, tab_name = open_diff(ide, doc, PROPOSED)
+    expect(page.locator(".proposal-tab .CodeMirror-merge")).to_be_visible()
+    n = page.evaluate("() => window.__sockets.length")
+    page.evaluate("""() => {
+        window.__sockets[window.__sockets.length - 1].close();
+        document.querySelector('.proposal-tab [data-act="accept"]').click();
+    }""")
+    expect(proposal_tab(page)).to_have_count(0)
+    page.wait_for_timeout(300)
+    assert ide.response(rid) is None, "the socket was down: it waits"
+    assert not [m for m in page.sent if m.get("type") == "diff-decision"]
+    page.wait_for_function(f"() => window.__sockets.length > {n}", timeout=10000)
+    decisions = until(lambda: [m for m in page.sent if m.get("type") == "diff-decision"], what="the decision", pg=page)
+    assert len(decisions) == 1 and decisions[0]["accept"] is True and decisions[0]["contents"] == PROPOSED
+    assert ide.texts(rid) == ["FILE_SAVED", PROPOSED]
+    page.wait_for_timeout(300)
+    expect(proposal_tab(page)).to_have_count(0)   # sent again on attach, it is not shown again
+
+
 def test_rejecting_or_closing_a_proposed_edit_says_no(page, ide, doc):
     rid, tab_name = open_diff(ide, doc, PROPOSED)
     expect(proposal_tab(page)).to_be_visible()
