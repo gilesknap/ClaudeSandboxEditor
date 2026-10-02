@@ -31,6 +31,7 @@ const Term = (() => {
   let expectReplay = false;   // the next binary frame is the scrollback replay
   let replaying = 0;          // replies xterm makes to queries in a replay are not sent
   let pending = [], pendingLen = 0;   // input typed before the session can take it
+  let lost = false;           // the connection to a session on screen dropped; keys go nowhere
   let shownId;                // id of the session whose output the terminal holds
   let status = { state: 'none', id: null, cwd: null };
   let sent = { cols: 0, rows: 0 };
@@ -139,6 +140,9 @@ const Term = (() => {
     s.onclose = () => {
       if (s !== ws) return;
       ws = null;
+      // keys typed at a dead panel must not reach whatever session answers the reconnect
+      // (a restarted server's, or one another tab restarted)
+      if (shownId !== undefined) { lost = true; clearPending(); }
       if (!announced) {
         announced = true;
         term.write('\r\n\x1b[2m[disconnected — reconnecting…]\x1b[22m\r\n');
@@ -175,7 +179,8 @@ const Term = (() => {
     if (first || m.id !== shownId) { term.reset(); shownId = m.id; }
     expectReplay = first && (m.state === 'running' || m.state === 'exited');
     status = m;
-    if (m.state === 'exited' || m.state === 'failed') pending = [], pendingLen = 0;
+    lost = false;
+    if (m.state === 'exited' || m.state === 'failed') clearPending();
     renderNotice();
     flush();
   }
@@ -185,21 +190,25 @@ const Term = (() => {
   const ended = () => status.state === 'exited' || status.state === 'failed';
   // the running session can take input: connected, its status and any replay are in
   const ready = () => open() && !fresh && !expectReplay && !replaying && status.state === 'running';
-  // xterm's own answers to terminal queries (device attributes, cursor position, mode and
-  // colour reports, focus events); those made while drawing a replay answer old queries
-  const REPLY = /^\x1b(\[[?>]?[\d;]*(\$y|[cnRtIO])|\][\s\S]*(\x07|\x1b\\)|P[\s\S]*\x1b\\)$/;
+  // dropped while a replay is drawn: xterm's own answers to terminal queries (device
+  // attributes, cursor position, mode and colour reports), which answer old queries, and
+  // mouse reports (SGR and X10), which point at a screen still being drawn
+  const REPLY = /^\x1b(\[[?>]?[\d;]*(\$y|[cnRt])|\[<[\d;]*[Mm]|\[M[\s\S]{3}|\][\s\S]*(\x07|\x1b\\)|P[\s\S]*\x1b\\)$/;
   const PENDING_MAX = 1 << 20;
 
   // Keys typed while connecting, or while a replay is drawn, wait here rather than being lost.
   function flush() {
     if (!ready() || !pending.length) return;
     const queued = pending.join('');
-    pending = [], pendingLen = 0;
+    clearPending();
     sendBytes(enc.encode(queued));
   }
 
+  function clearPending() { pending = []; pendingLen = 0; }
+
   function onInput(s) {
     if (ended()) { if (s === '\r') restart(); return; }
+    if (lost) return;
     if (ready()) { flush(); sendBytes(enc.encode(s)); return; }
     if (replaying && REPLY.test(s)) return;
     if (pendingLen + s.length <= PENDING_MAX) { pending.push(s); pendingLen += s.length; }

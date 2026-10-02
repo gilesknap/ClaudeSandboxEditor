@@ -113,6 +113,7 @@ SLOW_SOCKET = """(() => {   // the page's WebSockets take 1.5 s to start connect
     constructor(url) {
       this.readyState = 0;
       this.binaryType = 'blob';
+      window.__wsStarted = performance.now();
       setTimeout(() => {
         const r = this._r = new Real(url);
         r.binaryType = this.binaryType;
@@ -131,15 +132,52 @@ SLOW_SOCKET = """(() => {   // the page's WebSockets take 1.5 s to start connect
 
 
 def test_keys_typed_while_connecting_are_kept(browser, srv):
+    """Keys typed before the socket opens wait for the session (the replay path when an
+    earlier test has started it, else the spawn path) rather than being lost."""
     ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    errors = []
     try:
         ctx.add_init_script(SLOW_SOCKET)
         pg = ctx.new_page()
+        pg.on("pageerror", lambda e: errors.append(str(e)))
         pg.goto(srv.base + "#a.md")
         pg.locator("#term .xterm").click()
-        assert pg.evaluate("() => performance.now()") < 1500, "typed before the socket opened"
+        assert pg.evaluate("() => performance.now() - window.__wsStarted") < 1500, \
+            "typed before the socket opened"
         pg.keyboard.type("echo early-$((40+3))\n")
         wait_term_line(pg, "early-43")
+    finally:
+        ctx.close()
+    assert not errors, errors
+
+
+TRACK_SOCKETS = """(() => {   // keep the page's WebSockets where a test can close them
+  const Real = window.WebSocket;
+  window.__sockets = [];
+  window.WebSocket = class extends Real {
+    constructor(...a) { super(...a); window.__sockets.push(this); }
+  };
+})()"""
+
+
+def test_keys_typed_while_disconnected_are_dropped(browser, srv):
+    """Keys typed at a panel whose connection dropped are not sent to whatever session
+    answers the reconnect (after a server restart it would be a different one)."""
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    try:
+        ctx.add_init_script(TRACK_SOCKETS)
+        pg = ctx.new_page()
+        pg.goto(srv.base + "#a.md")
+        pg.locator("#term .xterm").click()
+        pg.keyboard.type("echo before-$((3+4))\n")
+        wait_term_line(pg, "before-7")
+        pg.evaluate("() => window.__sockets.at(-1).close()")
+        wait_term_line(pg, r"\[disconnected — reconnecting…\]")
+        pg.keyboard.type("echo stale-$((5+5))\n")   # the retry waits a second
+        pg.wait_for_function("() => window.__sockets.length > 1 && window.__sockets.at(-1).readyState === 1")
+        pg.keyboard.type("echo after-$((6+6))\n")
+        wait_term_line(pg, "after-12")
+        assert "stale-10" not in term_text(pg)   # only output contains it; the echoed command does not
     finally:
         ctx.close()
 
