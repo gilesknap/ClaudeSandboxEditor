@@ -17,6 +17,7 @@ let cards = [];
 let cardSeq = 0;
 let skills = [];
 let applyingRemote = false;
+let askConf = { available: false, reason: '' };   // /api/config's "ask": can Ask Claude run?
 
 // ------------------------------------------------------------------ editor
 
@@ -488,9 +489,10 @@ pill.addEventListener('mousedown', e => e.preventDefault());
 pill.onclick = () => { pill.hidden = true; openAsk('editor', true); };
 cm.getWrapperElement().addEventListener('mouseup', () => setTimeout(() => {
   lastSelSource = 'editor';
-  if (!cm.somethingSelected()) { pill.hidden = true; return; }
+  if (!cm.somethingSelected() || !askConf.available) { pill.hidden = true; return; }
   const c = cm.cursorCoords(cm.getCursor('to'), 'window');
   placeFloating(pill, c.left, c.bottom + 6);
+  if (pill.hidden) prepareAsk();
   pill.hidden = false;
 }, 0));
 cm.on('keydown', () => { pill.hidden = true; });
@@ -547,7 +549,28 @@ function buildPresets() {
   }
 }
 
+// Ask the server to make the session that holds this document before the first card needs
+// it (the server keeps one per document version, so an unchanged document is skipped).
+let prepared = null;
+function prepareAsk() {
+  if (!askConf.available || !cur.path) return;
+  const body = { path: cur.path, doc: cm.getValue(), model: $('#model').value };
+  if (prepared && ['path', 'doc', 'model'].every(k => prepared[k] === body[k])) return;
+  prepared = body;
+  api('POST', '/api/ask/prepare', body).catch(() => { if (prepared === body) prepared = null; });
+}
+
+// Ask Claude can't run (see askConf.reason): show why on the Suggestions tab.
+function showAskUnavailable() {
+  document.body.classList.remove('no-claude');
+  setPanelTab('suggestions', false);
+  renderCards();
+  cm.refresh();
+}
+
 function openAsk(source, focus) {
+  if (!askConf.available) { if (focus) showAskUnavailable(); return; }
+  prepareAsk();
   askTarget = currentRange(source);
   if (source !== 'preview') previewRange = null;
   const bar = $('#askbar');
@@ -587,6 +610,7 @@ document.addEventListener('mousedown', e => {
   if (!$('#askbar').hidden && !e.target.closest('#askbar')) closeAsk();
 });
 document.addEventListener('keydown', e => {
+  if (e.target instanceof Element && e.target.closest('#term')) return;   // Claude Code uses these keys
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'j' && !cm.hasFocus()) { e.preventDefault(); openAsk(lastSelSource, true); }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's' && !cm.hasFocus()) { e.preventDefault(); save(); }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'o' && !cm.hasFocus()) { e.preventDefault(); openBrowser(); }
@@ -616,6 +640,7 @@ function createCard({ from, to, whole, instruction, mode, label }) {
   markCard(c, 'pending');
   cards.unshift(c);
   document.body.classList.remove('no-claude');
+  setPanelTab('suggestions', false);   // cards don't outlive a reload, so the remembered tab stays
   run(c);
 }
 
@@ -640,9 +665,11 @@ async function run(c, feedback) {
     body.instruction = c.instruction + '\n\n(Give a noticeably different version from the previous attempt.)';
     body.previous = c.result;
   }
+  if (body.previous && c.session) body.session = c.session;   // the server forks the card's session
   try {
     const res = await api('POST', '/api/ask', body);
     if (c.status === 'cancelled') return;
+    c.session = res.session || null;
     if (c.mode === 'replace') {
       const lead = c.original.match(/^\s*/)[0], trail = c.original.match(/\s*$/)[0];
       c.result = lead + res.result.trim() + trail;
@@ -683,10 +710,16 @@ function accept(c) {
 }
 
 function renderCards() {
+  const open = cards.filter(c => ['pending', 'ready'].includes(c.status)).length;
+  $('#cards-count').textContent = open;
+  $('#cards-count').hidden = !open;
   const box = $('#cards');
   box.replaceChildren();
   if (!cards.length) {
-    box.innerHTML = `<p class="muted hint">Highlight text in the editor or the preview, then pick an action from the pop-up (or press <kbd>Ctrl</kbd>+<kbd>J</kbd>). With nothing selected, the request applies to the whole document.</p>`;
+    box.innerHTML = askConf.available
+      ? `<p class="muted hint">Highlight text in the editor or the preview, then pick an action from the pop-up (or press <kbd>Ctrl</kbd>+<kbd>J</kbd>). With nothing selected, the request applies to the whole document.</p>`
+      : `<div class="muted hint"><p><strong>Ask Claude unavailable</strong></p><p>${esc(askConf.reason || 'unknown reason.')}</p>
+         <p>Choose how it runs with <code>md-editor --ask-agent CMD</code> (or the <code>MDEDIT_ASK_AGENT</code> environment variable).</p></div>`;
     return;
   }
   for (const c of cards) box.appendChild(cardEl(c));
@@ -903,6 +936,7 @@ function setRoot(root) {
   rootDir = root;
   $('#file-root').textContent = root;
   $('#stat-root').textContent = root;
+  Term.onRootChange(root);
 }
 
 $('#open-browse').onclick = openBrowser;
@@ -975,13 +1009,14 @@ function setView(mode) {
   setTimeout(() => { cm.refresh(); renderPreview(); }, 0);
 }
 $('#toggle-files').onclick = () => { document.body.classList.toggle('no-files'); store.set('mdedit.files', document.body.classList.contains('no-files') ? '0' : '1'); cm.refresh(); };
-$('#toggle-claude').onclick = () => { document.body.classList.toggle('no-claude'); cm.refresh(); };
+$('#toggle-claude').onclick = () => { document.body.classList.toggle('no-claude'); cm.refresh(); Term.visible(); };
 
 function setTheme(dark) {
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
   $('#gh-css').href = `https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-${dark ? 'dark' : 'light'}.min.css`;
   $('#hl-css').href = `https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github${dark ? '-dark' : ''}.min.css`;
   MD.initMermaid(dark);
+  Term.setTheme(dark);
   store.set('mdedit.theme', dark ? 'dark' : 'light');
   renderPreview();
 }
@@ -990,6 +1025,66 @@ $('#model').value = store.get('mdedit.model', '');
 $('#model').onchange = () => store.set('mdedit.model', $('#model').value);
 
 window.addEventListener('beforeunload', e => { if (cur.dirty) { save(); e.preventDefault(); } });
+
+// ------------------------------------------------------------------ Claude panel: tabs and width
+
+const panel = $('#claude');
+
+// 'terminal' (Claude Code, term.js) or 'suggestions' (the Ask Claude cards)
+function setPanelTab(tab, persist = true) {
+  if (tab !== 'terminal') tab = 'suggestions';
+  panel.dataset.tab = tab;
+  for (const b of document.querySelectorAll('#panel-tabs .tab')) {
+    b.classList.toggle('on', b.dataset.tab === tab);
+    b.setAttribute('aria-selected', b.dataset.tab === tab ? 'true' : 'false');
+  }
+  if (persist) store.set('mdedit.panelTab', tab);
+  Term.visible();
+}
+document.querySelectorAll('#panel-tabs .tab').forEach(b => b.onclick = () => {
+  setPanelTab(b.dataset.tab);
+  if (b.dataset.tab === 'terminal') Term.focus();
+});
+setPanelTab(store.get('mdedit.panelTab', 'terminal'), false);
+
+const PANEL_MIN = 280;
+const defaultPanelWidth = () => Math.max(360, Math.min(innerWidth * 0.4, 640));
+function setPanelWidth(w, persist) {
+  w = Math.round(Math.max(PANEL_MIN, Math.min(innerWidth * 0.75, w)));
+  panel.style.width = w + 'px';
+  if (persist) store.set('mdedit.panelWidth', String(w));
+}
+const applyPanelWidth = () => setPanelWidth(+store.get('mdedit.panelWidth', 0) || defaultPanelWidth());
+applyPanelWidth();
+window.addEventListener('resize', applyPanelWidth);
+
+// Drag the panel's left edge to resize it; the terminal is refitted once, on release.
+$('#panel-resize').addEventListener('pointerdown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  const handle = e.currentTarget;
+  const right = panel.getBoundingClientRect().right;
+  handle.setPointerCapture(e.pointerId);
+  document.body.classList.add('panel-resizing');
+  const move = ev => setPanelWidth(right - ev.clientX);
+  const up = () => {
+    handle.removeEventListener('pointermove', move);
+    handle.removeEventListener('pointerup', up);
+    handle.removeEventListener('pointercancel', up);
+    document.body.classList.remove('panel-resizing');
+    setPanelWidth(panel.getBoundingClientRect().width, true);
+    cm.refresh();
+    Term.fit();
+  };
+  handle.addEventListener('pointermove', move);
+  handle.addEventListener('pointerup', up);
+  handle.addEventListener('pointercancel', up);
+});
+$('#panel-resize').addEventListener('dblclick', () => {
+  store.set('mdedit.panelWidth', '');
+  applyPanelWidth();
+  cm.refresh();
+});
 
 // ------------------------------------------------------------------ start
 
@@ -1003,7 +1098,16 @@ window.addEventListener('beforeunload', e => { if (cur.dirty) { save(); e.preven
   const conf = await api('GET', '/api/config');
   skills = conf.skills;
   fileList = conf.files;
+  Term.init(conf.agent);
+  askConf = conf.ask || { available: false, reason: 'This md-editor server has no Ask Claude support.' };
+  const askBtn = $('#toolbar [data-cmd="ask"]');
+  askBtn.disabled = !askConf.available;
+  askBtn.title = askConf.available ? `Ask Claude about the selection (Ctrl+J), via ${askConf.cmd}` : `Ask Claude unavailable: ${askConf.reason}`;
+  renderCards();
+  const agentOk = !!conf.agent?.available;
+  $('#tab-terminal').title = agentOk ? `Claude Code (${conf.agent.cmd}) in the open folder` : 'Claude Code terminal (unavailable)';
   setRoot(conf.root);
+  setPanelTab(agentOk ? store.get('mdedit.panelTab', 'terminal') : 'suggestions', false);
   buildPresets();
   renderFiles();
   const fromHash = decodeURIComponent(location.hash.slice(1));

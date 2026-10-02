@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Stand-in for `claude -p --output-format json`, enough for md-editor's Ask Claude.
+
+Like the real CLI it takes the prompt as an argument, or from stdin when stdin is not a
+terminal. Run by fake-sandbox (FAKE_SANDBOX=1) it first re-runs itself under script(1), as
+claude-sandbox's shadow `claude` does, so its stdin is a terminal and only an argument works.
+
+Sessions are JSON files under $FAKE_CLAUDE_STATE/sessions/<cwd>/, so --resume only finds a
+session made in the same folder, --fork-session copies it, and an unknown session is an error.
+Every call is logged to $FAKE_CLAUDE_STATE/claude.log. The reply is "OK" for a base (document)
+message, else "ECHO:" + a JSON digest of what was received.
+
+Flag files in $FAKE_CLAUDE_STATE: fail-resume (every --resume fails), is-error (reply is_error),
+hang (never answer; appends its PID to "hanging"), noise (print non-JSON lines first).
+"""
+import hashlib
+import json
+import os
+import shlex
+import sys
+import time
+import uuid
+
+STATE = os.environ.get("FAKE_CLAUDE_STATE") or "/tmp/fake-claude-state"
+FLAGS = ("-p", "--print", "--fork-session", "--no-session-persistence")
+VALUED = ("--output-format", "--resume", "-r", "--model", "--append-system-prompt")
+VARIADIC = ("--tools", "--allowedTools", "--allowed-tools")
+
+
+def flag(name):
+    return os.path.exists(os.path.join(STATE, name))
+
+
+def parse(argv):
+    opts, pos, i = {"tools": [], "allowed": []}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--":
+            pos += argv[i + 1:]
+            break
+        if a in FLAGS:
+            opts[a] = True
+        elif a in VALUED:
+            opts[a] = argv[i + 1]
+            i += 1
+        elif a in VARIADIC:
+            key = "tools" if a == "--tools" else "allowed"
+            while i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                opts[key].append(argv[i + 1])
+                i += 1
+        elif a.startswith("-"):
+            raise SystemExit(f"error: unknown option '{a}'")
+        else:
+            pos.append(a)
+        i += 1
+    return opts, pos
+
+
+def main(argv):
+    if os.environ.get("FAKE_SANDBOX") and not os.environ.get("FAKE_SHADOWED"):
+        # the shadow wrapper: the agent runs on a fresh PTY, whatever our stdin is
+        os.environ["FAKE_SHADOWED"] = "1"
+        cmd = shlex.join([sys.executable, os.path.abspath(__file__)] + argv)
+        os.execvp("script", ["script", "--return", "-q", "-E", "never", "-c", cmd, "/dev/null"])
+    opts, pos = parse(argv)
+    tty = os.isatty(0)
+    if pos:
+        prompt = pos[0]
+    elif tty:
+        print("Error: Input must be provided either through stdin or as a prompt argument when using --print",
+              file=sys.stderr)
+        return 1
+    else:
+        prompt = sys.stdin.read()
+    if flag("hang"):
+        print("thinking...", flush=True)
+        with open(os.path.join(STATE, "hanging"), "a") as f:
+            f.write(f"{os.getpid()}\n")
+        time.sleep(300)
+        return 1
+    cwd = os.getcwd()
+    sdir = os.path.join(STATE, "sessions", cwd.strip("/").replace("/", "-"))
+    os.makedirs(sdir, exist_ok=True)
+    resume = opts.get("--resume") or opts.get("-r")
+    history = []
+    if resume:
+        path = os.path.join(sdir, resume + ".json")
+        if flag("fail-resume") or not os.path.exists(path):
+            print(f"No conversation found with session ID: {resume}", file=sys.stderr)
+            return 1
+        with open(path) as f:
+            history = json.load(f)["messages"]
+    sid = resume if resume and not opts.get("--fork-session") else str(uuid.uuid4())
+    messages = history + [prompt]
+    persisted = not opts.get("--no-session-persistence")
+    if persisted:
+        with open(os.path.join(sdir, sid + ".json"), "w") as f:
+            json.dump({"messages": messages, "parent": resume}, f)
+    sysp = opts.get("--append-system-prompt", "")
+    digest = {
+        "n": len(messages), "doc_msgs": sum('<document path="' in m for m in messages),
+        "last_doc": '<document path="' in prompt, "last_request": "<request" in prompt,
+        "last_update": "<document_update>" in prompt, "last_len": len(prompt),
+        "sys": hashlib.sha256(sysp.encode()).hexdigest()[:10], "model": opts.get("--model"),
+        "session": sid, "parent": resume, "persisted": persisted, "tty": tty, "cwd": cwd,
+        "tools": opts["tools"], "allowed": opts["allowed"],
+    }
+    is_base = "Reply with just OK." in prompt and "<request" not in prompt
+    is_error = flag("is-error")
+    result = "API Error: fake failure" if is_error else "OK" if is_base else "ECHO:" + json.dumps(digest)
+    with open(os.path.join(STATE, "claude.log"), "a") as f:
+        f.write(json.dumps(dict(digest, argv=argv, prompt=prompt, base=is_base, is_error=is_error,
+                                fork=bool(opts.get("--fork-session")), t=time.time())) + "\n")
+    out = {"type": "result", "subtype": "success", "is_error": is_error, "result": result,
+           "session_id": sid, "total_cost_usd": 0,
+           "usage": {"input_tokens": len(prompt) // 4, "cache_read_input_tokens": sum(map(len, history)) // 4,
+                     "cache_creation_input_tokens": 0, "output_tokens": 5}}
+    if flag("noise"):
+        print('Warning: {not json} and {"type": "system", "subtype": "init"}')
+        print(json.dumps({"type": "system", "subtype": "init", "session_id": "not-this-one"}))
+    # the real CLI writes terminal escapes around its output on a TTY
+    sys.stdout.write(("\x1b[?25l" if tty else "") + json.dumps(out) + "\n" + ("\x1b[?25h" if tty else ""))
+    sys.stdout.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

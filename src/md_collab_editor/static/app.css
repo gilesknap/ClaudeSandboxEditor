@@ -83,7 +83,7 @@ kbd { font: 11px var(--mono); border: 1px solid var(--border); border-bottom-wid
   display: flex; flex-direction: column; min-height: 0;
 }
 #files { width: 220px; }
-#claude { width: 360px; border-right: 0; border-left: 1px solid var(--border); }
+#claude { width: 360px; border-right: 0; border-left: 1px solid var(--border); position: relative; }
 body.no-files #files, body.no-claude #claude { display: none; }
 .side-head {
   display: flex; justify-content: space-between; align-items: center;
@@ -120,6 +120,7 @@ body.no-files #files, body.no-claude #claude { display: none; }
 #toolbar #spell.on { color: var(--accent); text-decoration: none; }
 #toolbar #spell:disabled { opacity: 0.4; }
 #toolbar .ask-btn { color: var(--claude); border-color: var(--claude); font-weight: 600; }
+#toolbar .ask-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 
 #editor { flex: 1; min-height: 0; }
 .CodeMirror {
@@ -249,6 +250,52 @@ body.no-files #files, body.no-claude #claude { display: none; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
+/* ---------- Claude panel: tabs, resize handle and terminal */
+#panel-resize {
+  position: absolute; top: 0; bottom: 0; left: -3px; width: 5px; z-index: 6;
+  cursor: col-resize; touch-action: none;
+}
+#panel-resize:hover, body.panel-resizing #panel-resize { background: var(--accent); opacity: 0.5; }
+body.panel-resizing { user-select: none; }
+body.panel-resizing, body.panel-resizing * { cursor: col-resize !important; }
+#panel-head { padding: 0 8px 0 2px; align-items: stretch; gap: 8px; }
+#panel-tabs { display: flex; min-width: 0; }
+.tab {
+  background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; margin-bottom: -1px;
+  padding: 9px 8px 7px; font-weight: 600; color: var(--fg-muted); white-space: nowrap;
+}
+.tab:hover { color: var(--fg); border-color: transparent; }
+.tab.on, .tab.on:hover { color: var(--fg); border-bottom-color: var(--claude); }
+.tab .count {
+  display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 5px; border-radius: 8px;
+  background: var(--claude); color: #fff; font-size: 11px; line-height: 16px; text-align: center;
+}
+.tab .count[hidden] { display: none; }
+.tab-actions { display: flex; align-items: center; gap: 6px; }
+#claude[data-tab="terminal"] #cards, #claude[data-tab="terminal"] #clear-cards,
+#claude[data-tab="suggestions"] #term-wrap, #claude[data-tab="suggestions"] #term-restart { display: none; }
+#term-restart[hidden] { display: none; }
+#term-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
+#term-notice {
+  flex: none; display: flex; flex-direction: column; gap: 4px; padding: 6px 10px; font-size: 12px;
+  background: var(--ready-bg); border-bottom: 1px solid var(--border);
+}
+#term-notice[hidden] { display: none; }
+#term-notice > div { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; }
+#term-notice .path, #term-notice code { font: 11.5px var(--mono); word-break: break-all; }
+#term-notice button { font-size: 12px; padding: 0 8px; }
+/* content-box, so the fit addon measures the space inside the padding */
+#term {
+  flex: 1; min-height: 0; box-sizing: content-box; padding: 4px 0 4px 6px;
+  background: var(--bg); overflow: hidden; position: relative; z-index: 0;
+}
+#term .xterm { height: 100%; }
+#term .xterm-viewport { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+#term-wrap.off #term { padding: 0; overflow: auto; }
+.term-off { padding: 8px 12px; font-size: 13px; }
+.term-off p { margin: 0 0 8px; }
+.term-off code { font: 12px var(--mono); background: var(--bg-inset); border-radius: 4px; padding: 0 4px; }
+
 /* ---------- file browser */
 #browser {
   position: fixed; inset: 0; z-index: 50; background: rgba(1, 4, 9, 0.45);
@@ -291,7 +338,8 @@ body.no-files #files, body.no-claude #claude { display: none; }
 @media (max-width: 800px) {
   #files, #claude { position: fixed; top: 44px; bottom: 24px; z-index: 20; box-shadow: var(--shadow); }
   #files { left: 0; }
-  #claude { right: 0; width: min(360px, 100vw); }
+  #claude { right: 0; width: min(480px, 100vw) !important; }
+  #panel-resize { display: none; }
   #main.split #preview-pane { display: none; }
   #main.split #editor-pane { border-right: 0; }
   #preview { padding: 16px 16px 50vh; }
