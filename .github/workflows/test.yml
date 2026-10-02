@@ -1,0 +1,28 @@
+# Run the tests on every push and pull request, on the oldest and newest supported Pythons.
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.13"]
+    env:
+      # Playwright needs Python 3.10+: elsewhere the browser tests must run, not skip
+      MD_EDITOR_E2E: ${{ matrix.python-version != '3.9' && 'require' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - run: uv sync --group dev
+      - name: Install Chromium for the browser tests
+        if: matrix.python-version != '3.9'
+        run: uv run playwright install --with-deps chromium
+      - run: uv run pytest -v
