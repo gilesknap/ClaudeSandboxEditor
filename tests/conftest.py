@@ -24,11 +24,17 @@ class Servers:
         self.base, self.root, self.servers = base, root, []
 
     def start(self, root=None, **kw):
-        """start(root=..., agent="none", ask_agent="none", args=(), env=None) -> Server"""
+        """start(root=..., agent="none", args=(), env=None) -> Server"""
         work = self.base / f"server{len(self.servers)}"
         (work / "tmp").mkdir(parents=True)
-        # native Ask Claude runs in $XDG_CACHE_HOME/md-editor/ask: not the real ~/.cache
-        kw["env"] = dict({"TMPDIR": str(work / "tmp"), "XDG_CACHE_HOME": str(work / "cache")},
+        # the IDE link's lock files go to folders of the test's own, never ~/.claude/ide: in
+        # native mode (an agent called claude) $CLAUDE_CONFIG_DIR/ide; in launcher mode (any
+        # other agent) $CLAUDE_SANDBOX_SHARED_CONFIG/.claude/ide, and as that has no .claude
+        # folder, launcher mode has no link (and appends nothing to the agent's arguments)
+        # unless a test makes one
+        kw["env"] = dict({"TMPDIR": str(work / "tmp"), "XDG_CACHE_HOME": str(work / "cache"),
+                          "CLAUDE_CONFIG_DIR": str(work / "claude-config"),
+                          "CLAUDE_SANDBOX_SHARED_CONFIG": str(work / "sandbox-config")},
                          **(kw.get("env") or {}))
         srv = Server(root or self.root, work, **kw)
         self.servers.append(srv)
@@ -51,7 +57,7 @@ def root(tmp_path):
 
 @pytest.fixture
 def md_editor(tmp_path, root):
-    """Factory: md_editor(root=root, agent="none", ask_agent="none", args=(), env=None) starts
+    """Factory: md_editor(root=root, agent="none", args=(), env=None) starts
     `python -m md_collab_editor` on a free port and returns its Server (base URL in .base).
     On teardown every server is stopped (SIGTERM to its group) and nothing it started may
     still be running."""

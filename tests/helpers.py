@@ -25,10 +25,9 @@ MARKER = "MDEDIT_TEST_RUN"   # set in each server's environment, so its leftover
 
 
 def _linux_tools():
-    """Linux with util-linux script(1) 2.35 or later: fakes/claude runs under it with the
-    options claude-sandbox's wrapper uses, --echo (-E) among them, which 2.35 added (BSD
-    script, as on macOS, takes other options); fakes/fake-sandbox uses GNU stat, and the
-    terminal tests drive bash and read /proc."""
+    """Linux with util-linux script(1) 2.35 or later (--echo (-E), which 2.35 added, is the
+    sign; BSD script, as on macOS, takes other options): the terminal tests drive bash and
+    read /proc, and rely on GNU tools."""
     if not sys.platform.startswith("linux"):
         return False
     try:
@@ -123,26 +122,21 @@ def marked_pids(tag):
 # ---------------------------------------------------------------- server
 
 class Server:
-    """`python -m md_collab_editor ROOT --port 0 ...` in its own process group. Fake claude
-    state (call logs, flag files) lives in `state`."""
+    """`python -m md_collab_editor ROOT --port 0 ...` in its own process group."""
 
-    def __init__(self, root, workdir, args=(), env=None, agent="none", ask_agent="none"):
+    def __init__(self, root, workdir, args=(), env=None, agent="none"):
         self.root = Path(root)
-        self.state = Path(workdir) / "fake-state"
-        self.state.mkdir(parents=True, exist_ok=True)
         self.logpath = Path(workdir) / "server.log"
         self.tag = os.urandom(8).hex()
         e = {k: v for k, v in os.environ.items() if not k.startswith("MDEDIT_")}
         # started as if from inside a Claude Code session, whose markers must not reach the agents
-        e.update({MARKER: self.tag, "FAKE_CLAUDE_STATE": str(self.state), "CLAUDECODE": "1",
+        e.update({MARKER: self.tag, "CLAUDECODE": "1",
                   "CLAUDE_CODE_CHILD_SESSION": "1", "CLAUDE_CODE_SESSION_ID": "parent-session",
                   "PYTHONPATH": os.pathsep.join(filter(None, [str(SRC), os.environ.get("PYTHONPATH")]))})
         e.update(env or {})
         argv = [sys.executable, "-m", "md_collab_editor", str(root), "--no-browser", "--port", "0"]
         if agent is not None:
             argv += ["--agent", agent]
-        if ask_agent is not None:
-            argv += ["--ask-agent", ask_agent]
         self.log = open(self.logpath, "wb")
         self.proc = subprocess.Popen(argv + list(args), stdout=self.log, stderr=subprocess.STDOUT, env=e,
                                      cwd=str(workdir), start_new_session=True)
@@ -218,29 +212,6 @@ class Server:
     def ws(self, **kw):
         return WS(self.port, **kw)
 
-    # -- fake claude
-
-    def flag(self, name, on=True):
-        p = self.state / name
-        if on:
-            p.touch()
-        elif p.exists():
-            p.unlink()
-
-    def _jsonl(self, name):
-        p = self.state / name
-        return [json.loads(line) for line in p.read_text().splitlines() if line.strip()] if p.exists() else []
-
-    def calls(self):
-        """Every fake `claude` call: its digest plus argv, prompt, base, fork, is_error."""
-        return self._jsonl("claude.log")
-
-    def bases(self):
-        return [c for c in self.calls() if c["base"]]
-
-    def sandbox_calls(self):
-        return self._jsonl("sandbox.log")
-
     # -- shutdown
 
     def stop(self, sig=signal.SIGTERM):
@@ -299,15 +270,22 @@ class Frame:
 
 
 class WS:
-    """A WebSocket client for /api/term with a reader thread that keeps every frame. It can
-    send any frame (unmasked, fragmented, with reserved bits or a false length)."""
+    """A WebSocket client for /api/term (or, with `unix`, a Unix socket's: the IDE link's) with a
+    reader thread that keeps every frame. It can send any frame (unmasked, fragmented, with
+    reserved bits or a false length)."""
 
-    def __init__(self, port, host=None, origin="same", headers=None, pipeline=b"", path="/api/term", pong=True):
+    def __init__(self, port, host=None, origin="same", headers=None, pipeline=b"", path="/api/term", pong=True,
+                 unix=None):
         host = host or f"127.0.0.1:{port}"
         self.pong = pong            # answer pings, as browsers do
         if origin == "same":
             origin = f"http://{host}"
-        self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        if unix:
+            self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.sock.settimeout(10)
+            self.sock.connect(unix)
+        else:
+            self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
         key = base64.b64encode(os.urandom(16)).decode()
         self.want_accept = base64.b64encode(hashlib.sha1((key + GUID).encode()).digest()).decode()
         h = {"Host": host, "Upgrade": "websocket", "Connection": "keep-alive, Upgrade",

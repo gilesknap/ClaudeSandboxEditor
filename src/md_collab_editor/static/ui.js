@@ -28,11 +28,12 @@
 //   UI.rawUrl(path, version?)         /raw/ URL of a ROOT-relative file
 //   UI.isMarkdown(path)               .md / .markdown
 //   UI.basename(path) / UI.dirname(path)
-//   UI.sendToTerminal(path, range?)   types "@path " or "@path#L1-5 " into the Claude terminal
-//                                       (path '': the open folder)
-//                                       (bracketed paste, no Enter), shows and focuses it.
-//                                       range: {from, to} 1-based line numbers. → Promise<bool>
-//                                       (waits up to 5 s for a terminal that is connecting)
+//   UI.sendToTerminal(path, range?)   puts "@path " or "@path#L1-5 " in the Claude Code prompt
+//                                       (path '': the open folder), no Enter: as an at-mention
+//                                       over the IDE link, else typed as one paste (Term.mention).
+//                                       Shows and focuses the terminal. range: {from, to}
+//                                       1-based line numbers. → Promise<bool> (waits up to 5 s
+//                                       for a terminal that is connecting)
 
 const UI = (() => {
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -315,31 +316,13 @@ const UI = (() => {
 
   // ---------------------------------------------------------------- send to the Claude terminal
 
+  // The server works out the reference (relative to the terminal's folder, or absolute outside
+  // it) and sends it over the IDE link or types it. Term.mention shows the panel and waits.
   async function sendToTerminal(path, range) {
     const T = window.Term;
     // before showing the panel, which in a narrow window hides the side bar the user is in
-    if (!T || !T.sendText || T.available?.() === false) { toast('The Claude terminal is not available.', { kind: 'err' }); return false; }
-    window.App?.showTerminal?.();
-    // a terminal that was never on screen connects now: give it a moment
-    const ended = () => ['exited', 'failed'].includes(T.state?.());
-    for (let i = 0; i < 50 && !T.running() && !ended(); i++) await new Promise(r => setTimeout(r, 100));
-    if (!T.running()) {
-      toast(ended() ? 'The Claude session has ended: restart it in the terminal first.' : 'The Claude terminal is not running yet; try again when it has started.', { kind: 'err' });
-      return false;
-    }
-    // path '' is the open folder itself
-    const abs = (root.replace(/\/+$/, '') + (path ? '/' + path : '')).replace(/\/+$/, '');
-    const cwd = (T.cwd() || '').replace(/\/+$/, '');
-    let p = abs;   // the terminal's own folder too: Claude Code takes no "@." as a mention
-    if (cwd && abs.startsWith(cwd + '/')) p = abs.slice(cwd.length + 1);
-    let ref = '@' + (/\s/.test(p) ? `"${p}"` : p);
-    if (range && range.from) ref += range.to && range.to !== range.from ? `#L${range.from}-${range.to}` : `#L${range.from}`;
-    if (!T.sendText(ref + ' ', { bracketed: true })) {
-      toast('The Claude terminal could not take the text.', { kind: 'err' });
-      return false;
-    }
-    T.focus();
-    return true;
+    if (!T || !T.mention || T.available?.() === false) { toast('The Claude terminal is not available.', { kind: 'err' }); return false; }
+    return T.mention(path || '', range && range.from ? range : null);
   }
 
   return {

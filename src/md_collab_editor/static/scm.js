@@ -551,6 +551,14 @@ const SCM = (() => {
     refreshSoon(300);
   });
   Tabs.on('saved', () => refreshSoon());
+  // while Claude's proposed change to a file waits, its diffs are read-only too (Tabs.linkedDoc
+  // refuses their edits; this also stops the keys, undo included, as in the main editor)
+  Tabs.on('hold', path => {
+    for (const s of diffs) {
+      const m = s.tab && s.tab.model;
+      if (s.mv && s.linked && m && m.path === path) s.mv.editor().setOption('readOnly', Tabs.held(m));
+    }
+  });
   Tabs.on('rename', () => { headCache = new Map(); refreshSoon(); scheduleGutter(0); });
 
   // ---------------------------------------------------------------- diff tabs
@@ -776,13 +784,14 @@ const SCM = (() => {
 
   function buildMerge(s) {
     s.mv = CodeMirror.MergeView(s.el.split, Object.assign(editorOptions(s), {
-      value: s.linked || '', origLeft: s.base.text, readOnly: !s.linked,
+      value: s.linked || '', origLeft: s.base.text, readOnly: !s.linked || Tabs.held(s.tab.model),
       connect: 'align', revertButtons: !!s.linked, extraKeys: keys(s),
     }));
     const ed = s.mv.editor(), orig = s.mv.leftOriginal();
     for (const c of [ed, orig]) {
       c.getWrapperElement().classList.toggle('cm-code', !md(s));
       c.on('contextmenu', (cc, e) => diffMenu(s, cc, e));
+      c.on('cursorActivity', cc => reportSel(s, cc));
     }
   }
 
@@ -845,6 +854,7 @@ const SCM = (() => {
         if (h && h.chunk) revertChunk(s.linked, s.base.text, h.chunk);
       });
       cm.on('contextmenu', (c, e) => diffMenu(s, c, e));
+      cm.on('cursorActivity', c => reportSel(s, c));
     } else {
       keep = { top: cm.getScrollInfo().top, cursor: cm.getCursor() };
       cm.setValue(text);
@@ -983,6 +993,31 @@ const SCM = (() => {
     UI.sendToTerminal(s.d.path, range);
   }
 
+  // What is selected in a diff on screen, as the working file's lines (Term.select, which tells
+  // Claude over the IDE link). The base side, or a deleted file, is just the file.
+  function reportSel(s, cm) {
+    if (!window.Term || !Term.select || s.kind === 'deleted' || s.tab.closed || Tabs.active() !== s.tab) return;
+    const pos = (line, ch) => ({ line, character: ch });
+    const r = { path: s.d.path, start: pos(0, 0), end: pos(0, 0), text: '' };
+    const from = cm.getCursor('from'), to = cm.getCursor('to');
+    if (s.linked && s.mv && cm === s.mv.editor()) {
+      Object.assign(r, { start: pos(from.line, from.ch), end: pos(to.line, to.ch), text: cm.getRange(from, to) });
+    } else if (s.linked && s.inl && cm === s.inl.cm && s.inlRows) {
+      let b = to.line;
+      if (to.ch === 0 && b > from.line) b--;   // whole lines end at the next line's start
+      const rows = s.inlRows.slice(from.line, b + 1).filter(x => x.e != null);
+      if (cm.somethingSelected() && rows.length) {
+        const a = rows[0].e, z = rows[rows.length - 1].e;
+        const end = pos(z, s.linked.getLine(z)?.length || 0);
+        Object.assign(r, { start: pos(a, 0), end, text: s.linked.getRange({ line: a, ch: 0 }, { line: z, ch: end.character }) });
+      } else {
+        const next = s.inlRows.slice(from.line).find(x => x.e != null);
+        if (next) r.start = r.end = pos(next.e, 0);
+      }
+    }
+    Term.select(r);
+  }
+
   function chunkAt(s, cm) {
     const line = cm.getCursor().line;
     if (s.mv && cm === s.mv.editor() && s.linked) {
@@ -1026,6 +1061,9 @@ const SCM = (() => {
     else showView(s);
     updateRows();
     if (s.kind === 'deleted') reviveIfBack(s);
+    const n = navTarget(s);
+    if (n) reportSel(s, n.cm);
+    else reportSel(s, { getCursor: () => ({ line: 0, ch: 0 }) });   // a message (binary, …): just the file
   }
 
   // a deleted file's diff whose file is back (git checkout -- path in the terminal): made again
@@ -1110,7 +1148,16 @@ const SCM = (() => {
 
   // ---------------------------------------------------------------- discard
 
+  // Claude's proposed change to the file waits for an answer (Tabs.hold): git must not change
+  // the file under it (the proposal's left side would go stale, and an Accept would then fail)
+  function heldFile(f) {
+    const p = [f.path, f.old_path].filter(Boolean).find(x => Tabs.held(x));
+    if (p) UI.toast(`Claude has proposed a change to ${UI.basename(p)}: accept or reject it before discarding.`, { kind: 'err' });
+    return !!p;
+  }
+
   async function discard(f) {
+    if (heldFile(f)) return;
     const name = UI.basename(f.path);
     const dirty = [f.path, f.old_path].filter(Boolean).some(p => Tabs.model(p)?.dirty);
     let msg, ok = 'Discard';
@@ -1122,7 +1169,7 @@ const SCM = (() => {
       default: msg = `Discard the changes to “${name}”? It goes back to how it is in HEAD, and the changes cannot be recovered.`;
     }
     if (dirty) msg += ' Its unsaved changes in the editor will be lost too.';
-    if (!(await UI.confirm(msg, { title: f.status === 'U' ? 'Delete file' : 'Discard changes', ok, danger: true }))) return;
+    if (!(await UI.confirm(msg, { title: f.status === 'U' ? 'Delete file' : 'Discard changes', ok, danger: true })) || heldFile(f)) return;
     // stop a pending autosave (and let any write under way finish) before git rewrites the file,
     // so the discarded edits are not written back on top of the restored HEAD version
     for (const p of [f.path, f.old_path].filter(Boolean)) {
