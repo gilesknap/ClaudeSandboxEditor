@@ -30,6 +30,7 @@ const Term = (() => {
   let fresh = false;          // the next status is the first on this connection
   let expectReplay = false;   // the next binary frame is the scrollback replay
   let replaying = 0;          // replies xterm makes to queries in a replay are not sent
+  let pending = [], pendingLen = 0;   // input typed before the session can take it
   let shownId;                // id of the session whose output the terminal holds
   let status = { state: 'none', id: null, cwd: null };
   let sent = { cols: 0, rows: 0 };
@@ -94,7 +95,7 @@ const Term = (() => {
     term.attachCustomKeyEventHandler(onKey);
     term.onData(onInput);
     term.onBinary(s => {
-      if (!accepting()) return;
+      if (!ready()) return;   // mouse reports; stale ones are not worth queueing
       const b = new Uint8Array(s.length);
       for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 0xff;
       sendBytes(b);
@@ -160,9 +161,9 @@ const Term = (() => {
     const bytes = new Uint8Array(data);
     if (expectReplay) {   // the server sends one, possibly empty, after the first status
       expectReplay = false;
-      if (!bytes.length) return;
+      if (!bytes.length) { flush(); return; }
       replaying++;
-      term.write(bytes, () => { replaying--; });
+      term.write(bytes, () => { replaying--; flush(); });
     } else term.write(bytes);
   }
 
@@ -174,16 +175,34 @@ const Term = (() => {
     if (first || m.id !== shownId) { term.reset(); shownId = m.id; }
     expectReplay = first && (m.state === 'running' || m.state === 'exited');
     status = m;
+    if (m.state === 'exited' || m.state === 'failed') pending = [], pendingLen = 0;
     renderNotice();
+    flush();
   }
 
   // ---------------------------------------------------------------- input
 
-  const accepting = () => !replaying && status.state !== 'exited' && status.state !== 'failed';
+  const ended = () => status.state === 'exited' || status.state === 'failed';
+  // the running session can take input: connected, its status and any replay are in
+  const ready = () => open() && !fresh && !expectReplay && !replaying && status.state === 'running';
+  // xterm's own answers to terminal queries (device attributes, cursor position, mode and
+  // colour reports, focus events); those made while drawing a replay answer old queries
+  const REPLY = /^\x1b(\[[?>]?[\d;]*(\$y|[cnRtIO])|\][\s\S]*(\x07|\x1b\\)|P[\s\S]*\x1b\\)$/;
+  const PENDING_MAX = 1 << 20;
+
+  // Keys typed while connecting, or while a replay is drawn, wait here rather than being lost.
+  function flush() {
+    if (!ready() || !pending.length) return;
+    const queued = pending.join('');
+    pending = [], pendingLen = 0;
+    sendBytes(enc.encode(queued));
+  }
 
   function onInput(s) {
-    if ((status.state === 'exited' || status.state === 'failed') && s === '\r') { restart(); return; }
-    if (accepting()) sendBytes(enc.encode(s));
+    if (ended()) { if (s === '\r') restart(); return; }
+    if (ready()) { flush(); sendBytes(enc.encode(s)); return; }
+    if (replaying && REPLY.test(s)) return;
+    if (pendingLen + s.length <= PENDING_MAX) { pending.push(s); pendingLen += s.length; }
   }
 
   // Ctrl+Shift+C copies; Ctrl+Shift+V (and Ctrl+V off the Mac) is left to the browser,

@@ -107,6 +107,43 @@ def test_terminal_runs_commands_and_replays_after_a_reload(page):
     wait_term_line(page, "after-42")
 
 
+SLOW_SOCKET = """(() => {   // the page's WebSockets take 1.5 s to start connecting
+  const Real = window.WebSocket;
+  class Slow {
+    constructor(url) {
+      this.readyState = 0;
+      this.binaryType = 'blob';
+      setTimeout(() => {
+        const r = this._r = new Real(url);
+        r.binaryType = this.binaryType;
+        r.onopen = e => { this.readyState = 1; if (this.onopen) this.onopen(e); };
+        r.onmessage = e => { if (this.onmessage) this.onmessage(e); };
+        r.onerror = e => { if (this.onerror) this.onerror(e); };
+        r.onclose = e => { this.readyState = 3; if (this.onclose) this.onclose(e); };
+      }, 1500);
+    }
+    send(d) { if (this.readyState !== 1) throw new Error('not open'); this._r.send(d); }
+    close(...a) { if (this._r) this._r.close(...a); else this.readyState = 3; }
+  }
+  Object.assign(Slow, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+  window.WebSocket = Slow;
+})()"""
+
+
+def test_keys_typed_while_connecting_are_kept(browser, srv):
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    try:
+        ctx.add_init_script(SLOW_SOCKET)
+        pg = ctx.new_page()
+        pg.goto(srv.base + "#a.md")
+        pg.locator("#term .xterm").click()
+        assert pg.evaluate("() => performance.now()") < 1500, "typed before the socket opened"
+        pg.keyboard.type("echo early-$((40+3))\n")
+        wait_term_line(pg, "early-43")
+    finally:
+        ctx.close()
+
+
 def test_editor_shortcuts_stay_out_of_the_terminal(page):
     page.locator("#term").click()
     page.keyboard.press("Control+o")
