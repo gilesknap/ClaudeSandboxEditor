@@ -66,6 +66,7 @@ The ✦ panel has two tabs: **Suggestions** holds the *Ask Claude* cards, and **
 By default the terminal runs `uvx claude-sandbox@latest`, which runs Claude Code inside a [claude-sandbox](https://pypi.org/project/claude-sandbox/) container for the open folder. That needs [uv](https://docs.astral.sh/uv/), rootless podman (or docker) and `/dev/net/tun` on the host; the first start pulls the container image, so it takes a while.
 
 - The session starts the first time the Terminal tab is shown. It survives page reloads (the scrollback is replayed) and ends when md-editor quits.
+- There is one session, shared by every browser tab, so it is best open in one tab at a time: it has one size, set by the tab that resized it last, and other tabs draw it wrongly until they resize it.
 - **Restart** ends the session and starts a new one in the open folder. When a session ends by itself, press <kbd>Enter</kbd> to start another.
 - If you open a different folder, the session stays where it was and a notice offers to restart it in the new folder.
 - <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> copies the terminal selection, and <kbd>Ctrl</kbd>+<kbd>V</kbd> pastes. While the terminal has focus the editor's own shortcuts are off, so keys such as <kbd>Ctrl</kbd>+<kbd>O</kbd> and <kbd>Esc</kbd> go to Claude Code.

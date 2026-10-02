@@ -267,15 +267,19 @@ def terminate_group(proc):
     for sig in (signal.SIGHUP, signal.SIGKILL):
         try:
             os.killpg(proc.pid, sig)
-        except OSError:  # ProcessLookupError: the whole group is gone
+        except ProcessLookupError:  # the whole group is gone
             return
+        except OSError:  # EPERM, say, for a member of another user: SIGKILL the rest anyway
+            pass
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:
             proc.poll()  # reap the main process, so the group can empty
             try:
                 os.killpg(proc.pid, 0)
-            except OSError:
+            except ProcessLookupError:
                 return
+            except OSError:  # only members we may not signal are left
+                break
             time.sleep(0.05)
 
 
@@ -356,6 +360,7 @@ except ValueError:
 ASK_ARG_MAX = 100_000
 ASK_CONTEXT = 300      # characters of context either side of a selection
 ASK_BASES_MAX, ASK_CARDS_MAX = 32, 256
+ASK_CARDS_CHARS = 4_000_000  # characters of document text the remembered cards may hold
 # claude reports a --resume of a session it does not have with this, on stderr
 SESSION_MISSING = "No conversation found with session ID:"
 # where launcher mode runs claude, in the container: claude-sandbox's wrapper always binds
@@ -365,8 +370,8 @@ ASK_LOCK = threading.Lock()              # guards the five below
 ASK_BASES = collections.OrderedDict()   # key → {"session", "doc"}: a session holding the document
 ASK_CARDS = collections.OrderedDict()   # card session id → {"key", "doc"}: the document it was asked about
 ASK_KEY_LOCKS = {}                       # key → [Lock, callers], so concurrent cards wait for a single base
-ASK_RUNNING = {}                         # prompt file → its launcher Popen (None until started)
-ASK_CLOSING = False                      # md-editor is exiting: start no more launcher calls
+ASK_RUNNING = {}                         # call id → [its Popen (None until started), its prompt file or None]
+ASK_CLOSING = False                      # md-editor is exiting: start no more claude calls
 ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)?|[ -/]*[0-~])")
 CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")  # JSON never holds these raw
 
@@ -445,20 +450,57 @@ def native_ask_dir():
     return d
 
 
+def ask_begin(prompt_file=None):
+    """Note a claude call about to start, so that end_asks() ends it; returns its id."""
+    call = uuid.uuid4().hex
+    with ASK_LOCK:
+        if ASK_CLOSING:
+            raise RuntimeError("md-editor is shutting down")
+        ASK_RUNNING[call] = [None, prompt_file]
+    return call
+
+
+def ask_started(call, proc):
+    """Note the call's process. False when md-editor has begun to exit, and end_asks() may
+    have missed it: the caller ends it."""
+    with ASK_LOCK:
+        ASK_RUNNING[call][0] = proc
+        return not ASK_CLOSING
+
+
+def ask_done(call):
+    with ASK_LOCK:
+        ASK_RUNNING.pop(call, None)
+
+
 def run_native(args, prompt):
-    """`claude -p` on pipes, in native_ask_dir(), which holds no project CLAUDE.md. Returns
-    its output."""
+    """`claude -p` on pipes, in native_ask_dir(), which holds no project CLAUDE.md, and in a
+    process group of its own, which end_asks() ends if md-editor exits first. Returns its
+    output."""
     exe = shutil.which(ASK_CMD[0]) or ASK_CMD[0]
     cwd = native_ask_dir()
+    call = ask_begin()
     try:
-        proc = subprocess.run([exe] + ASK_CMD[1:] + args, input=prompt, capture_output=True,
-                              encoding="utf-8", errors="replace", timeout=ASK_TIMEOUT, cwd=cwd,
-                              env=child_env())
-    except OSError as exc:
-        raise RuntimeError(f"Could not run {exe}: {exc}")
-    if parse_result(proc.stdout) is None:
-        raise RuntimeError((proc.stderr or proc.stdout or "no output from claude").strip()[:2000])
-    return proc.stdout
+        try:
+            proc = subprocess.Popen([exe] + ASK_CMD[1:] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=cwd,
+                                    env=child_env(), start_new_session=True)
+        except OSError as exc:
+            raise RuntimeError(f"Could not run {exe}: {exc}")
+        with proc:  # closes the pipes and reaps it
+            if not ask_started(call, proc):
+                terminate_group(proc)
+                raise RuntimeError("md-editor is shutting down")
+            try:
+                out, err = proc.communicate(prompt, timeout=ASK_TIMEOUT)
+            except BaseException:  # the timeout, mostly: end it, as subprocess.run would
+                terminate_group(proc)
+                raise
+    finally:
+        ask_done(call)
+    if parse_result(out) is None:
+        raise RuntimeError((err or out or "no output from claude").strip()[:2000])
+    return out
 
 
 def run_launcher(args, prompt):
@@ -475,15 +517,11 @@ def run_launcher(args, prompt):
                            f"{ASK_ARG_MAX // 1000} kB at most.")
     root = ROOT
     pf = root / f".md-editor-ask-{uuid.uuid4().hex}.txt"
-    with ASK_LOCK:
-        if ASK_CLOSING:
-            raise RuntimeError("md-editor is shutting down")
-        ASK_RUNNING[pf] = None
+    call = ask_begin(pf)
     try:
         fd = os.open(pf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except OSError as exc:
-        with ASK_LOCK:
-            ASK_RUNNING.pop(pf, None)
+        ask_done(call)
         raise RuntimeError(f"Ask Claude via claude-sandbox needs to write a temporary file in {root}, "
                            f"but cannot: {exc.strerror or exc}")
     try:
@@ -500,10 +538,7 @@ def run_launcher(args, prompt):
             proc, master = spawn_pty(ASK_CMD + ["shell", "-c", script], str(root), env, 200, 50)
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError(f"Could not start {shlex.join(ASK_CMD)}: {exc}")
-        with ASK_LOCK:
-            ASK_RUNNING[pf] = proc
-            closing = ASK_CLOSING
-        if closing:  # end_asks() may have missed it
+        if not ask_started(call, proc):
             os.close(master)
             terminate_group(proc)
             raise RuntimeError("md-editor is shutting down")
@@ -511,8 +546,7 @@ def run_launcher(args, prompt):
     except OSError as exc:
         raise RuntimeError(f"Ask Claude via claude-sandbox failed: {exc}")
     finally:
-        with ASK_LOCK:
-            ASK_RUNNING.pop(pf, None)
+        ask_done(call)
         try:
             pf.unlink()
         except OSError:
@@ -527,19 +561,20 @@ def run_launcher(args, prompt):
 
 
 def end_asks():
-    """At exit: end the launcher calls still running, whose threads die with the server, and
+    """At exit: end the claude calls still running, whose threads die with the server, and
     delete their prompt files (a launcher may outlive the PTY hang-up)."""
     global ASK_CLOSING
     with ASK_LOCK:
         ASK_CLOSING = True
-        running = list(ASK_RUNNING.items())
-    for pf, proc in running:
+        running = [tuple(v) for v in ASK_RUNNING.values()]
+    for proc, pf in running:
         if proc is not None:
             terminate_group(proc)
-        try:
-            pf.unlink()
-        except OSError:
-            pass
+        if pf is not None:
+            try:
+                pf.unlink()
+            except OSError:
+                pass
 
 
 def run_claude(args, prompt):
@@ -681,11 +716,22 @@ def ask_forked(req, key):
         raise
     sid = data.get("session_id")
     if sid:
-        with ASK_LOCK:
-            ASK_CARDS[sid] = {"key": key, "doc": doc}
-            while len(ASK_CARDS) > ASK_CARDS_MAX:
-                ASK_CARDS.popitem(last=False)
+        remember_card(sid, key, doc)
     return data
+
+
+def remember_card(sid, key, doc):
+    """Note the document version card session `sid` was asked about, for its Retry / Refine.
+    The oldest cards are forgotten (their Retry forks the base instead) past ASK_CARDS_MAX
+    of them, or past ASK_CARDS_CHARS characters of document text, keeping the newest."""
+    with ASK_LOCK:
+        base = ASK_BASES.get(key)
+        if base is not None and base["doc"] == doc:
+            doc = base["doc"]  # the same version: share the base's copy
+        ASK_CARDS[sid] = {"key": key, "doc": doc}
+        chars = sum(len(c["doc"]) for c in ASK_CARDS.values())
+        while len(ASK_CARDS) > 1 and (len(ASK_CARDS) > ASK_CARDS_MAX or chars > ASK_CARDS_CHARS):
+            chars -= len(ASK_CARDS.popitem(last=False)[1]["doc"])
 
 
 def unfence(text: str, original: str) -> str:
@@ -1034,6 +1080,7 @@ class WSClient:
         self.send_lock = threading.Lock()
         self.alive = True
         self.last_seen = time.monotonic()  # when a frame last came from the browser
+        self.writing = False               # the handler is in TERM.write, so it reads no frames
         try:  # bounds each blocking send(), not reads, which wait as long as the browser is idle
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", 1, 0))
         except (OSError, AttributeError, struct.error):
@@ -1069,9 +1116,14 @@ class WSClient:
 
     def keepalive(self, stop):
         """Ping every WS_PING_INTERVAL until `stop` is set; drop the client when nothing (not
-        even the pong browsers send by themselves) has come back since the last ping."""
+        even the pong browsers send by themselves) has come back since the last ping. While
+        the handler is blocked in a PTY write (a paste the agent is not reading) the pongs
+        wait unread behind it, so the client is neither pinged nor judged until it is done."""
         pinged = None
         while not stop.wait(WS_PING_INTERVAL):
+            if self.writing:
+                pinged = None
+                continue
             if pinged is not None and self.last_seen < pinged:
                 with self.send_lock:
                     self._drop_locked()
@@ -1384,6 +1436,8 @@ class Handler(SimpleHTTPRequestHandler):
             key = self.ws_read(4)
             payload = ws_unmask(self.ws_read(n, client), key)
             if op == OP_CLOSE:
+                if n == 1:  # a status code takes two bytes
+                    raise WSProtocolError(1002)
                 client.send_frame(ws_frame(OP_CLOSE, payload[:2]))  # echo the status code
                 return
             if op == OP_PING:
@@ -1398,20 +1452,25 @@ class Handler(SimpleHTTPRequestHandler):
                 if fin:
                     msg, msg_op = b"".join(parts), part_op
                     parts, part_op, part_len = None, None, 0
-                    self.ws_message(msg_op, msg)
+                    self.ws_message(client, msg_op, msg)
             elif op in (OP_TEXT, OP_BIN):
                 if parts is not None:
                     raise WSProtocolError(1002)
                 if fin:
-                    self.ws_message(op, payload)
+                    self.ws_message(client, op, payload)
                 else:
                     parts, part_op, part_len = [payload], op, n
             else:
                 raise WSProtocolError(1002)
 
-    def ws_message(self, op, payload):
+    def ws_message(self, client, op, payload):
         if op == OP_BIN:
-            return TERM.write(payload)
+            client.writing = True
+            try:
+                return TERM.write(payload)
+            finally:
+                client.last_seen = time.monotonic()  # before keepalive() may judge it again
+                client.writing = False
         try:
             msg = json.loads(payload.decode("utf-8"))
         except ValueError:  # includes UnicodeDecodeError

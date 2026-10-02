@@ -232,6 +232,7 @@ PROTOCOL_ERRORS = {
     "data frame inside a fragmented message": (lambda c: (c.send_frame(2, b"a", fin=False),
                                                           c.send_frame(2, b"b")), 1002),
     "RSV1 set": (lambda c: c.send_frame(2, b"x", rsv=0x40), 1002),
+    "1-byte close payload": (lambda c: c.send_frame(8, b"\x03"), 1002),
     "reserved opcode": (lambda c: c.send_frame(3, b"x"), 1002),
 }
 
@@ -568,6 +569,32 @@ def test_a_client_that_stops_reading_does_not_stall_the_others(srv):
     finally:
         stuck.close()
         c1.close()
+        if c2:
+            c2.close()
+
+
+def test_a_client_whose_paste_is_blocked_is_not_dropped(md_editor):
+    """While the agent is not reading, a paste blocks the handler that would read the
+    client's pongs: keepalive must not take that for a browser that has gone away."""
+    srv = md_editor(agent=BASH, env={"MDEDIT_WS_PING": "0.3"})
+    c1 = running(srv)
+    c2 = None
+    try:
+        c1.cmd("sleep 1000")
+        time.sleep(0.3)
+        threading.Thread(target=lambda: c1.send_bin(lines_of(2 << 20)), daemon=True).start()
+        time.sleep(3)   # ten ping intervals
+        assert not c1.eof, "dropped while its paste was blocked"
+        c2 = srv.ws()
+        c2.wait_status()
+        c2.send_json({"type": "restart"})   # frees the paste
+        assert c2.wait_status(lambda s: s["id"] == 2 and s["state"] == "running")
+        pings = sum(f.op == 9 for f in c1.frames)
+        assert roundtrip(c2, c1)
+        assert c1.wait(lambda: sum(f.op == 9 for f in c1.frames) >= pings + 3, 5), "pinged again"
+        assert not c1.eof
+    finally:
+        c1.abort()
         if c2:
             c2.close()
 

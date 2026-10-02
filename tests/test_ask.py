@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -407,12 +408,12 @@ def test_timeout_is_504_and_kills_claude(md_editor, root, agent):
     # the md_editor fixture checks that the hung fake is gone once the server stops
 
 
-@needs_linux
-def test_stopping_md_editor_ends_a_running_call(md_editor, root):
-    """The request's thread dies with the server, so the server itself must end the launcher
-    (which here ignores the PTY hang-up) and delete the prompt file, and must not start the
-    stateless fallback on the way out."""
-    srv = md_editor(ask_agent=LAUNCHER)
+@pytest.mark.parametrize("agent", [pytest.param(LAUNCHER, marks=needs_linux), NATIVE], ids=["launcher", "native"])
+def test_stopping_md_editor_ends_a_running_call(md_editor, root, agent):
+    """The request's thread dies with the server, so the server itself must end the call (the
+    launcher's or claude's own process group, which a signal to md-editor alone never reaches),
+    delete the prompt file, and not start the stateless fallback on the way out."""
+    srv = md_editor(ask_agent=agent)
     srv.flag("hang")
 
     def call():
@@ -421,13 +422,17 @@ def test_stopping_md_editor_ends_a_running_call(md_editor, root):
         except OSError:   # the server went away mid-request
             pass
     threading.Thread(target=call, daemon=True).start()
+    hanging = srv.state / "hanging"
     deadline = time.monotonic() + 10
-    while not (srv.state / "hanging").exists():
+    while not (hanging.exists() and hanging.read_text().endswith("\n")):
         assert time.monotonic() < deadline, "the call never started"
         time.sleep(0.05)
-    srv.stop()
+    os.kill(srv.proc.pid, signal.SIGTERM)   # md-editor alone, not its process group
+    srv.proc.wait(10)
+    pids = [int(p) for p in hanging.read_text().split()]
+    assert len(pids) == 1, "no new call after shutdown began"
+    assert gone_within(pids), "the hung claude was ended"
     assert prompt_files(root) == []
-    assert len(srv.sandbox_calls()) == 1, "no new call after shutdown began"
     assert srv.leftovers(1) == []
 
 
@@ -512,6 +517,45 @@ def test_base_sessions_one_per_key_and_at_most_32(monkeypatch):
     assert S.ASK_KEY_LOCKS == {}, "a key's lock lives only while a call holds or waits for it"
     S.forget_session(S.ASK_BASES[("cmd", "/r", "f39.md", "")]["session"])
     assert ("cmd", "/r", "f39.md", "") not in S.ASK_BASES
+
+
+def test_card_sessions_are_capped_by_count_and_size(monkeypatch):
+    monkeypatch.setattr(S, "ASK_BASES", collections.OrderedDict())
+    monkeypatch.setattr(S, "ASK_CARDS", collections.OrderedDict())
+    monkeypatch.setattr(S, "ASK_CARDS_MAX", 4)
+    monkeypatch.setattr(S, "ASK_CARDS_CHARS", 1000)
+    key = ("cmd", "/r", "p.md", "")
+    S.ASK_BASES[key] = {"session": "b", "doc": "x" * 300}
+    S.remember_card("c1", key, "".join("x" for _ in range(300)))
+    assert S.ASK_CARDS["c1"]["doc"] is S.ASK_BASES[key]["doc"], "the base's version is shared, not copied"
+    for i in range(2, 6):
+        S.remember_card(f"c{i}", key, str(i) * 100)
+    assert list(S.ASK_CARDS) == ["c2", "c3", "c4", "c5"], "at most ASK_CARDS_MAX"
+    S.remember_card("big", key, "y" * 900)
+    assert list(S.ASK_CARDS) == ["c5", "big"], "at most ASK_CARDS_CHARS of text"
+    S.remember_card("huge", key, "z" * 5000)
+    assert list(S.ASK_CARDS) == ["huge"], "the newest card is kept"
+
+
+def test_terminate_group_goes_on_after_eperm(monkeypatch):
+    """A member that may not be signalled (another user's) does not stop the SIGKILL."""
+    sent = []
+
+    def killpg(pgid, sig):
+        sent.append(sig)
+        if sig == signal.SIGHUP or (sig == 0 and signal.SIGKILL not in sent):
+            raise PermissionError(1, "Operation not permitted")
+        if sig == 0:
+            raise ProcessLookupError(3, "No such process")
+    monkeypatch.setattr(S.os, "killpg", killpg)
+
+    class Proc:
+        pid = 12345
+
+        def poll(self):
+            return None
+    S.terminate_group(Proc())
+    assert sent == [signal.SIGHUP, 0, signal.SIGKILL, 0]
 
 
 def test_native_ask_dir_is_private(monkeypatch, tmp_path):
