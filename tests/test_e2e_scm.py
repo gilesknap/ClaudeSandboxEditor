@@ -272,6 +272,28 @@ def test_inline_view_navigation_and_revert(page, repo):
     expect(page.locator(f"{VIEW} .diff-inline .diff-del-line")).to_have_count(1)
 
 
+def test_diff_editors_report_the_working_files_selection(page):
+    """What is selected in a diff is what Claude is told about (Term.select, which the IDE link
+    passes on): lines of the working file, from either view."""
+    page.evaluate("() => { window.sels = []; Term.select = s => window.sels.push(s); }")
+    open_scm(page)
+    scm_row(page, "src/app.py").click()
+    expect(page.locator(f"{VIEW} .CodeMirror-merge")).to_be_visible()
+    page.evaluate(f"""() => document.querySelector('{VIEW} .CodeMirror-merge-editor .CodeMirror').CodeMirror
+                          .setSelection({{line: 1, ch: 4}}, {{line: 2, ch: 0}})""")
+    page.wait_for_function("() => window.sels.length && window.sels.at(-1).start.line === 1")
+    assert page.evaluate("window.sels.at(-1)") == {"path": "src/app.py", "start": {"line": 1, "character": 4},
+                                                   "end": {"line": 2, "character": 0}, "text": 'print("hello")\n'}
+    # the inline view's rows are mapped back to the file's lines, the removed ones left out
+    page.locator(f"{VIEW} .diff-head [data-view=inline]").click()
+    expect(page.locator(f"{VIEW} .diff-inline .CodeMirror")).to_be_visible()
+    page.evaluate(f"""() => document.querySelector('{VIEW} .diff-inline .CodeMirror').CodeMirror
+                          .setSelection({{line: 1, ch: 0}}, {{line: 3, ch: 5}})""")
+    page.wait_for_function("() => window.sels.at(-1).end.line === 2")
+    assert page.evaluate("window.sels.at(-1)") == {"path": "src/app.py", "start": {"line": 1, "character": 0},
+                                                   "end": {"line": 2, "character": 12}, "text": '    print("hello")\n    return 1'}
+
+
 def test_deleted_and_untracked_files(page):
     open_scm(page)
     scm_row(page, "src/old.py").click()
@@ -345,6 +367,24 @@ def test_discard_asks_first(page, repo):
     assert disk(repo, "src/old.py") == "old = 1\n"
     expect(page.locator(".scm-empty")).to_have_text("No changes.")
     expect(badge(page)).to_be_hidden()
+
+
+def test_discard_waits_for_claudes_proposed_change(page, repo):
+    """While Claude's proposed change to a file waits for an answer (held, as proposal.js holds
+    it), Discard leaves the file alone: git would change it under the proposal."""
+    open_scm(page)
+    page.evaluate("() => { window.__release = Tabs.hold('src/app.py', { msg: 'Held.' }); }")
+    scm_row(page, "src/app.py").click(button="right")
+    page.locator(".ctx-menu").get_by_role("menuitem", name="Discard changes…").click()
+    expect(page.locator("#toast")).to_contain_text("accept or reject it before discarding")
+    expect(page.get_by_role("alertdialog")).to_have_count(0)
+    assert disk(repo, "src/app.py") == APP_NOW
+    page.evaluate("() => window.__release()")
+    scm_row(page, "src/app.py").click(button="right")
+    page.locator(".ctx-menu").get_by_role("menuitem", name="Discard changes…").click()
+    page.get_by_role("alertdialog").get_by_role("button", name="Discard").click()
+    expect_rows(page, ["new.txt U", "src/old.py D"])
+    assert disk(repo, "src/app.py") == APP
 
 
 # ---------------------------------------------------------------- the Branch base
@@ -481,6 +521,7 @@ def test_a_deleted_files_diff_tab_follows_the_file_back(page, repo):
     tab(page, "README.md").click()
     diff.click()
     expect(page.locator(f"{VIEW} .diff-head [data-act=open]")).to_be_enabled(timeout=5000)
+    expect(page.locator(f"{VIEW} .CodeMirror-merge")).to_be_visible()   # built once its base has come
     assert merge_values(page) == ["old = 1\n", "old = 1\n"]
     expect(page.locator(f"{VIEW} .diff-stats")).to_have_text("No changes")
 

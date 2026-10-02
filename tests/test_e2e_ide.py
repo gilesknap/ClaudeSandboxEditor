@@ -10,7 +10,6 @@ import re
 import pytest
 
 from gitutil import SERVER_ENV, make_repo, open_root
-from helpers import FAKES
 
 REQUIRE = os.environ.get("MD_EDITOR_E2E") == "require"
 try:
@@ -418,43 +417,6 @@ def test_switching_folders_asks_about_unsaved_files(page, repo, tmp_path):
     assert tab_names(page) == ["README.md", "util.js"]
 
 
-def test_ask_claude_cards_stay_with_their_file(browser, shared_servers, tmp_path):
-    srv = shared_servers.start(env=SERVER_ENV, ask_agent=str(FAKES / "fake-sandbox"))
-    r = open_root(srv, make_repo(tmp_path / "ask", FILES))
-    page, errors = open_page(browser, srv)
-    page.locator(".CodeMirror-line", has_text="Hello world.").click(click_count=3)
-    page.keyboard.press("Control+j")
-    page.locator("#ask-presets").get_by_role("button", name="Tighten", exact=True).click()
-    card = page.locator("#cards .card").first
-    expect(card.locator(".card-file")).to_have_text("README.md")
-    row(page, "src").click()
-    row(page, "src/app.py").dblclick()   # another file is active when the answer comes
-    expect(card).to_have_class(re.compile(r"\bready\b"), timeout=30000)
-    card.get_by_role("button", name="Accept").click()
-    expect(card).to_contain_text("Accepted")
-    expect(page.locator("#doc-name")).to_have_text("src/app.py")
-    page.wait_for_function("() => !Tabs.model('README.md').dirty", timeout=10000)   # autosaved
-    text = disk(r, "README.md")
-    assert "ECHO:" in text and "Hello world." not in text and text.startswith("# Readme\n\n")
-    assert 'print("hi")' in disk(r, "src/app.py")
-    # a card on a preview tab keeps that tab open (it would go, and the card with it, when the
-    # next single click replaced it)
-    row(page, "src/util.js").click()
-    expect(tab(page, "util.js")).to_have_class(re.compile(r"\bpreview\b"))
-    page.locator(".CodeMirror-line", has_text="const a").click(click_count=3)
-    page.keyboard.press("Control+j")
-    page.locator("#ask-presets").get_by_role("button", name="Tighten", exact=True).click()
-    expect(page.locator("#cards .card").first.locator(".card-file")).to_have_text("util.js")
-    expect(tab(page, "util.js")).not_to_have_class(re.compile(r"\bpreview\b"))
-    row(page, "docs").click()
-    row(page, "docs/guide.md").click()
-    expect(tab(page, "guide.md")).to_have_class(re.compile(r"\bactive\b"))
-    assert tab_names(page) == ["README.md", "app.py", "util.js", "guide.md"]
-    expect(page.locator("#cards .card").first).to_have_class(re.compile(r"\bready\b"), timeout=30000)
-    page.context.close()
-    assert not errors, errors
-
-
 # ---------------------------------------------------------------- files deleted or moved on disk
 
 def wait_deleted(pg, name):
@@ -615,31 +577,34 @@ def test_the_side_bar_and_claude_panel_leave_room_for_the_editor(page):
 
 # ---------------------------------------------------------------- the Explorer and the terminal
 
-def fake_terminal(pg, cwd):
-    """Term stands in for a running terminal: what it is sent lands in window.sent."""
-    pg.evaluate("""cwd => {
+def fake_terminal(pg):
+    """Term stands in for a running terminal: what Send to Claude terminal asks it to mention
+    (the server works out the text, or sends it over the IDE link) lands in window.sent."""
+    pg.evaluate("""() => {
         window.sent = [];
-        Object.assign(Term, {available: () => true, running: () => true, cwd: () => cwd, focus() {},
-                             sendText(t) { window.sent.push(t); return true; }});
-    }""", str(cwd))
+        Object.assign(Term, {available: () => true,
+                             mention(path, range) { window.sent.push([path, range]); return Promise.resolve(true); }});
+    }""")
 
 
 def test_explorer_sends_paths_to_the_terminal(page, repo):
-    fake_terminal(page, repo.parent)
+    fake_terminal(page)
     page.locator("#tree").focus()
     page.keyboard.press("Home")   # docs; the menu shows @ as the shortcut for sending it
     page.keyboard.press("@")
     page.wait_for_function("() => window.sent.length === 1")
-    assert page.evaluate("window.sent") == ["@ws/docs "]
+    assert page.evaluate("window.sent") == [["docs", None]]
     page.locator("#tree").click(button="right", position={"x": 60, "y": 400})   # the open folder itself
     page.locator(".ctx-menu").get_by_role("menuitem", name="Send to Claude terminal").click()
     page.wait_for_function("() => window.sent.length === 2")
-    assert page.evaluate("window.sent[1]") == "@ws "
-    fake_terminal(page, repo)   # the terminal's own folder: by its absolute path (Claude Code
-    page.locator("#tree").click(button="right", position={"x": 60, "y": 400})   # takes no "@.")
-    page.locator(".ctx-menu").get_by_role("menuitem", name="Send to Claude terminal").click()
-    page.wait_for_function("() => window.sent.length === 1")
-    assert page.evaluate("window.sent") == [f"@{repo} "]
+    assert page.evaluate("window.sent[1]") == ["", None]
+    row(page, "src").click()
+    row(page, "src/app.py").dblclick()
+    expect(page.locator("#doc-name")).to_have_text("src/app.py")
+    page.evaluate("() => { App.cm.focus(); App.cm.setSelection({line: 0, ch: 0}, {line: 1, ch: 3}); }")
+    page.keyboard.press("Control+Alt+l")
+    page.wait_for_function("() => window.sent.length === 3")
+    assert page.evaluate("window.sent[2]") == ["src/app.py", {"from": 1, "to": 2}]
 
 
 def test_send_without_a_terminal_keeps_the_side_bar(browser, srv, repo):

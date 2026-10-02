@@ -46,12 +46,6 @@
   <div class="seg" id="view-mode">
     <button data-mode="edit">Edit</button><button data-mode="split" class="on">Split</button><button data-mode="preview">Preview</button>
   </div>
-  <select id="model" title="Claude model">
-    <option value="">Default model</option>
-    <option value="opus">Opus</option>
-    <option value="sonnet">Sonnet</option>
-    <option value="haiku">Haiku</option>
-  </select>
   <button id="export-pdf" title="Export as PDF: saved next to the .md file and downloaded (the browser's Print prints the preview)">⬇ PDF</button>
   <button id="theme" class="icon-btn" title="Light / dark">◐</button>
   <button id="toggle-claude" class="icon-btn" title="Claude panel">✦</button>
@@ -111,24 +105,19 @@
   </div>
   </div>
 
-  <aside id="claude" data-tab="terminal">
+  <aside id="claude" aria-label="Claude Code">
     <div id="panel-resize" title="Drag to resize the panel (double-click to reset)"></div>
     <div class="side-head" id="panel-head">
-      <div id="panel-tabs" role="tablist">
-        <button type="button" class="tab" role="tab" data-tab="terminal" id="tab-terminal" title="Claude Code in the open folder">Terminal</button>
-        <button type="button" class="tab" role="tab" data-tab="suggestions" id="tab-suggestions" title="Ask Claude suggestions for the selected text">Suggestions<span id="cards-count" class="count" hidden></span></button>
-      </div>
+      <span id="panel-title" title="Claude Code in the open folder">Claude Code</span>
+      <span id="term-ide" class="ide-state" hidden></span>
+      <span class="spacer"></span>
       <span class="tab-actions">
         <button type="button" id="term-restart" class="small-btn" title="End this Claude session and start a new one in the open folder">Restart</button>
-        <button type="button" id="clear-cards" class="small-btn">Clear done</button>
       </span>
     </div>
     <div id="term-wrap">
       <div id="term-notice" hidden></div>
       <div id="term"></div>
-    </div>
-    <div id="cards">
-      <p class="muted hint" id="cards-empty">Highlight text in the editor or the preview, then pick an action from the pop-up (or press <kbd>Ctrl</kbd>+<kbd>J</kbd>). With nothing selected, the request applies to the whole document.</p>
     </div>
   </aside>
 </main>
@@ -137,7 +126,7 @@
 
 <div id="askbar" hidden>
   <div id="ask-presets"></div>
-  <form id="ask-form"><input id="ask-input" placeholder="Ask Claude to… (Enter to send, Esc to close)" autocomplete="off"><button type="submit">Send</button></form>
+  <form id="ask-form"><input id="ask-input" placeholder="Ask Claude… (Enter sends it to the Claude terminal, Esc closes)" autocomplete="off"><button type="submit">Send</button></form>
 </div>
 
 <div id="browser" hidden>
@@ -169,6 +158,7 @@
 <script src="linediff.js"></script>
 <script src="scm.js"></script>
 <script src="search.js"></script>
+<script src="proposal.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

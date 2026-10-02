@@ -100,7 +100,7 @@ def test_post_needs_a_matching_origin(srv, root):
 
 
 def test_post_to_every_endpoint_is_guarded(srv, root):
-    for path in ("/api/root", "/api/new", "/api/pdf", "/api/ask", "/api/ask/prepare", "/api/nonexistent"):
+    for path in ("/api/root", "/api/new", "/api/pdf", "/api/nonexistent"):
         assert forbidden(*srv.post(path, {"path": str(root)}, origin=None)), path
 
 

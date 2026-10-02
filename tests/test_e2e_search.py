@@ -2,7 +2,8 @@
 terminal (Ctrl+Alt+L and the context menus) in headless Chromium (Playwright).
 
 Each test opens a fresh git repository; the terminal test runs bash in place of Claude Code
-and reads what was typed into it both from the screen and from the WebSocket frames. Skipped
+and reads what the page asked for from its WebSocket frames, and what the server typed from
+the screen. Skipped
 like test_e2e.py when Playwright or its Chromium is missing (MD_EDITOR_E2E=require makes that
 fail)."""
 import os
@@ -390,14 +391,16 @@ def test_send_to_claude_terminal(browser, shared_servers, tmp_path):
     page.evaluate("() => { App.cm.focus(); App.cm.setSelection({line: 0, ch: 0}, {line: 2, ch: 0}); }")
     page.keyboard.press("Control+Alt+l")
     wait_term_line(page, PROMPT + r" @src/app\.py#L1-2")
-    wait_sent(b"\x1b[200~@src/app.py#L1-2 \x1b[201~")
+    # the page asks the server to mention the lines (over the IDE link when it is up; here it
+    # types them, as one paste)
+    wait_sent(b'{"type":"mention","path":"src/app.py","start":{"line":0,"character":0},"end":{"line":2,"character":0}}')
     page.wait_for_function("() => !!document.activeElement.closest('#term')")
 
     # the Explorer's menu sends the path
     row(page, "src/util.js").click(button="right")
     page.locator(".ctx-menu").get_by_role("menuitem", name="Send to Claude terminal").click()
     wait_term_line(page, PROMPT + r" @src/app\.py#L1-2 @src/util\.js")
-    wait_sent(b"\x1b[200~@src/util.js \x1b[201~")
+    wait_sent(b'{"type":"mention","path":"src/util.js"}')
 
     # the editor's own menu sends the selection (Shift+right-click leaves the browser's menu)
     tab(page, "app.py").click()
@@ -420,7 +423,10 @@ def test_send_to_claude_terminal(browser, shared_servers, tmp_path):
     expect(page.locator("#doc-name")).to_have_text("notes.md")
     tab(page, "notes.md").click(button="right")
     page.locator(".ctx-menu").get_by_role("menuitem", name="Send to Claude terminal").click()
-    wait_sent(f"\x1b[200~@{other}/notes.md \x1b[201~".encode())
+    wait_sent(b'{"type":"mention","path":"notes.md"}')
+    page.wait_for_function("""p => [...document.querySelectorAll('#term .xterm-rows > div')]
+                                  .map(d => d.textContent.replace(/\\u00a0/g, ' ').trimEnd()).join('').includes(p)""",
+                           arg=f"@{other}/notes.md")   # rows joined: the line may wrap
     page.wait_for_function("() => !!document.activeElement.closest('#term')")
     page.context.close()
     assert not errors, errors
