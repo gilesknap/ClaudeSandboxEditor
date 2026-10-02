@@ -70,6 +70,7 @@ const Tabs = (() => {
   CodeMirror.modeURL = CM_BASE + 'mode/%N/%N.min.js';
   const MD_MODE = { name: 'gfm', highlightFormatting: true, fencedCodeBlockHighlighting: true };
   const SAVE_DELAY = 800;
+  const RAW_LINK_MAX = 100 * 1024 * 1024;   // above this, do not offer a raw-file link (a GB download)
 
   const $ = s => document.querySelector(s);
   const main = $('#main');
@@ -249,6 +250,16 @@ const Tabs = (() => {
   function scheduleSave(m) {
     clearTimeout(m.saveT);
     m.saveT = setTimeout(() => save(m, false, true), SAVE_DELAY);
+  }
+
+  // Stop a pending autosave and hand back the write under way (if any) to await: a caller about to
+  // change the file on disk (e.g. a git discard) must not have an autosave write the editor's text
+  // back over it afterwards.
+  function cancelAutosave(m) {
+    if (!m) return null;
+    clearTimeout(m.saveT);
+    m.saveT = null;
+    return m.saving;
   }
 
   // auto: an autosave, which never writes a file that was deleted on disk back
@@ -805,8 +816,11 @@ const Tabs = (() => {
       const why = i.kind === 'too_large'
         ? `It is not shown because it is too large (${fmtSize(i.size)}; the limit is 5 MB).`
         : `It is not shown because it is binary or uses an unsupported text encoding${i.size != null ? ` (${fmtSize(i.size)})` : ''}.`;
-      t.view.innerHTML = `<div class="file-view-msg"><p><strong>${name}</strong></p><p class="muted">${UI.esc(why)}</p>
-        <p><a href="${UI.esc(raw)}" target="_blank" rel="noopener">Open the raw file in a new browser tab</a></p></div>`;
+      // offer the raw file only when it is not enormous: a link to a multi-GB artefact is a trap
+      const link = i.size != null && i.size > RAW_LINK_MAX
+        ? `<p class="muted">Too large to open in the browser.</p>`
+        : `<p><a href="${UI.esc(raw)}" target="_blank" rel="noopener">Open the raw file in a new browser tab</a></p>`;
+      t.view.innerHTML = `<div class="file-view-msg"><p><strong>${name}</strong></p><p class="muted">${UI.esc(why)}</p>${link}</div>`;
     }
   }
 
@@ -1034,7 +1048,7 @@ const Tabs = (() => {
     model: p => models.get(p), models: () => [...models.values()],
     acquire, release,
     linkedDoc: m => m.doc.linkedDoc({ sharedHist: true, mode: m.doc.modeOption }),
-    loadMode, save, saveAll, anyDirty, renamePath, renameBlocked, pathDeleted, reload,
+    loadMode, save, saveAll, anyDirty, renamePath, renameBlocked, pathDeleted, reload, cancelAutosave,
     confirmLeave, closeAll, restore, registerType, setStatus, autosave,
     on, cm: () => cm, categoryOf,
   };

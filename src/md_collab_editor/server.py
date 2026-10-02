@@ -73,7 +73,9 @@ DEFAULT_ASK_AGENT = "uvx claude-sandbox@latest"
 ASK_CMD = shlex.split(DEFAULT_ASK_AGENT)
 
 PDF_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>{title}</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src file: https: data:; style-src https: 'unsafe-inline'; font-src https: data:">
+<title>{title}</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-light.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
@@ -956,6 +958,8 @@ SEARCH_CHILD = ("import sys; sys.path.insert(0, sys.argv[1]); "
 
 
 def kill_search(proc):
+    if proc.returncode is not None:  # already reaped: its pid could now name another process
+        return
     try:
         if os.name == "posix":
             os.killpg(proc.pid, signal.SIGKILL)  # with its git grep
@@ -1084,21 +1088,29 @@ def api_search(q):
 # git to run: md-editor runs git on this machine, outside the sandbox that the terminal's Claude
 # runs in, and that sandbox can write the repository's .git/config and .git/hooks. So no
 # fsmonitor hook (git status, ls-files and check-ignore would run it), no hooks (git restore runs
-# post-checkout), no submodules; clean/smudge filters: see filter_opts.
+# post-checkout), no submodules; clean/smudge filters: see frozen_git_dir.
 GIT_OPTS = ["-c", "color.ui=false", "-c", "core.quotePath=false", "-c", "diff.relative=false",
             "-c", "grep.fullName=false", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
             "-c", "submodule.recurse=false"]
-FILTER_CMDS = ("status", "diff", "restore", "checkout", "rm")  # the ones that run filter drivers
-# Git LFS's own filter commands (as `git lfs install` writes them) are left alone, unless the
-# configuration also names commands for git-lfs itself to run: LFS extensions (run on every clean
-# and smudge) and custom transfer agents. git-lfs never downloads either (GIT_LFS_SKIP_SMUDGE), so
-# no transfer agent, credential helper or ssh command from the configuration runs for a smudge.
+# status/diff run clean (and textconv) drivers, restore/checkout/rm run smudge drivers: a command
+# the agent names in .git/config for a path .gitattributes marks. These run against a frozen,
+# agent-unwritable copy of the repository's config (frozen_git_dir).
+FILTER_CMDS = ("status", "diff", "restore", "checkout", "rm")
+# Git LFS's own filter commands (as `git lfs install` writes them) are kept in the frozen config,
+# unless the configuration also names commands for git-lfs itself to run: LFS extensions (run on
+# every clean and smudge) and custom transfer agents. git-lfs never downloads either
+# (GIT_LFS_SKIP_SMUDGE), so no transfer agent, credential helper or ssh command runs for a smudge.
 LFS_FILTER = {"clean": ("git-lfs clean -- %f",), "smudge": ("git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"),
               "process": ("git-lfs filter-process", "git-lfs filter-process --skip")}
 LFS_COMMAND_KEYS = ("lfs.extension.", "lfs.customtransfer.", "lfs.standalonetransferagent")
+# core.* keys that name a command git could run (status runs fsmonitor, restore the hooks): never
+# copied into the frozen config, and overridden by GIT_OPTS for good measure.
+FROZEN_CORE_SKIP = {"fsmonitor", "fsmonitorhookversion", "hookspath", "sshcommand", "pager", "editor",
+                    "askpass", "alternaterefscommand", "gvfs", "commitgraph"}
 GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_LITERAL_PATHSPECS",
-                "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
+                "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+                "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_ATTR_SOURCE")
 GIT_TTL = 3              # seconds that ROOT's work tree is remembered (git init / rm -rf .git)
 GIT_REPOS = {}           # ROOT → (expiry, git_repo() answer)
 GIT_FEATURES = {}        # "pcre", "restore" → bool, found out once
@@ -1116,43 +1128,106 @@ def git_env(literal=False):
     return env
 
 
-def filter_opts(cwd):
-    """-c options that switch off every clean/smudge filter driver in git's configuration, except
-    Git LFS's (see LFS_FILTER): the commands in FILTER_CMDS would otherwise run whatever a driver
-    names for files that .gitattributes gives it. Reading the configuration runs nothing.
-    (Something that keeps rewriting .git/config could still slip a driver in between this and the
-    command itself.)"""
-    r = subprocess.run(["git"] + GIT_OPTS + ["config", "-z", "--get-regexp", r"^(filter|lfs)\."], cwd=str(cwd),
-                       capture_output=True, stdin=subprocess.DEVNULL, env=git_env(), timeout=60)
-    drivers, lfs_commands = {}, False
+def git_plain(args, cwd, env=None, timeout=60):
+    """One git subprocess; stdin closed. Used to read the real repo while building the frozen dir."""
+    return subprocess.run(["git"] + GIT_OPTS + list(args), cwd=str(cwd), capture_output=True,
+                          stdin=subprocess.DEVNULL, env=env if env is not None else git_env(), timeout=timeout)
+
+
+def _abs_git_path(cwd, which):
+    """Absolute path of one of the repo's files (objects, index), by its git-path relative to cwd."""
+    r = git_plain(["rev-parse", "--git-path", which], cwd)
+    if r.returncode != 0:
+        return None
+    out = os.fsdecode(r.stdout.rstrip(b"\n"))
+    return out if os.path.isabs(out) else os.path.abspath(os.path.join(str(cwd), out))
+
+
+def write_frozen_config(cwd, path):
+    """Write `path`: a git config with only the repo's effective core/extensions/index settings
+    (minus any that name a command for git to run) and Git LFS's exact filter commands, read once
+    from the real repo. Every other clean/smudge/diff/textconv driver, include, alias and remote is
+    left out, so a FILTER_CMD run against this config cannot execute a command the agent slipped
+    into .git/config. Reading the config runs nothing, and git later reads only this frozen copy."""
+    r = git_plain(["config", "--no-includes", "-z", "--get-regexp", r"^(core|extensions|index|filter|lfs)\."], cwd)
+    keep, lfs_vals, lfs_ok = [], {}, True
     for item in r.stdout.split(b"\0") if r.returncode == 0 else ():
         key, _, value = os.fsdecode(item).partition("\n")
-        if key.lower().startswith(LFS_COMMAND_KEYS):  # git-lfs reads its keys in any case
-            lfs_commands = True
+        low = key.lower()
+        if low.startswith(LFS_COMMAND_KEYS):  # git-lfs would run these itself: do not trust LFS
+            lfs_ok = False
             continue
-        name, _, var = key[len("filter."):].rpartition(".")
-        if key.startswith("filter.") and name and var in ("clean", "smudge", "process"):
-            safe = value.strip() in LFS_FILTER[var] if name == "lfs" else False
-            drivers[name] = drivers.get(name, True) and safe
-    if lfs_commands and "lfs" in drivers:
-        drivers["lfs"] = False
-    opts = []
-    for name, safe in drivers.items():
-        if safe:
-            continue
-        if "=" in name:  # -c can't name it (its key ends at the first =)
-            raise OSError(f"git's configuration has a filter driver named {name!r}, which md-editor won't run git with")
-        for var, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")):
-            opts += ["-c", f"filter.{name}.{var}={value}"]
-    return opts
+        section, _, var = low.rpartition(".")
+        if section in ("core", "extensions", "index"):
+            if section == "core" and var in FROZEN_CORE_SKIP:
+                continue
+            keep.append((key, value))
+        elif section == "filter.lfs" and var in ("clean", "smudge", "process", "required"):
+            lfs_vals[var] = value.strip()
+    # keep Git LFS only when every filter command it names is exactly one `git lfs install` writes
+    if lfs_ok and any(v in lfs_vals for v in ("clean", "smudge", "process")) and \
+            all(lfs_vals.get(v, next(iter(LFS_FILTER[v]))) in LFS_FILTER[v] for v in ("clean", "smudge", "process")):
+        for v in ("clean", "smudge", "process"):
+            keep.append((f"filter.lfs.{v}", next(iter(LFS_FILTER[v]))))
+        keep.append(("filter.lfs.required", lfs_vals.get("required", "true")))
+    open(path, "x").close()  # git config --file writes correct escaping; we only add known keys
+    for key, value in keep:
+        subprocess.run(["git", "config", "--file", str(path), "--add", key, value],
+                       capture_output=True, stdin=subprocess.DEVNULL, env=git_env(), timeout=30)
+
+
+def frozen_git_dir(cwd):
+    """A private, agent-unwritable git directory for running a FILTER_CMD in the work tree at cwd:
+    its config is a frozen copy with no agent-supplied drivers (write_frozen_config), its HEAD is
+    pinned to the current commit, and its objects and index are the real repo's (shared, so a
+    discard still writes the real index). Returns (git_dir, work_tree, index_file) or None when cwd
+    is not inside a work tree (nothing there runs a filter). Caller removes git_dir."""
+    if git_plain(["rev-parse", "--is-inside-work-tree"], cwd).stdout.strip() != b"true":
+        return None
+    top = git_plain(["rev-parse", "--show-toplevel"], cwd)
+    objects = _abs_git_path(cwd, "objects")
+    index = _abs_git_path(cwd, "index")
+    if top.returncode != 0 or objects is None or index is None:
+        return None
+    work_tree = os.fsdecode(top.stdout.rstrip(b"\n"))
+    head = git_plain(["rev-parse", "-q", "--verify", "HEAD"], cwd)
+    sha = head.stdout.decode().strip() if head.returncode == 0 else ""
+    git_dir = tempfile.mkdtemp(prefix="mdedit-git-")
+    try:
+        os.mkdir(os.path.join(git_dir, "refs"))
+        os.makedirs(os.path.join(git_dir, "objects", "info"))
+        with open(os.path.join(git_dir, "objects", "info", "alternates"), "w") as f:
+            f.write(objects + "\n")
+        # a resolved sha (so no ref lookup is needed), or an unborn branch so status reports every
+        # file as added, exactly as the real repo would before its first commit
+        with open(os.path.join(git_dir, "HEAD"), "w") as f:
+            f.write((sha if SHA_RE.fullmatch(sha) else "ref: refs/heads/_mdedit_unborn") + "\n")
+        write_frozen_config(cwd, os.path.join(git_dir, "config"))
+    except BaseException:  # never leave the private dir behind, and never fall back to unfrozen git
+        shutil.rmtree(git_dir, ignore_errors=True)
+        raise
+    return git_dir, work_tree, index
 
 
 def git(args, cwd, input=None, literal=False, timeout=60):
     """Run git with bytes in and out; a failing git is the caller's to judge from returncode.
-    Raises OSError if git cannot run at all."""
+    Raises OSError if git cannot run at all. A FILTER_CMD (which runs clean/smudge/diff drivers)
+    is run against a frozen copy of the repository's config that the sandboxed agent cannot change
+    under it, so a driver it writes into .git/config never executes on the host."""
     kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
-    extra = filter_opts(cwd) if args and args[0] in FILTER_CMDS else []
-    return subprocess.run(["git"] + GIT_OPTS + extra + list(args), cwd=str(cwd), capture_output=True,
+    if args and args[0] in FILTER_CMDS:
+        frozen = frozen_git_dir(cwd)
+        if frozen is not None:
+            git_dir, work_tree, index = frozen
+            env = git_env(literal)
+            env["GIT_INDEX_FILE"] = index
+            pre = ["--git-dir=" + git_dir, "--work-tree=" + work_tree]
+            try:
+                return subprocess.run(["git"] + pre + GIT_OPTS + list(args), cwd=str(cwd),
+                                      capture_output=True, env=env, timeout=timeout, **kw)
+            finally:
+                shutil.rmtree(git_dir, ignore_errors=True)
+    return subprocess.run(["git"] + GIT_OPTS + list(args), cwd=str(cwd), capture_output=True,
                           env=git_env(literal), timeout=timeout, **kw)
 
 
@@ -2158,29 +2233,60 @@ def prepare_ask(req):
 
 # ---------------------------------------------------------------- pdf
 
+RAW_SRC_RE = re.compile(r'src="/raw/([^"]*)"')
+
+
+def pdf_image_src(m):
+    """Rewrite one <img src="/raw/PATH"> for the print page: Chrome reads the image straight from
+    disk (a file:// URL), but only when PATH stays inside ROOT (safe_path resolves it, so neither
+    ../ in the string nor a symlink can reach a file outside the folder); otherwise the src is
+    dropped. The agent fully controls the HTML posted to /api/pdf, so this is checked here, not
+    with a blind string replace."""
+    path = unquote(m.group(1).split("?", 1)[0], errors="surrogateescape")
+    try:
+        p = safe_path(path)
+    except (ValueError, OSError):
+        return 'src=""'
+    return f'src="{p.as_uri()}"'
+
+
 def export_pdf(req):
-    """Print the editor's rendered HTML to <name>.pdf beside the markdown file."""
+    """Print the editor's rendered HTML to <name>.pdf beside the markdown file. The print HTML is
+    agent-influenced (whatever is posted as req["html"]), so it is rendered OUTSIDE ROOT, a meta
+    Content-Security-Policy in the page blocks scripts, frames and plugins (only images and the
+    stylesheets load), image sources are resolved through safe_path, and the .pdf is written with
+    O_NOFOLLOW so a symlink the agent planted at <name>.pdf cannot redirect the write out of ROOT."""
     if not CHROME_BIN:
         raise RuntimeError("PDF export needs Google Chrome or Chromium (or set MDEDIT_CHROME)")
     md = safe_path(req["path"])
+    html = req["html"]
+    if not isinstance(html, str):
+        raise ValueError("html must be a string")
     pdf = md.with_suffix(".pdf")
-    # images point at the /raw/ route; Chrome reads them straight from disk instead
-    body = req["html"].replace('src="/raw/', f'src="{ROOT.as_uri()}/')
+    if os.path.islink(pdf) or (pdf.exists() and not pdf.is_file()):
+        raise RuntimeError("refusing to write the PDF: a symlink or non-file is in its place")
+    body = RAW_SRC_RE.sub(pdf_image_src, html)
     page = PDF_TEMPLATE.format(title=md.stem.replace("<", "&lt;"), body=body)
-    # the page sits beside the .md so relative image links resolve
-    tmp_html = md.with_name(f".{md.stem}.print.html")
-    tmp_html.write_text(page, encoding="utf-8")
-    profile = tempfile.mkdtemp(prefix="mdedit-chrome-")
+    profile = tempfile.mkdtemp(prefix="mdedit-chrome-")  # outside ROOT: the agent cannot touch it
+    tmp_html = Path(profile) / "print.html"
+    out_pdf = Path(profile) / "out.pdf"
     try:
+        tmp_html.write_text(page, encoding="utf-8")
         proc = subprocess.run(
             [CHROME_BIN, "--headless=new", "--disable-gpu", "--no-first-run", "--no-pdf-header-footer",
              f"--user-data-dir={profile}", "--virtual-time-budget=15000", "--run-all-compositor-stages-before-draw",
-             f"--print-to-pdf={pdf}", tmp_html.as_uri()],
+             f"--print-to-pdf={out_pdf}", tmp_html.as_uri()],
             capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0 or not pdf.exists():
+        if proc.returncode != 0 or not out_pdf.exists():
             raise RuntimeError(f"Chrome failed to print: {(proc.stderr or proc.stdout).strip()[-800:]}")
+        data = out_pdf.read_bytes()
+        try:
+            fd = os.open(pdf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        except OSError as exc:
+            raise RuntimeError(f"refusing to write the PDF: {exc.strerror or exc}")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
     finally:
-        tmp_html.unlink(missing_ok=True)
         shutil.rmtree(profile, ignore_errors=True)
     return {"pdf": pdf.relative_to(ROOT).as_posix(), "bytes": pdf.stat().st_size}
 
@@ -2608,6 +2714,22 @@ LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
 REQUEST = threading.local()  # .conn: the socket of the API request this thread is answering
 QUIET_POLLS = ("/api/stat", "/api/git/status", "/api/git/info")  # not logged when they succeed
 HOST_RE = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[^\[\]:/@\s]+)(?::[0-9]{1,5})?")
+# Content types that run script or embed documents when a browser opens them as a page (as
+# opposed to an <img> subresource): /raw/ serves these as a download, so a link or placeholder
+# in the preview cannot run them in the editor's origin even if the sandbox CSP were bypassed.
+RAW_ACTIVE = {"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+              "text/javascript", "application/javascript", "application/ecmascript", "text/ecmascript",
+              "application/pdf"}
+# The editor page's own Content-Security-Policy: its code and the pinned CDN libraries, nothing
+# else. Kept permissive enough (inline + eval, the two CDNs, ws: for the terminal) not to break
+# the no-build front end, while still refusing script, frames or plugins from anywhere else.
+APP_CSP = ("default-src 'self'; "
+           "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net blob:; "
+           "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; "
+           "img-src 'self' data: blob: http: https:; "
+           "font-src 'self' data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; "
+           "connect-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net ws: wss:; "
+           "worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -2661,6 +2783,11 @@ class Handler(SimpleHTTPRequestHandler):
 
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
+        # the editor page (and any HTML the static handler serves) gets the site-wide CSP, unless
+        # the response already set its own (the /raw/ sandbox policy), so the two never collide
+        buf = b"".join(getattr(self, "_headers_buffer", None) or []).lower()
+        if b"text/html" in buf and b"content-security-policy" not in buf:
+            self.send_header("Content-Security-Policy", APP_CSP)
         super().end_headers()
 
     def send_json(self, obj, status=200):
@@ -2672,21 +2799,43 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_raw(self, rel):
-        """Serve a file from the document root (images referenced by the markdown)."""
+        """Serve a file from the document root (images referenced by the markdown). The agent
+        controls these files, so the response is locked down: a file opened on its own (an SVG or
+        HTML file in the folder, say) must not run scripts in the editor's origin, which can use
+        the API. The file is streamed, so opening a huge artefact does not read it all into memory."""
         p = safe_path(rel)
-        if not p.is_file():
+        try:
+            st = os.stat(p)
+        except OSError:
             return self.send_json({"error": "not found"}, 404)
-        data = p.read_bytes()
+        if not stat.S_ISREG(st.st_mode):
+            return self.send_json({"error": "not found"}, 404)
+        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
         self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(p.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
-        # a file opened on its own (an SVG or HTML file in the folder, say) must not run scripts
-        # in the editor's origin, which can use the API; <img> ignores both headers
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(st.st_size))
+        # the sandbox keeps an opened SVG/HTML file from scripting in our origin; nosniff stops a
+        # mislabelled file being run as script; <img> ignores both headers
         self.send_header("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; "
                                                     "style-src 'unsafe-inline'")
         self.send_header("X-Content-Type-Options", "nosniff")
+        # a type that runs script or embeds a document, opened as a page (not fetched as an image),
+        # is downloaded rather than rendered; the name is kept out of the header (the agent chooses
+        # it, and it may hold CR/LF) to avoid a header injection
+        if (ctype in RAW_ACTIVE or ctype.endswith("+xml")) and self.headers.get("Sec-Fetch-Dest") != "image":
+            self.send_header("Content-Disposition", "attachment")
         self.end_headers()
-        self.wfile.write(data)
+        remaining = st.st_size
+        try:
+            with open(p, "rb") as f:
+                while remaining > 0:
+                    chunk = f.read(min(1 << 16, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def read_json(self):
         n = int(self.headers.get("Content-Length") or 0)

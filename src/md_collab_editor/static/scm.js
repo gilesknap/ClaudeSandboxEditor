@@ -1123,6 +1123,12 @@ const SCM = (() => {
     }
     if (dirty) msg += ' Its unsaved changes in the editor will be lost too.';
     if (!(await UI.confirm(msg, { title: f.status === 'U' ? 'Delete file' : 'Discard changes', ok, danger: true }))) return;
+    // stop a pending autosave (and let any write under way finish) before git rewrites the file,
+    // so the discarded edits are not written back on top of the restored HEAD version
+    for (const p of [f.path, f.old_path].filter(Boolean)) {
+      const m = Tabs.model(p);
+      if (m) await Tabs.cancelAutosave(m);
+    }
     try {
       await UI.api('POST', '/api/git/discard', f.old_path ? { path: f.path, old_path: f.old_path } : { path: f.path });
     } catch (e) {

