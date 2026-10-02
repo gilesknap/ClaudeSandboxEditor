@@ -95,7 +95,7 @@ const MD = (() => {
   let docPath = () => '';
   const ABS_URL = /^(?:[a-z][a-z0-9+.-]*:|\/\/|#)/i;
   function fixImages(root) {
-    const dir = docPath().split('/').slice(0, -1).map(encodeURIComponent).join('/');
+    const dir = docPath().split('/').slice(0, -1).map(window.UI ? UI.encPath : encodeURIComponent).join('/');
     const base = new URL(`/raw/${dir}${dir ? '/' : ''}`, location.origin);
     root.querySelectorAll('img[src]').forEach(img => {
       const src = img.getAttribute('src');

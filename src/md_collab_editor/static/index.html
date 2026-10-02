@@ -9,6 +9,7 @@
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/merge/merge.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css">
 <link rel="stylesheet" href="app.css">
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
@@ -25,14 +26,20 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/search.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/jump-to-line.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/mode/simple.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/mode/multiplex.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/meta.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/mode/loadmode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/diff_match_patch/20121119/diff_match_patch.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/merge/merge.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.js"></script>
 </head>
 <body>
 <header id="topbar">
-  <button id="toggle-files" class="icon-btn" title="Files">☰</button>
-  <button id="open-browse" class="icon-btn" title="Open a markdown file (Ctrl+O)">📂</button>
+  <button id="toggle-files" class="icon-btn" title="Show or hide the side bar">☰</button>
+  <button id="open-browse" class="icon-btn" title="Open another folder or file (Ctrl+O)">📂</button>
   <span id="doc-name">—</span>
   <span id="save-state" class="muted"></span>
   <div class="spacer"></div>
@@ -45,22 +52,26 @@
     <option value="sonnet">Sonnet</option>
     <option value="haiku">Haiku</option>
   </select>
-  <button id="export-pdf" title="Export as PDF: saved next to the .md file and downloaded (Ctrl+P prints the preview)">⬇ PDF</button>
+  <button id="export-pdf" title="Export as PDF: saved next to the .md file and downloaded (the browser's Print prints the preview)">⬇ PDF</button>
   <button id="theme" class="icon-btn" title="Light / dark">◐</button>
   <button id="toggle-claude" class="icon-btn" title="Claude panel">✦</button>
 </header>
 
 <div id="banner" hidden></div>
 
-<main id="main" class="split">
-  <aside id="files">
-    <div class="side-head"><span>Files</span><span><button id="browse-btn" class="small-btn" title="Browse for a markdown file (Ctrl+O)">Open…</button> <button id="new-file" class="small-btn" title="New file">+ New</button></span></div>
-    <div id="file-root" class="muted"></div>
-    <ul id="file-list"></ul>
+<main id="main" class="split" data-kind="empty">
+  <nav id="activity-bar" role="tablist" aria-label="Side bar" aria-orientation="vertical"></nav>
+  <aside id="sidebar">
+    <div id="sidebar-resize" title="Drag to resize the side bar (double-click to reset)"></div>
+    <div id="side-views"></div>
   </aside>
 
+  <div id="workbench">
+  <div id="tabstrip" role="tablist" aria-label="Open files" hidden></div>
+  <div id="editor-area">
   <section id="editor-pane">
     <div id="toolbar">
+      <span class="md-tools">
       <button data-cmd="h1" title="Heading">H</button>
       <button data-cmd="bold" title="Bold (Ctrl+B)"><b>B</b></button>
       <button data-cmd="italic" title="Italic (Ctrl+I)"><i>I</i></button>
@@ -78,6 +89,7 @@
       <button data-cmd="table" title="Table">▦</button>
       <button data-cmd="hr" title="Horizontal rule">―</button>
       <span class="sep"></span>
+      </span>
       <button data-cmd="undo" title="Undo (Ctrl+Z)">↶</button>
       <button data-cmd="redo" title="Redo (Ctrl+Y)">↷</button>
       <span class="sep"></span>
@@ -91,6 +103,13 @@
   <section id="preview-pane">
     <article id="preview" class="markdown-body"></article>
   </section>
+  <div id="custom-view"></div>
+  <div id="empty-state">
+    <p><strong>No file open</strong></p>
+    <p class="muted">Pick a file in the Explorer, or press <kbd>Ctrl</kbd>+<kbd>O</kbd> to open another folder.</p>
+  </div>
+  </div>
+  </div>
 
   <aside id="claude" data-tab="terminal">
     <div id="panel-resize" title="Drag to resize the panel (double-click to reset)"></div>
@@ -114,7 +133,7 @@
   </aside>
 </main>
 
-<footer id="status"><span id="stat-words"></span><span id="stat-cursor"></span><span id="stat-root" class="muted"></span></footer>
+<footer id="status"><span id="status-left"><span id="stat-words" class="stat-item" style="order:20"></span><span id="stat-cursor" class="stat-item" style="order:30"></span></span><span id="status-right"><span id="stat-root" class="stat-item muted" style="order:100"></span></span></footer>
 
 <div id="askbar" hidden>
   <div id="ask-presets"></div>
@@ -135,7 +154,7 @@
     <ul id="browser-list"></ul>
     <div class="browser-foot">
       <span id="browser-msg" class="muted">Click a folder to enter it; click a .md file to open it.</span>
-      <button id="browser-use-folder" title="Show every markdown file in this folder in the sidebar">Use this folder</button>
+      <button id="browser-use-folder" title="Open this folder in the Explorer">Use this folder</button>
     </div>
   </div>
 </div>
@@ -143,6 +162,13 @@
 <script src="render.js"></script>
 <script src="spell.js"></script>
 <script src="term.js"></script>
+<script src="ui.js"></script>
+<script src="activity.js"></script>
+<script src="tabs.js"></script>
+<script src="explorer.js"></script>
+<script src="linediff.js"></script>
+<script src="scm.js"></script>
+<script src="search.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

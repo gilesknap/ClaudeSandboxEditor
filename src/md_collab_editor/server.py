@@ -23,9 +23,11 @@ import collections
 import difflib
 import hashlib
 import json
+import itertools
 import math
 import mimetypes
 import os
+import posixpath
 import re
 import select
 import shlex
@@ -35,14 +37,16 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:  # PTYs need a POSIX system (Linux, macOS)
     import fcntl
@@ -69,7 +73,9 @@ DEFAULT_ASK_AGENT = "uvx claude-sandbox@latest"
 ASK_CMD = shlex.split(DEFAULT_ASK_AGENT)
 
 PDF_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>{title}</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src file: https: data:; style-src https: 'unsafe-inline'; font-src https: data:">
+<title>{title}</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/github-markdown-css/5.5.1/github-markdown-light.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
@@ -110,14 +116,52 @@ to change it. Do not include text from outside the selection.
 - British English spelling unless the document clearly uses another convention.
 - If asked to use a skill, invoke it with the Skill tool before writing."""
 
+# for any file that is not markdown; {lang} is e.g. "Python" or "plain text", {valid} "valid Python"
+CODE_SYSTEM_PROMPT = """You are a coding and writing assistant embedded in a text editor. The file \
+the user is editing (file type: {lang}) is supplied first, inside <document> tags. Each request about it comes \
+in a <request> block and stands on its own. A request names part of the file, the <selection>, by \
+quoting it with its line numbers and the text just before and after it (<context_before>, \
+<context_after>), or says that the whole file is selected. If the file has changed since it was \
+supplied, the request starts with a <document_update> holding a unified diff to the current \
+version: work from that version.
+
+Rules:
+- Reply with the result ONLY: no preamble, no explanation, no closing remarks, no surrounding \
+quotes, and no markdown code fence (```) around the reply.
+- In "replace" mode your reply replaces the selection verbatim, so it must be {valid} that fits \
+seamlessly where the selection was. Keep the file's indentation (tabs or spaces, and the \
+selection's own leading indentation), formatting, naming and comment style, and keep the code \
+working. Do not include text from outside the selection.
+- In "comment" mode reply with concise feedback in markdown; the file is not changed.
+- British English spelling in prose and comments unless the file clearly uses another convention.
+- If asked to use a skill, invoke it with the Skill tool before writing."""
+
 
 # ---------------------------------------------------------------- files
 
-def safe_path(rel: str) -> Path:
-    p = (ROOT / rel).resolve()
-    if p != ROOT and ROOT not in p.parents:
+def safe_path(rel: str, follow=True) -> Path:
+    """ROOT/rel, refused (ValueError) if it leaves ROOT, including by way of a symlink. With
+    follow=False the last component is not resolved, so a symlink stays the link itself (for
+    creating, renaming and deleting); the folder holding it must still be inside ROOT."""
+    if not isinstance(rel, str) or "\0" in rel:
+        raise ValueError("bad path")
+    try:
+        if follow:
+            p = (ROOT / rel).resolve()
+            if p != ROOT and ROOT not in p.parents:
+                raise ValueError("path escapes the root folder")
+            if os.path.islink(p):  # 3.13 hands back a link it could not resolve: a loop
+                raise RuntimeError
+            return p
+        lex = Path(os.path.normpath(ROOT / rel))
+        if lex == ROOT:
+            return ROOT
+        parent = lex.parent.resolve()
+    except RuntimeError:  # Python 3.9-3.12 raise this for a symlink loop (3.13 resolves what it can)
+        raise ValueError(f"symlink loop: {rel}")
+    if parent != ROOT and ROOT not in parent.parents:
         raise ValueError("path escapes the root folder")
-    return p
+    return parent / lex.name
 
 
 def version_of(p: Path) -> str:
@@ -189,6 +233,1380 @@ def list_skills():
                 pass
             skills.append({"name": d.name, "description": desc})
     return skills
+
+
+# ---------------------------------------------------------------- workspace
+#
+# The IDE side: the file tree, any text file, create / rename / delete, quick open and find in
+# files. Paths come and go ROOT-relative (posix) and pass through safe_path. Inside a git work
+# tree git decides what is ignored, and lists and searches the files; elsewhere a walk that
+# skips hidden folders and SKIP_DIRS does.
+
+TEXT_MAX = 5 << 20       # bytes: bigger files are "too_large", and the walk search skips them
+SNIFF = 8192             # a NUL in the first 8 KiB makes a file binary (as for git)
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".bmp", ".ico")
+ALLFILES_MAX = 50_000
+SEARCH_MAX = 2000        # matches
+SEARCH_TIMEOUT = 60      # seconds for one search (git grep is killed; the walk gives up)
+PREVIEW = 300            # characters of a matching line in a search result
+LINE_MAX = 1 << 20       # bytes of a line that git grep found that a search looks at
+STATUS_MAX = 5000        # changed files in one /api/git/status answer
+
+LANGS = {
+    ".md": "Markdown", ".markdown": "Markdown", ".mdx": "MDX", ".rst": "reStructuredText", ".txt": "plain text",
+    ".py": "Python", ".pyi": "Python", ".pyw": "Python", ".ipynb": "JSON", ".js": "JavaScript",
+    ".mjs": "JavaScript", ".cjs": "JavaScript", ".jsx": "JSX", ".ts": "TypeScript", ".mts": "TypeScript",
+    ".cts": "TypeScript", ".tsx": "TSX", ".json": "JSON", ".jsonc": "JSON", ".html": "HTML", ".htm": "HTML",
+    ".xml": "XML", ".svg": "XML", ".css": "CSS", ".scss": "SCSS", ".sass": "Sass", ".less": "LESS",
+    ".vue": "Vue", ".svelte": "Svelte", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML", ".ini": "INI",
+    ".cfg": "INI", ".properties": "Properties files", ".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
+    ".fish": "fish", ".ps1": "PowerShell", ".bat": "Batch", ".c": "C", ".h": "C", ".cc": "C++", ".cpp": "C++",
+    ".cxx": "C++", ".hpp": "C++", ".hh": "C++", ".cs": "C#", ".java": "Java", ".kt": "Kotlin", ".kts": "Kotlin",
+    ".scala": "Scala", ".groovy": "Groovy", ".gradle": "Groovy", ".go": "Go", ".rs": "Rust", ".rb": "Ruby",
+    ".php": "PHP", ".pl": "Perl", ".pm": "Perl", ".lua": "Lua", ".r": "R", ".jl": "Julia", ".swift": "Swift",
+    ".m": "Objective-C", ".dart": "Dart", ".ex": "Elixir", ".exs": "Elixir", ".erl": "Erlang",
+    ".hs": "Haskell", ".ml": "OCaml", ".clj": "Clojure", ".el": "Emacs Lisp", ".sql": "SQL", ".tex": "LaTeX",
+    ".bib": "BibTeX", ".csv": "CSV", ".tsv": "TSV", ".diff": "diff", ".patch": "diff",
+    ".proto": "Protocol Buffers", ".graphql": "GraphQL", ".tf": "HCL", ".nix": "Nix", ".cmake": "CMake",
+    ".mk": "Makefile", ".dockerfile": "Dockerfile", ".j2": "Jinja2", ".jinja": "Jinja2", ".zig": "Zig",
+    ".v": "Verilog", ".vhd": "VHDL", ".f90": "Fortran", ".asm": "Assembly", ".s": "Assembly",
+}
+LANG_FILES = {
+    "Dockerfile": "Dockerfile", "Containerfile": "Dockerfile", "Makefile": "Makefile", "GNUmakefile": "Makefile",
+    "CMakeLists.txt": "CMake", "Jenkinsfile": "Groovy", "Gemfile": "Ruby", "Rakefile": "Ruby",
+    "Vagrantfile": "Ruby", ".bashrc": "Shell", ".bash_profile": "Shell", ".profile": "Shell", ".zshrc": "Shell",
+    ".gitignore": "gitignore", ".dockerignore": "gitignore", ".gitattributes": "gitattributes",
+    ".editorconfig": "INI", ".env": "dotenv",
+}
+SHEBANGS = {"python": "Python", "node": "JavaScript", "deno": "TypeScript", "bash": "Shell", "sh": "Shell",
+            "zsh": "Shell", "dash": "Shell", "ksh": "Shell", "fish": "fish", "perl": "Perl", "ruby": "Ruby",
+            "php": "PHP", "lua": "Lua", "Rscript": "R"}
+
+
+class ApiError(Exception):
+    """An answer of {"error": message} with this HTTP status."""
+
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def lex_rel(rel):
+    """rel as a ROOT-relative posix path, normalised without resolving symlinks ('' for ROOT)."""
+    lex = Path(os.path.normpath(ROOT / rel))
+    if lex == ROOT:
+        return ""
+    try:
+        return lex.relative_to(ROOT).as_posix()
+    except ValueError:
+        raise ValueError("path escapes the root folder")
+
+
+def no_git_dir(p):
+    """Refuse to create, rename, delete or discard anything inside a .git folder."""
+    if p != ROOT and ".git" in p.relative_to(ROOT).parts:
+        raise ValueError("refusing to change a .git folder")
+
+
+def decode_text(data):
+    """data as text with \\n line ends, or None if it is binary (a NUL in the first 8 KiB, or not
+    UTF-8). The line ends match what read_text gives; PUT /api/file puts CRLF back."""
+    if b"\0" in data[:SNIFF]:
+        return None
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def disk_text(p):
+    """File p's text as GET /api/file gives it, "" if there is no file, or None if it is not text
+    (binary, not UTF-8, over TEXT_MAX, or not a file)."""
+    try:
+        if not p.exists():  # as version_of: version "0"
+            return ""
+        if not p.is_file() or p.stat().st_size > TEXT_MAX:
+            return None
+        return decode_text(p.read_bytes())
+    except FileNotFoundError:  # deleted just now
+        return ""
+    except OSError:
+        return None
+
+
+def uses_crlf(p):
+    """Whether the file's first line ends in CRLF."""
+    try:
+        with open(p, "rb") as f:
+            head = f.read(65536)
+    except OSError:
+        return False
+    i = head.find(b"\n")
+    return i > 0 and head[i - 1:i] == b"\r"
+
+
+def language_of(path, head=""):
+    """The language of a file by its name (CodeMirror's names where it has one), else by a #! line
+    at the start of `head`; None when unknown."""
+    name = posixpath.basename(path or "")
+    lang = LANG_FILES.get(name) or LANGS.get(os.path.splitext(name)[1].lower())
+    if lang or not head.startswith("#!"):
+        return lang
+    words = head[2:].split("\n", 1)[0].split()
+    if words and os.path.basename(words[0]) == "env":
+        words = [w for w in words[1:] if not w.startswith("-")]
+    return SHEBANGS.get(re.sub(r"[\d.]+$", "", os.path.basename(words[0]))) if words else None
+
+
+def is_markdown(path):
+    return not path or path.lower().endswith(MD_EXT)
+
+
+def file_info(q):
+    """GET /api/file: {path, kind: text|binary|image|too_large, size, version, text (text only),
+    mode (language hint, when known)}."""
+    rel = q["path"]
+    p = safe_path(rel)
+    if not p.is_file():
+        raise ApiError(404, "not found")
+    st = p.stat()  # before reading, so a write in between shows up as a newer version later
+    out = {"path": rel, "kind": "text", "size": st.st_size, "version": str(st.st_mtime_ns)}
+    head = ""
+    if p.suffix.lower() in IMAGE_EXT:
+        out["kind"] = "image"
+    elif st.st_size > TEXT_MAX:
+        out["kind"] = "too_large"
+    else:
+        text = decode_text(p.read_bytes())
+        if text is None:
+            out["kind"] = "binary"
+        else:
+            out["text"], head = text, text[:200]
+    lang = language_of(rel, head)
+    if lang:
+        out["mode"] = lang
+    return out
+
+
+def api_tree(q):
+    """GET /api/tree: one folder's entries, folders first; hidden (dotfiles, SKIP_DIRS) and
+    git-ignored ones only with all=1, flagged. .git never appears."""
+    rel = q.get("dir", "")
+    d = safe_path(rel)
+    if not d.is_dir():
+        raise ApiError(404, "not a folder")
+    base, show_all = lex_rel(rel), q.get("all") == "1"
+    entries = []
+    with os.scandir(d) as it:
+        for e in it:
+            if e.name == ".git":
+                continue
+            try:
+                is_dir = e.is_dir()
+            except OSError:
+                is_dir = False
+            size = None
+            if not is_dir:
+                try:
+                    size = e.stat().st_size
+                except OSError:  # a dangling symlink
+                    pass
+            hidden = e.name.startswith(".") or (is_dir and e.name in SKIP_DIRS)
+            if hidden and not show_all:
+                continue
+            entries.append({"name": e.name, "path": f"{base}/{e.name}" if base else e.name, "dir": is_dir,
+                            "size": size, "hidden": hidden, "ignored": False})
+    # git knows the files where they really are: a folder reached through a symlink is
+    # asked about at its target
+    real = d.relative_to(ROOT).as_posix() if d != ROOT else ""
+    ignored = git_ignored([f"{real}/{e['name']}" if real else e["name"] for e in entries], real)
+    for e in entries:
+        e["ignored"] = (f"{real}/{e['name']}" if real else e["name"]) in ignored
+    if not show_all:
+        entries = [e for e in entries if not e["ignored"]]
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower(), e["name"]))
+    return {"dir": base, "entries": entries}
+
+
+def dir_stamp(rel, top=None, memo=None):
+    """A short hash of a folder's direct entries (name, is folder), or "0" if it is gone: what
+    its rows in the tree show, so saving a file in it does not make the page list it again. A
+    .gitignore's mtime is in it too, since that file decides which entries are ignored, and in
+    work tree `top` (ws_git()) so are the other files with ignore rules for it (ignore_rules)."""
+    try:
+        items = []
+        d = safe_path(rel)
+        with os.scandir(d) as it:
+            for e in it:
+                if e.name == ".git":
+                    continue
+                try:
+                    items.append((e.name, e.is_dir(), e.stat(follow_symlinks=False).st_mtime_ns
+                                  if e.name == ".gitignore" else 0))
+                except OSError:
+                    items.append((e.name, False, 0))
+    except (ValueError, OSError):
+        return "0"
+    items.sort()
+    rules = ignore_rules(d, top, {} if memo is None else memo) if top is not None else []
+    return hashlib.sha1(repr((items, rules)).encode("utf-8", "surrogateescape")).hexdigest()[:16]
+
+
+def ignore_rules(d, top, memo):
+    """The mtimes of the files, other than its own .gitignore, whose rules decide which of folder
+    d's entries git ignores: the repository's info/exclude and the .gitignore in each folder
+    above d up to the work tree's top. memo: path → mtime, shared by one poll's folders."""
+    files = [git_exclude_file(top)]
+    if top in d.parents:
+        for p in d.parents:
+            files.append(p / ".gitignore")
+            if p == top:
+                break
+    out = []
+    for f in files:
+        if f is None:
+            continue
+        if f not in memo:
+            try:
+                memo[f] = os.stat(f).st_mtime_ns
+            except OSError:
+                memo[f] = 0
+        out.append(memo[f])
+    return out
+
+
+def api_stat(req):
+    """POST /api/stat: the versions of open files and stamps of expanded folders, for polling."""
+    paths, dirs = req.get("paths") or [], req.get("dirs") or []
+    if not isinstance(paths, list) or not isinstance(dirs, list):
+        raise ValueError("paths and dirs must be lists")
+    versions = {}
+    for rel in paths:
+        try:
+            p = safe_path(rel)
+            versions[rel] = version_of(p) if p.is_file() else "0"
+        except (ValueError, OSError):
+            versions[rel] = "0"
+    top, memo = (ws_git() if dirs else None), {}
+    return {"versions": versions, "dirs": {rel: dir_stamp(rel, top, memo) for rel in dirs}}
+
+
+def api_new(req):
+    """POST /api/new: a file (a name with no extension at all gets .md, unless exact is true) or,
+    with dir true, a folder; 409 if it exists."""
+    rel, is_dir = str(req.get("path") or "").strip(), bool(req.get("dir"))
+    if not is_dir:
+        rel = rel.rstrip("/")  # "notes/" is not a name: it would become notes/.md
+    if not rel:
+        raise ValueError("missing path")
+    if not is_dir and not req.get("exact") and "." not in posixpath.basename(rel.rstrip("/")):
+        rel += ".md"
+    p = safe_path(rel, follow=False)
+    no_git_dir(p)
+    if p == ROOT or os.path.lexists(p):
+        raise ApiError(409, "folder already exists" if p.is_dir() else "file already exists")
+    out = {"path": lex_rel(rel)}
+    if is_dir:
+        p.mkdir(parents=True)
+        return out
+    text = req.get("text")
+    if text is None:
+        text = f"# {p.stem}\n\n" if is_markdown(p.name) else ""
+    if not isinstance(text, str):
+        raise ValueError("text must be a string")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(p, "x", encoding="utf-8", newline="") as f:  # never over a file made meanwhile
+            f.write(text)
+    except FileExistsError:
+        raise ApiError(409, "file already exists")
+    out["version"] = version_of(p)
+    return out
+
+
+def api_rename(req):
+    """POST /api/rename: move a file or folder within ROOT; 409 if the target exists."""
+    src, dst = safe_path(req["from"], follow=False), safe_path(req["to"], follow=False)
+    if ROOT in (src, dst):
+        raise ValueError("cannot rename the root folder")
+    no_git_dir(src)
+    no_git_dir(dst)
+    if not os.path.lexists(src):
+        raise ApiError(404, "not found")
+    if os.path.lexists(dst):
+        # only a change of case on a case-insensitive file system names the same file
+        same = src.parent == dst.parent and src.name.lower() == dst.name.lower() and src.name != dst.name
+        try:
+            same = same and os.path.samefile(src, dst)
+        except OSError:  # e.g. one of them is a dangling symlink
+            same = False
+        if not same:
+            raise ApiError(409, "a file or folder of that name already exists")
+    if src.is_dir() and not src.is_symlink() and src in dst.parents:
+        raise ValueError("cannot move a folder into itself")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(src, dst)
+    return {"path": lex_rel(req["to"])}
+
+
+def api_delete(req):
+    """POST /api/delete: a file, symlink or folder (recursively, never ROOT). With dry_run true it
+    only counts. Answers {ok, files, dirs}: the files and the folders inside a deleted folder
+    (or that would be deleted)."""
+    p = safe_path(req["path"], follow=False)
+    if p == ROOT:
+        raise ValueError("refusing to delete the root folder")
+    no_git_dir(p)
+    if not os.path.lexists(p):
+        raise ApiError(404, "not found")
+    if p.is_dir() and not p.is_symlink():
+        files = dirs = 0
+        for _, dnames, fnames in os.walk(p):
+            dirs, files = dirs + len(dnames), files + len(fnames)
+        if not req.get("dry_run"):
+            shutil.rmtree(p)
+        return {"ok": True, "files": files, "dirs": dirs}
+    if not req.get("dry_run"):
+        p.unlink()
+    return {"ok": True, "files": 1, "dirs": 0}
+
+
+def walk_files():
+    """ROOT-relative paths of the files under ROOT in a sorted walk that skips hidden folders and
+    SKIP_DIRS and does not follow symlinked folders."""
+    for dirpath, dirnames, filenames in os.walk(ROOT):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS)
+        rel = Path(dirpath).relative_to(ROOT).as_posix()
+        for f in sorted(filenames):
+            yield f if rel == "." else f"{rel}/{f}"
+
+
+def api_allfiles(q):
+    """GET /api/allfiles: every non-ignored file under ROOT, for quick open."""
+    files = None
+    if ws_git() is not None:
+        r = git(["ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", "."], ROOT)
+        if r.returncode == 0:
+            names = dict.fromkeys(os.fsdecode(n) for n in r.stdout.split(b"\0") if n)  # unmerged: once
+            # drops tracked files deleted from the work tree, and submodules
+            files = sorted(n for n in names if os.path.isfile(os.path.join(ROOT, n)))
+    if files is None:
+        files = sorted(itertools.islice(walk_files(), ALLFILES_MAX + 1))
+    return {"files": files[:ALLFILES_MAX], "truncated": len(files) > ALLFILES_MAX}
+
+
+# -- find in files
+
+def split_globs(spec):
+    """The include box: globs separated by commas outside {...}."""
+    parts, depth, cur = [], 0, ""
+    for ch in spec:
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+            continue
+        depth += (ch == "{") - (ch == "}")
+        cur += ch
+    return parts + [cur]
+
+
+def expand_braces(g, limit=64):
+    """{a,b} alternatives, innermost first; a loop rather than recursion, so a glob of a thousand
+    {…} groups is just slow to refuse rather than a RecursionError."""
+    out, todo = [], [g]
+    while todo:
+        s = todo.pop()
+        m = re.search(r"\{([^{}]*)\}", s)
+        if not m:
+            out.append(s)
+        else:
+            todo += [s[:m.start()] + alt + s[m.end():] for alt in reversed(m.group(1).split(","))]
+        if len(out) + len(todo) > limit:
+            raise ValueError("too many {…} alternatives in the include globs")
+    return out
+
+
+def glob_parts(spec):
+    """The include box as [(glob, exclude)]: globs separated by commas, `!glob` excludes, {a,b}
+    alternatives, and a glob without a / matches at any depth (as in .gitignore)."""
+    out = []
+    for g in split_globs(spec or ""):
+        g = g.strip()
+        neg = g.startswith("!")
+        g = g[1:].strip() if neg else g
+        if g.startswith("./"):
+            g = g[2:]
+        anchored = "/" in g.rstrip("/")
+        g = g.strip("/")
+        if not g:
+            continue
+        if ".." in g.split("/"):
+            raise ValueError("include globs cannot leave the folder")
+        out += [(alt if anchored else "**/" + alt, neg) for alt in expand_braces(g)]
+    return out
+
+
+def glob_re(g):
+    """A git-style glob (* and ? within one name, ** across folders, [...]) as a regex over
+    ROOT-relative paths; it matches a folder's contents too, as git's pathspecs do."""
+    i, n, out = 0, len(g), []
+    while i < n:
+        c = g[i]
+        start = i == 0 or g[i - 1] == "/"
+        if start and g.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif start and g.startswith("**", i) and i + 2 == n:
+            out.append(".*")
+            i += 2
+        elif c == "*":
+            out.append("[^/]*")
+            i += 1
+        elif c == "?":
+            out.append("[^/]")
+            i += 1
+        elif c == "[":
+            j = i + 1
+            if j < n and g[j] in "!^":
+                j += 1
+            if j < n and g[j] == "]":
+                j += 1
+            j = g.find("]", j)
+            if j < 0:
+                out.append(re.escape(c))
+                i += 1
+            else:
+                body, neg = g[i + 1:j], g[i + 1:i + 2] in ("!", "^")
+                if neg:
+                    body = body[1:]
+                # every character literal (escaped: no nested sets, &&, ~~ or || for re to warn
+                # about), except a - between two others, which makes a range
+                cls = "".join("-" if c == "-" and 0 < k < len(body) - 1 and body[k - 1] != "-"
+                              else c if c.isalnum() or ord(c) > 127 else "\\" + c
+                              for k, c in enumerate(body))
+                out.append("[" + ("^" if neg else "") + cls + "]")
+                i = j + 1
+        else:
+            out.append(re.escape(c))
+            i += 1
+    return re.compile("".join(out) + "(?:/.*)?", re.S)
+
+
+def git_pathspecs(globs):
+    """git pathspecs for glob_parts() output, relative to ROOT (git's cwd)."""
+    specs = []
+    for g, neg in globs:
+        magic = ":(exclude,glob)" if neg else ":(glob)"
+        specs += [magic + g, magic + g + "/**"]
+    if not any(not neg for _, neg in globs):
+        specs.insert(0, ".")
+    return specs
+
+
+def search_pattern(q, regex, case, word):
+    """The Python regex for a search (re.error if q is not a valid regex). Named groups written as
+    in JavaScript and PCRE, (?<name>...) and \\k<name>, are translated."""
+    if regex:
+        pat = re.sub(r"\(\?<(?=[A-Za-z_])", "(?P<", q)
+        pat = re.sub(r"\\k<(\w+)>", r"(?P=\1)", pat)
+    else:
+        pat = re.escape(q)
+    if word:
+        pat = r"(?<![0-9A-Za-z_])(?:" + pat + r")(?![0-9A-Za-z_])"
+    return re.compile(pat, 0 if case else re.IGNORECASE)
+
+
+def line_spans(pat, line, limit=SEARCH_MAX + 1):
+    """Where pat matches in line: its non-empty matches (at most `limit`), else its first empty
+    one, else None."""
+    if pat is None:
+        return None
+    spans, empty = [], None
+    for m in pat.finditer(line):
+        if m.end() > m.start():
+            spans.append(m.span())
+            if len(spans) >= limit:
+                break
+        elif empty is None:
+            empty = m.span()
+    return spans or ([empty] if empty is not None else None)
+
+
+def js_len(s):
+    """Length in UTF-16 code units, which is how JavaScript and CodeMirror count characters."""
+    return len(s) if s.isascii() else len(s.encode("utf-16-le")) // 2
+
+
+def search_hit(path, n, line, s, e):
+    """One result. col and len are in the line; a long line is cut to PREVIEW characters around
+    the match, and `offset` says where `text` starts in the line."""
+    off = 0 if len(line) <= PREVIEW or e <= PREVIEW - 40 else max(0, s - 100)
+    return {"path": path, "line": n, "col": js_len(line[:s]), "len": js_len(line[s:e]),
+            "text": line[off:off + PREVIEW], "offset": js_len(line[:off])}
+
+
+def grep_records(stream, line_max=LINE_MAX):
+    """(path, line number, column, text) byte strings from `git grep -n --column -z` output, in
+    one pass over it (a minified file's single line can be megabytes); text past line_max bytes
+    of a line is dropped."""
+    head, text, nuls = bytearray(), bytearray(), 0
+    while True:
+        chunk = stream.read1(65536)
+        if not chunk:
+            return
+        i, n = 0, len(chunk)
+        while i < n:
+            if nuls < 3:  # path\0line\0column\0
+                j = chunk.find(b"\0", i)
+                if j < 0:
+                    head += chunk[i:]
+                    break
+                head += chunk[i:j + 1]
+                nuls += 1
+                i = j + 1
+                continue
+            j = chunk.find(b"\n", i)
+            end = n if j < 0 else j
+            if len(text) < line_max:
+                text += chunk[i:min(end, i + line_max - len(text))]
+            if j < 0:
+                break
+            path, line, col, _ = bytes(head).split(b"\0")
+            yield path, line, col, bytes(text)
+            head.clear()
+            text.clear()
+            nuls = 0
+            i = j + 1
+
+
+class Watchdog(threading.Thread):
+    """Calls kill() once the deadline passes (why = "timeout") or the client of `conn`, a request's
+    socket, has gone away (why = "gone": a newer search replaced it)."""
+
+    def __init__(self, kill, deadline, conn=None):
+        super().__init__(daemon=True)
+        self.kill, self.deadline, self.conn = kill, deadline, conn
+        self.why = None
+        self.done = threading.Event()
+
+    def run(self):
+        while not self.done.wait(0.2):
+            if time.monotonic() > self.deadline:
+                self.why = "timeout"
+            elif self.conn is not None and client_gone(self.conn):
+                self.why = "gone"
+            else:
+                continue
+            try:
+                self.kill()
+            except OSError:
+                pass
+            return
+
+    def stop(self):
+        self.done.set()
+
+    def check(self):
+        """Raise the ApiError for why the search was stopped, if it was."""
+        if self.why == "timeout":
+            raise ApiError(504, "the search took too long")
+        if self.why == "gone":
+            raise ApiError(499, "the search was cancelled")
+
+
+def client_gone(conn):
+    """Whether the other end of this socket has closed it (an aborted fetch)."""
+    try:
+        if not select.select([conn], [], [], 0)[0]:
+            return False
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except BlockingIOError:
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def grep_run(args, deadline, skip_big):
+    """Records of one `git grep` run (killed at the deadline or when the client goes away)."""
+    err = tempfile.TemporaryFile()
+    proc = subprocess.Popen(["git"] + GIT_OPTS + args, cwd=str(ROOT), stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=err, env=git_env())
+    dog = Watchdog(proc.kill, deadline, getattr(REQUEST, "conn", None))
+    dog.start()
+    try:
+        last, skip = None, False
+        for rec in grep_records(proc.stdout):
+            if rec[0] != last:  # over 5 MB: the editor would not open it anyway, as the walk skips it
+                last = rec[0]
+                try:
+                    skip = skip_big and os.stat(os.path.join(ROOT, os.fsdecode(last))).st_size > TEXT_MAX
+                except OSError:
+                    skip = False
+            if not skip:
+                yield rec
+        rc = proc.wait()
+        dog.check()
+        if rc not in (0, 1):
+            err.seek(0)
+            msg = err.read().decode("utf-8", "replace").strip()
+            raise GrepError(re.sub(r"^(fatal|error): ", "", msg.splitlines()[-1] if msg else f"git grep failed ({rc})"))
+    finally:
+        dog.stop()
+        dog.join()  # before the process is reaped and its pid can be reused
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdout.close()
+        err.close()
+
+
+class GrepError(Exception):
+    """git grep refused the search (as git words it)."""
+
+
+def grep_git(query, regex, case, word, globs, pat, deadline, pcre=None):
+    """Search with git grep: tracked files (all of them: git grep --untracked would also leave out
+    tracked files that match an ignore rule), then untracked files that are not ignored; never
+    binary files or ones over 5 MB. Match positions come from `pat`, or from git's column when
+    Python's regex flavour disagrees."""
+    args = ["grep", "-n", "-I", "--column", "-z", "--no-color"]
+    if not case:
+        args.append("-i")
+    if word:
+        args.append("-w")
+    if regex and pcre is None:
+        pcre = git_pcre()
+    args.append(("-P" if pcre else "-E") if regex else "-F")
+    specs = git_pathspecs(globs)
+    runs = [args + ["-e", query, "--"] + specs]
+    r = git(["ls-files", "-z", "--others", "--exclude-standard", "--"] + specs, ROOT)
+    untracked = [n for n in r.stdout.split(b"\0") if n and not n.endswith(b"/")] if r.returncode == 0 else []
+    for k in range(0, len(untracked), 500):  # literal pathspecs, a command line at a time
+        runs.append(args + ["--untracked", "-e", query, "--"]
+                    + [":(literal)" + os.fsdecode(n) for n in untracked[k:k + 500]])
+    try:
+        for run in runs:
+            for path_b, line_b, col_b, text_b in grep_run(run, deadline, True):
+                path = os.fsdecode(path_b)
+                if text_b.endswith(b"\r"):
+                    text_b = text_b[:-1]
+                line = text_b.decode("utf-8", "replace")
+                spans = line_spans(pat, line)
+                if spans is None:
+                    c = len(text_b[:max(0, int(col_b) - 1)].decode("utf-8", "replace"))
+                    spans = [(c, c)]
+                for s, e in spans:
+                    yield search_hit(path, int(line_b), line, s, e)
+    except GrepError as exc:
+        raise ApiError(400, f"invalid regular expression: {exc}") if regex else ApiError(500, str(exc))
+
+
+def grep_walk(pat, globs, regex, deadline):
+    """Search by walking ROOT (no hidden folders or SKIP_DIRS, no symlinks, binary or big files).
+    A plain-text search first tries each whole file; a regex ($, \\A, lookarounds) might match a
+    whole file differently from its lines, so it goes line by line."""
+    inc = [glob_re(g) for g, neg in globs if not neg]
+    exc = [glob_re(g) for g, neg in globs if neg]
+    # in md-editor's own process (a plain-text search) it stops when its client goes away, as
+    # search_child's Watchdog stops a regex search
+    conn, look = getattr(REQUEST, "conn", None), 0.0
+    for rel in walk_files():
+        now = time.monotonic()
+        if now > deadline:
+            raise ApiError(504, "the search took too long")
+        if conn is not None and now >= look:
+            if client_gone(conn):
+                raise ApiError(499, "the search was cancelled")
+            look = now + 0.2
+        if (inc and not any(r.fullmatch(rel) for r in inc)) or any(r.fullmatch(rel) for r in exc):
+            continue
+        p = ROOT / rel
+        try:
+            st = p.lstat()  # regular files only: no symlinks, and a FIFO would block the read
+            if not stat.S_ISREG(st.st_mode) or st.st_size > TEXT_MAX:
+                continue
+            text = decode_text(p.read_bytes())
+        except OSError:
+            continue
+        if text is None or (not regex and not pat.search(text)):
+            continue
+        for n, line in enumerate(text.split("\n"), 1):
+            for s, e in line_spans(pat, line) or ():
+                yield search_hit(rel, n, line, s, e)
+
+
+def search_gen(job, deadline):
+    """The hits of a search job ({engine, q, regex, case, word, globs, pcre?}), in this process."""
+    try:
+        pat = search_pattern(job["q"], job["regex"], job["case"], job["word"])
+    except (re.error, OverflowError, RecursionError):
+        pat = None  # api_search has already refused this for the walk; git's PCRE may still take it
+    if job["engine"] == "git":
+        return grep_git(job["q"], job["regex"], job["case"], job["word"], job["globs"], pat, deadline,
+                        job.get("pcre"))
+    return grep_walk(pat, job["globs"], job["regex"], deadline)
+
+
+# Python's re has no time limit, and a regex that backtracks (`(a+)+$`) can run for hours while
+# holding the GIL, which would stop every other request: so a regular-expression search runs in
+# a child process, killed at the time limit or as soon as its client goes away.
+SEARCHES = set()           # running search processes, ended when md-editor exits
+SEARCH_LOCK = threading.Lock()
+SEARCH_CHILD = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                "from md_collab_editor.server import search_child_main; search_child_main()")
+
+
+def kill_search(proc):
+    if proc.returncode is not None:  # already reaped: its pid could now name another process
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)  # with its git grep
+        else:
+            proc.kill()
+    except OSError:
+        pass
+
+
+def search_child(job, deadline):
+    """The hits of a search job, found by a child process (`python -I`: nothing in the folder
+    being searched can be imported by it)."""
+    err = tempfile.TemporaryFile()
+    proc = subprocess.Popen([sys.executable, "-I", "-c", SEARCH_CHILD, str(HERE.parent)], cwd=str(HERE),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+                            start_new_session=os.name == "posix")
+    with SEARCH_LOCK:
+        SEARCHES.add(proc)
+    dog = Watchdog(lambda: kill_search(proc), deadline, getattr(REQUEST, "conn", None))
+    dog.start()
+    try:
+        job = dict(job, root=str(ROOT), timeout=max(1.0, deadline - time.monotonic()))
+        try:
+            proc.stdin.write(json.dumps(job).encode())
+            proc.stdin.close()
+        except OSError:
+            pass
+        for line in proc.stdout:
+            msg = json.loads(line)
+            if "error" in msg:
+                raise ApiError(msg.get("status") or 500, msg["error"])
+            if msg.get("end"):
+                return
+            yield msg
+        proc.wait()
+        dog.check()
+        err.seek(0)
+        tail = err.read().decode("utf-8", "replace").strip().splitlines()
+        raise ApiError(500, "the search failed" + (f": {tail[-1]}" if tail else ""))
+    finally:
+        dog.stop()
+        dog.join()  # before the process is reaped and its pid can be reused
+        kill_search(proc)
+        proc.wait()
+        proc.stdout.close()
+        err.close()
+        with SEARCH_LOCK:
+            SEARCHES.discard(proc)
+
+
+def search_child_main():
+    """The child process of search_child: a job as JSON on stdin; one JSON hit per line on
+    stdout, then {"end": true} or {"error", "status"}."""
+    global ROOT
+    job = json.loads(sys.stdin.buffer.read())
+    ROOT = Path(job["root"])
+    if hasattr(signal, "alarm"):  # in case md-editor is gone: SIGALRM's default action ends it
+        signal.alarm(int(job["timeout"]) + 10)
+    out = sys.stdout.buffer
+    try:
+        for hit in search_gen(job, time.monotonic() + job["timeout"]):
+            out.write(json.dumps(hit).encode() + b"\n")
+        out.write(b'{"end": true}\n')
+    except ApiError as exc:
+        out.write(json.dumps({"error": str(exc), "status": exc.status}).encode() + b"\n")
+    except BrokenPipeError:
+        return
+    out.flush()
+
+
+def end_searches():
+    """At exit: kill the searches still running."""
+    with SEARCH_LOCK:
+        procs = list(SEARCHES)
+    for proc in procs:
+        kill_search(proc)
+
+
+def api_search(q):
+    """GET /api/search: find in files, git grep in a work tree, else a walk with Python's re."""
+    query = q.get("q", "")
+    regex, case, word = (q.get(k) == "1" for k in ("regex", "case", "word"))
+    if "\n" in query or "\r" in query:
+        raise ValueError("search for one line at a time")
+    globs = glob_parts(q.get("glob", ""))
+    engine = "git" if ws_git() is not None else "walk"
+    if not query:
+        return {"results": [], "truncated": False, "engine": engine}
+    if engine == "walk":
+        try:
+            for g, _ in globs:
+                glob_re(g)
+        except re.error as exc:
+            raise ApiError(400, f"invalid include glob: {exc}")
+    try:
+        search_pattern(query, regex, case, word)
+    except (re.error, OverflowError, RecursionError) as exc:
+        if engine == "walk":
+            raise ApiError(400, f"invalid regular expression: {exc}")
+        # git's PCRE may still take it
+    job = {"engine": engine, "q": query, "regex": regex, "case": case, "word": word, "globs": globs}
+    if engine == "git" and regex:
+        job["pcre"] = git_pcre()
+    deadline = time.monotonic() + env_seconds("MDEDIT_SEARCH_TIMEOUT", SEARCH_TIMEOUT)
+    # a plain-text pattern can't backtrack (re.escape, at most with word-boundary checks)
+    hits = search_child(job, deadline) if regex else search_gen(job, deadline)
+    results, truncated = [], False
+    try:
+        for h in hits:
+            if len(results) == SEARCH_MAX:
+                truncated = True
+                break
+            results.append(h)
+    finally:
+        hits.close()  # stops git grep, or the child process
+    return {"results": results, "truncated": truncated, "engine": engine}
+
+
+# ---------------------------------------------------------------- git
+#
+# Read-only apart from /api/git/discard. git never gets an option from the user: paths come
+# after `--` (literal pathspecs where they name files), the search pattern after -e, and the
+# only revisions are HEAD and refs and SHAs that git itself gave us.
+
+# Repository settings that would change the output parsed here, and ones that name commands for
+# git to run: md-editor runs git on this machine, outside the sandbox that the terminal's Claude
+# runs in, and that sandbox can write the repository's .git/config and .git/hooks. So no
+# fsmonitor hook (git status, ls-files and check-ignore would run it), no hooks (git restore runs
+# post-checkout), no submodules; clean/smudge filters: see frozen_git_dir.
+GIT_OPTS = ["-c", "color.ui=false", "-c", "core.quotePath=false", "-c", "diff.relative=false",
+            "-c", "grep.fullName=false", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
+            "-c", "submodule.recurse=false"]
+# status/diff run clean (and textconv) drivers, restore/checkout/rm run smudge drivers: a command
+# the agent names in .git/config for a path .gitattributes marks. These run against a frozen,
+# agent-unwritable copy of the repository's config (frozen_git_dir).
+FILTER_CMDS = ("status", "diff", "restore", "checkout", "rm")
+# Git LFS's own filter commands (as `git lfs install` writes them) are kept in the frozen config,
+# unless the configuration also names commands for git-lfs itself to run: LFS extensions (run on
+# every clean and smudge) and custom transfer agents. git-lfs never downloads either
+# (GIT_LFS_SKIP_SMUDGE), so no transfer agent, credential helper or ssh command runs for a smudge.
+LFS_FILTER = {"clean": ("git-lfs clean -- %f",), "smudge": ("git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"),
+              "process": ("git-lfs filter-process", "git-lfs filter-process --skip")}
+LFS_COMMAND_KEYS = ("lfs.extension.", "lfs.customtransfer.", "lfs.standalonetransferagent")
+# core.* keys that name a command git could run (status runs fsmonitor, restore the hooks): never
+# copied into the frozen config, and overridden by GIT_OPTS for good measure.
+FROZEN_CORE_SKIP = {"fsmonitor", "fsmonitorhookversion", "hookspath", "sshcommand", "pager", "editor",
+                    "askpass", "alternaterefscommand", "gvfs", "commitgraph"}
+GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_LITERAL_PATHSPECS",
+                "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS",
+                "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_ATTR_SOURCE")
+GIT_TTL = 3              # seconds that ROOT's work tree is remembered (git init / rm -rf .git)
+GIT_REPOS = {}           # ROOT → (expiry, git_repo() answer)
+GIT_FEATURES = {}        # "pcre", "restore" → bool, found out once
+GIT_EXCLUDE = {}         # work tree top → its info/exclude file (git_exclude_file)
+SHA_RE = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+
+def git_env(literal=False):
+    env = {k: v for k, v in os.environ.items() if k not in GIT_ENV_DROP}
+    # no index.lock for status while the terminal's Claude runs git; never ask for a password;
+    # git-lfs smudges from its local store only (see LFS_FILTER)
+    env.update(GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", GIT_LFS_SKIP_SMUDGE="1")
+    if literal:
+        env["GIT_LITERAL_PATHSPECS"] = "1"
+    return env
+
+
+def git_plain(args, cwd, env=None, timeout=60):
+    """One git subprocess; stdin closed. Used to read the real repo while building the frozen dir."""
+    return subprocess.run(["git"] + GIT_OPTS + list(args), cwd=str(cwd), capture_output=True,
+                          stdin=subprocess.DEVNULL, env=env if env is not None else git_env(), timeout=timeout)
+
+
+def _abs_git_path(cwd, which):
+    """Absolute path of one of the repo's files (objects, index), by its git-path relative to cwd."""
+    r = git_plain(["rev-parse", "--git-path", which], cwd)
+    if r.returncode != 0:
+        return None
+    out = os.fsdecode(r.stdout.rstrip(b"\n"))
+    return out if os.path.isabs(out) else os.path.abspath(os.path.join(str(cwd), out))
+
+
+def write_frozen_config(cwd, path):
+    """Write `path`: a git config with only the repo's effective core/extensions/index settings
+    (minus any that name a command for git to run) and Git LFS's exact filter commands, read once
+    from the real repo. Every other clean/smudge/diff/textconv driver, include, alias and remote is
+    left out, so a FILTER_CMD run against this config cannot execute a command the agent slipped
+    into .git/config. Reading the config runs nothing, and git later reads only this frozen copy."""
+    r = git_plain(["config", "--no-includes", "-z", "--get-regexp", r"^(core|extensions|index|filter|lfs)\."], cwd)
+    keep, lfs_vals, lfs_ok = [], {}, True
+    for item in r.stdout.split(b"\0") if r.returncode == 0 else ():
+        key, _, value = os.fsdecode(item).partition("\n")
+        low = key.lower()
+        if low.startswith(LFS_COMMAND_KEYS):  # git-lfs would run these itself: do not trust LFS
+            lfs_ok = False
+            continue
+        section, _, var = low.rpartition(".")
+        if section in ("core", "extensions", "index"):
+            if section == "core" and var in FROZEN_CORE_SKIP:
+                continue
+            keep.append((key, value))
+        elif section == "filter.lfs" and var in ("clean", "smudge", "process", "required"):
+            lfs_vals[var] = value.strip()
+    # keep Git LFS only when every filter command it names is exactly one `git lfs install` writes
+    if lfs_ok and any(v in lfs_vals for v in ("clean", "smudge", "process")) and \
+            all(lfs_vals.get(v, next(iter(LFS_FILTER[v]))) in LFS_FILTER[v] for v in ("clean", "smudge", "process")):
+        for v in ("clean", "smudge", "process"):
+            keep.append((f"filter.lfs.{v}", next(iter(LFS_FILTER[v]))))
+        keep.append(("filter.lfs.required", lfs_vals.get("required", "true")))
+    open(path, "x").close()  # git config --file writes correct escaping; we only add known keys
+    for key, value in keep:
+        subprocess.run(["git", "config", "--file", str(path), "--add", key, value],
+                       capture_output=True, stdin=subprocess.DEVNULL, env=git_env(), timeout=30)
+
+
+def frozen_git_dir(cwd):
+    """A private, agent-unwritable git directory for running a FILTER_CMD in the work tree at cwd:
+    its config is a frozen copy with no agent-supplied drivers (write_frozen_config), its HEAD is
+    pinned to the current commit, and its objects and index are the real repo's (shared, so a
+    discard still writes the real index). Returns (git_dir, work_tree, index_file) or None when cwd
+    is not inside a work tree (nothing there runs a filter). Caller removes git_dir."""
+    if git_plain(["rev-parse", "--is-inside-work-tree"], cwd).stdout.strip() != b"true":
+        return None
+    top = git_plain(["rev-parse", "--show-toplevel"], cwd)
+    objects = _abs_git_path(cwd, "objects")
+    index = _abs_git_path(cwd, "index")
+    if top.returncode != 0 or objects is None or index is None:
+        return None
+    work_tree = os.fsdecode(top.stdout.rstrip(b"\n"))
+    head = git_plain(["rev-parse", "-q", "--verify", "HEAD"], cwd)
+    sha = head.stdout.decode().strip() if head.returncode == 0 else ""
+    git_dir = tempfile.mkdtemp(prefix="mdedit-git-")
+    try:
+        os.mkdir(os.path.join(git_dir, "refs"))
+        os.makedirs(os.path.join(git_dir, "objects", "info"))
+        with open(os.path.join(git_dir, "objects", "info", "alternates"), "w") as f:
+            f.write(objects + "\n")
+        # a resolved sha (so no ref lookup is needed), or an unborn branch so status reports every
+        # file as added, exactly as the real repo would before its first commit
+        with open(os.path.join(git_dir, "HEAD"), "w") as f:
+            f.write((sha if SHA_RE.fullmatch(sha) else "ref: refs/heads/_mdedit_unborn") + "\n")
+        write_frozen_config(cwd, os.path.join(git_dir, "config"))
+    except BaseException:  # never leave the private dir behind, and never fall back to unfrozen git
+        shutil.rmtree(git_dir, ignore_errors=True)
+        raise
+    return git_dir, work_tree, index
+
+
+def git(args, cwd, input=None, literal=False, timeout=60):
+    """Run git with bytes in and out; a failing git is the caller's to judge from returncode.
+    Raises OSError if git cannot run at all. A FILTER_CMD (which runs clean/smudge/diff drivers)
+    is run against a frozen copy of the repository's config that the sandboxed agent cannot change
+    under it, so a driver it writes into .git/config never executes on the host."""
+    kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
+    if args and args[0] in FILTER_CMDS:
+        frozen = frozen_git_dir(cwd)
+        if frozen is not None:
+            git_dir, work_tree, index = frozen
+            env = git_env(literal)
+            env["GIT_INDEX_FILE"] = index
+            pre = ["--git-dir=" + git_dir, "--work-tree=" + work_tree]
+            try:
+                return subprocess.run(["git"] + pre + GIT_OPTS + list(args), cwd=str(cwd),
+                                      capture_output=True, env=env, timeout=timeout, **kw)
+            finally:
+                shutil.rmtree(git_dir, ignore_errors=True)
+    return subprocess.run(["git"] + GIT_OPTS + list(args), cwd=str(cwd), capture_output=True,
+                          env=git_env(literal), timeout=timeout, **kw)
+
+
+def git_repo():
+    """{"top": the work tree's top (resolved) or None, "root_rel": ROOT relative to it, "ignored":
+    whether ROOT itself is git-ignored, "reason": why git cannot be used, if not just "no repo"},
+    remembered per ROOT for GIT_TTL seconds."""
+    root, now = ROOT, time.monotonic()
+    hit = GIT_REPOS.get(root)
+    if hit and hit[0] > now:
+        return hit[1]
+    repo = {"top": None, "root_rel": None, "ignored": False, "reason": ""}
+    try:
+        r = git(["rev-parse", "--show-toplevel"], root) if root.is_dir() else None
+        if r is None:
+            pass
+        elif r.returncode == 0:
+            top = Path(os.fsdecode(r.stdout.rstrip(b"\n"))).resolve()
+            if top == root or top in root.parents:
+                rr = "" if top == root else root.relative_to(top).as_posix()
+                repo.update(top=top, root_rel=rr)
+                if rr:
+                    repo["ignored"] = git(["check-ignore", "-q", "--", "./" + rr], top).returncode == 0
+        else:
+            err = r.stderr.decode("utf-8", "replace").strip()
+            if err and "not a git repository" not in err:
+                repo["reason"] = err.splitlines()[-1][:300]
+    except (OSError, subprocess.SubprocessError) as exc:
+        repo["reason"] = f"git is not available: {exc}"
+    GIT_REPOS[root] = (now + GIT_TTL, repo)
+    return repo
+
+
+def git_exclude_file(top):
+    """The info/exclude file of the repository whose work tree is `top` (a linked worktree's is
+    in the main one's .git), found out once per work tree; None if git cannot say."""
+    if top not in GIT_EXCLUDE:
+        try:
+            r = git(["rev-parse", "--git-path", "info/exclude"], top)
+            out = os.fsdecode(r.stdout.rstrip(b"\n")) if r.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            out = ""
+        if out:
+            GIT_EXCLUDE[top] = top / out
+    return GIT_EXCLUDE.get(top)
+
+
+def ws_git():
+    """The work tree's top when git should decide what the tree, quick open and search show: not
+    when ROOT is outside any repo, or itself git-ignored (everything in it would be)."""
+    repo = git_repo()
+    return repo["top"] if repo["top"] is not None and not repo["ignored"] else None
+
+
+def check_ignore(paths, index):
+    """The paths among these that check-ignore reports; None if it fails."""
+    # check-ignore takes no literal pathspecs; after ./ a leading : is not pathspec magic
+    r = git(["check-ignore", "-z", "--stdin"] + ([] if index else ["--no-index"]), ROOT,
+            input=b"".join(b"./" + os.fsencode(p) + b"\0" for p in paths))
+    if r.returncode not in (0, 1):  # e.g. a path inside a nested repository
+        return None
+    return {os.fsdecode(p[2:] if p.startswith(b"./") else p) for p in r.stdout.split(b"\0") if p}
+
+
+def git_ignored(paths, folder=""):
+    """Which of these ROOT-relative paths (the entries of `folder`, a real path: no symlinks on
+    the way, which git refuses) git ignores. A tracked file is never ignored, nor is a folder
+    with tracked files in it. With the index, check-ignore takes time in proportion to the
+    number of paths times the size of the index, so it first asks without the index (quick),
+    then sorts out the few it names with the index, or with the tracked files under `folder`."""
+    if not paths or ws_git() is None:
+        return set()
+    try:
+        cand = check_ignore(paths, False)
+        if not cand:
+            return set()
+        if len(cand) <= 64:
+            return check_ignore(sorted(cand), True) or set()
+        r = git(["ls-files", "-z", "--cached", "--", folder or "."], ROOT, literal=True)
+        if r.returncode != 0:
+            return set()
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    tracked = set()
+    for f in r.stdout.split(b"\0"):  # each tracked file, and the folders it is in
+        f = os.fsdecode(f)
+        while f and f not in tracked:
+            tracked.add(f)
+            f = posixpath.dirname(f)
+    return cand - tracked
+
+
+def git_pcre():
+    """Whether this git's grep has -P (PCRE, close to JavaScript's regexes); else -E is used."""
+    if "pcre" not in GIT_FEATURES:
+        with tempfile.TemporaryDirectory() as d:
+            try:
+                rc = git(["grep", "--no-index", "-q", "-P", "-e", "x", "--", "."], d).returncode
+            except (OSError, subprocess.SubprocessError):
+                rc = 128
+        GIT_FEATURES["pcre"] = rc in (0, 1)
+    return GIT_FEATURES["pcre"]
+
+
+def git_has_restore():
+    """git restore arrived in git 2.23."""
+    if "restore" not in GIT_FEATURES:
+        try:
+            m = re.search(rb"(\d+)\.(\d+)", git(["version"], tempfile.gettempdir()).stdout)
+        except (OSError, subprocess.SubprocessError):
+            m = None
+        GIT_FEATURES["restore"] = bool(m) and (int(m.group(1)), int(m.group(2))) >= (2, 23)
+    return GIT_FEATURES["restore"]
+
+
+def git_commit(top, rev):
+    """The SHA of commit `rev` (HEAD or a full ref name), or None."""
+    r = git(["rev-parse", "-q", "--verify", rev + "^{commit}"], top)
+    sha = r.stdout.decode().strip() if r.returncode == 0 else ""
+    return sha if SHA_RE.fullmatch(sha) else None
+
+
+def default_branch(top):
+    """{"name", "ref", "branch"} of the default branch: what origin/HEAD points at, else main,
+    else master (local, then origin's); None if there is none."""
+    cands = []
+    r = git(["symbolic-ref", "-q", "refs/remotes/origin/HEAD"], top)
+    ref = r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else ""
+    if ref.startswith("refs/remotes/"):
+        cands.append(ref)
+    cands += ["refs/heads/main", "refs/heads/master", "refs/remotes/origin/main", "refs/remotes/origin/master"]
+    r = git(["for-each-ref", "--format=%(refname)"] + cands, top)
+    have = set(r.stdout.decode("utf-8", "replace").splitlines()) if r.returncode == 0 else set()
+    for ref in cands:
+        if ref in have:
+            if ref.startswith("refs/heads/"):
+                name = branch = ref[len("refs/heads/"):]
+            else:
+                name = ref[len("refs/remotes/"):]
+                branch = name.split("/", 1)[1]
+            return {"name": name, "ref": ref, "branch": branch}
+    return None
+
+
+def git_head(top):
+    """(branch name or None when detached, HEAD's SHA or None before the first commit)."""
+    r = git(["symbolic-ref", "-q", "HEAD"], top)
+    ref = r.stdout.decode("utf-8", "replace").strip() if r.returncode == 0 else ""
+    return (ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else None), git_commit(top, "HEAD")
+
+
+def need_repo():
+    repo = git_repo()
+    if repo["top"] is None:
+        raise ApiError(400, "not a git repository" + (f" ({repo['reason']})" if repo["reason"] else ""))
+    return repo
+
+
+def api_git_info(q):
+    """GET /api/git/info."""
+    repo = git_repo()
+    if repo["top"] is None:
+        return {"repo": False, "reason": repo["reason"]} if repo["reason"] else {"repo": False}
+    top = repo["top"]
+    branch, head = git_head(top)
+    dflt = default_branch(top)
+    return {"repo": True, "top": str(top), "root_rel": repo["root_rel"], "branch": branch, "head": head,
+            "default_branch": dflt["name"] if dflt else None,
+            "is_default": bool(dflt and branch is not None and branch == dflt["branch"])}
+
+
+def git_base(mode):
+    """(base, repo) for a base mode: "head" is HEAD; "branch" is HEAD's merge-base with the
+    default branch, falling back to HEAD with a `note` when that makes no sense."""
+    if mode not in ("head", "branch"):
+        raise ValueError("base must be head or branch")
+    repo = need_repo()
+    top = repo["top"]
+    branch, head = git_head(top)
+    note = None
+    if mode == "branch":
+        dflt = default_branch(top)
+        if dflt is None:
+            note = "There is no default branch (origin/HEAD, main or master), so this shows uncommitted changes."
+        elif head is None:
+            note = "There are no commits yet, so this shows uncommitted changes."
+        elif branch is not None and branch == dflt["branch"]:
+            note = f"{branch} is the default branch, so this shows uncommitted changes."
+        else:
+            r = git(["merge-base", "HEAD", dflt["ref"]], top)
+            sha = r.stdout.decode().strip() if r.returncode == 0 else ""
+            if SHA_RE.fullmatch(sha):
+                return {"mode": "branch", "ref": dflt["ref"], "sha": sha, "label": dflt["name"]}, repo
+            note = f"HEAD has no history in common with {dflt['name']}, so this shows uncommitted changes."
+    base = {"mode": "head", "ref": "HEAD", "sha": head, "label": "HEAD"}
+    if note:
+        base["note"] = note
+    return base, repo
+
+
+def parse_status_v2(out):
+    """[(status, path, old path or None)] from `git status --porcelain=v2 -z` (top-relative):
+    the work tree against HEAD, staged and unstaged changes together."""
+    toks, i, entries = out.split(b"\0"), 0, []
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        kind = t[:1]
+        if kind == b"1":
+            parts = t.split(b" ", 8)
+            xy, path = parts[1].decode(), os.fsdecode(parts[8])
+            if "A" in xy:
+                if "D" not in xy:  # added, then deleted again: nothing against HEAD
+                    entries.append(("A", path, None))
+            else:
+                entries.append(("D" if "D" in xy else "M", path, None))
+        elif kind == b"2":
+            parts = t.split(b" ", 9)
+            xy, path, old = parts[1].decode(), os.fsdecode(parts[9]), os.fsdecode(toks[i])
+            i += 1
+            if xy[1:] == "D":    # renamed, then deleted: the old file is gone
+                entries.append(("D", old, None))
+            elif "R" in xy:
+                entries.append(("R", path, old))
+            else:                # a copy
+                entries.append(("A", path, None))
+        elif kind == b"u":
+            entries.append(("C", os.fsdecode(t.split(b" ", 10)[10]), None))
+        elif kind == b"?":
+            entries.append(("U", os.fsdecode(t[2:]), None))
+    return entries
+
+
+def parse_name_status(out):
+    """[(status, path, old path or None)] from `git diff --name-status -z` (top-relative)."""
+    toks, i, entries = out.split(b"\0"), 0, []
+    while i < len(toks):
+        s = toks[i].decode("ascii", "replace")
+        i += 1
+        if not s:
+            continue
+        if s[0] in "RC":
+            old, new = os.fsdecode(toks[i]), os.fsdecode(toks[i + 1])
+            i += 2
+            entries.append(("R", new, old) if s[0] == "R" else ("A", new, None))
+        else:
+            entries.append(({"A": "A", "D": "D", "U": "C"}.get(s[0], "M"), os.fsdecode(toks[i]), None))
+            i += 1
+    return entries
+
+
+def api_git_status(q):
+    """GET /api/git/status: changed files under ROOT against the base, and how many are outside."""
+    if git_repo()["top"] is None:
+        return {"repo": False, "base": None, "files": [], "outside": 0}
+    base, repo = git_base(q.get("base") or "head")
+    top, rr = repo["top"], repo["root_rel"]
+    if base["mode"] == "head":
+        r = git(["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=all"], top)
+        if r.returncode != 0:
+            raise ApiError(500, r.stderr.decode("utf-8", "replace").strip()[-500:] or "git status failed")
+        entries = parse_status_v2(r.stdout)
+    else:
+        r = git(["diff", "--name-status", "-z", "-M", "--no-ext-diff", "--ignore-submodules=all", base["sha"], "--"],
+                top)
+        u = git(["ls-files", "-z", "--others", "--exclude-standard"], top)
+        if r.returncode != 0 or u.returncode != 0:
+            raise ApiError(500, (r.stderr + u.stderr).decode("utf-8", "replace").strip()[-500:] or "git diff failed")
+        entries = parse_name_status(r.stdout) + [("U", os.fsdecode(p), None) for p in u.stdout.split(b"\0") if p]
+
+    def inside(p):  # top-relative → ROOT-relative, or None when outside ROOT
+        if not rr:
+            return p
+        return p[len(rr) + 1:] if p.startswith(rr + "/") else None
+
+    files, outside, nested = {}, 0, 0
+
+    def add(path, status, old=None):
+        prev = files.get(path)
+        if prev is not None:  # deleted from the index but back in the work tree as untracked
+            if {prev["status"], status} == {"D", "U"}:
+                prev["status"] = "M"
+            return
+        files[path] = {"path": path, "status": status}
+        if old is not None:
+            files[path]["old_path"] = old
+
+    for status, p, old in entries:
+        if p.endswith("/"):  # an untracked folder: a repository of its own (or a worktree) inside this one
+            if inside(p.rstrip("/")) is not None:
+                nested += 1
+            continue
+        rp = inside(p)
+        if status == "R":
+            ro = inside(old)
+            if rp is not None and ro is not None:
+                add(rp, "R", ro)
+            else:  # moved across ROOT's edge: what is inside is new, or gone
+                outside += 1
+                if rp is not None:
+                    add(rp, "A")
+                elif ro is not None:
+                    add(ro, "D")
+        elif rp is None:
+            outside += 1
+        else:
+            add(rp, status)
+    listed = sorted(files.values(), key=lambda f: f["path"])
+    out = {"repo": True, "base": base, "files": listed[:STATUS_MAX], "outside": outside, "nested": nested}
+    if len(listed) > STATUS_MAX:
+        out["truncated"] = True
+    return out
+
+
+def top_rel(rel, repo):
+    """A ROOT-relative path (inside ROOT) as a path from the top of the work tree."""
+    safe_path(rel)
+    lr = lex_rel(rel)
+    if not lr:
+        raise ValueError("expected a file path")
+    return f"{repo['root_rel']}/{lr}" if repo["root_rel"] else lr
+
+
+def api_git_show(q):
+    """GET /api/git/show: a file's content in the base commit (old_path for a rename)."""
+    base, repo = git_base(q.get("base") or "head")
+    path = top_rel(q.get("old_path") or q["path"], repo)
+    if not base["sha"]:
+        return {"exists": False, "binary": False}
+    spec = f"{base['sha']}:{path}"
+    r = git(["cat-file", "-s", spec], repo["top"])  # the size first: no need to read a big one
+    if r.returncode != 0:
+        return {"exists": False, "binary": False}
+    if int(r.stdout.strip() or 0) > TEXT_MAX:
+        return {"exists": True, "binary": False, "too_large": True}
+    r = git(["cat-file", "blob", spec], repo["top"])
+    if r.returncode != 0:
+        return {"exists": False, "binary": False}
+    text = decode_text(r.stdout)
+    return {"exists": True, "binary": True} if text is None else {"exists": True, "binary": False, "text": text}
+
+
+def api_git_discard(req):
+    """POST /api/git/discard: make a file match HEAD again, in the index and the work tree (a
+    file not in HEAD is deleted). old_path too, for a rename."""
+    repo = need_repo()
+    top = repo["top"]
+    head = git_commit(top, "HEAD")
+    todo = []
+    for rel in [req["path"]] + ([req["old_path"]] if req.get("old_path") else []):  # check all first
+        p = safe_path(rel, follow=False)
+        if p == ROOT or (p.is_dir() and not p.is_symlink()):
+            raise ValueError("discard works on files, not folders")
+        no_git_dir(p)
+        todo.append((p, top_rel(rel, repo)))
+    for p, path in todo:
+        in_head = head is not None and git(["cat-file", "-e", f"{head}:{path}"], top).returncode == 0
+        if in_head:
+            if git_has_restore():
+                r = git(["restore", f"--source={head}", "--staged", "--worktree", "--", path], top, literal=True)
+            else:
+                r = git(["checkout", "-q", head, "--", path], top, literal=True)
+            if r.returncode != 0:
+                raise ApiError(500, r.stderr.decode("utf-8", "replace").strip()[-500:])
+            continue
+        if git(["ls-files", "-z", "--cached", "--", path], top, literal=True).stdout:  # staged, new
+            r = git(["rm", "-q", "--cached", "-f", "--", path], top, literal=True)
+            if r.returncode != 0:
+                raise ApiError(500, r.stderr.decode("utf-8", "replace").strip()[-500:])
+        if os.path.lexists(p):
+            p.unlink()
+    return {"ok": True}
+
+
+GET_API = {"/api/file": file_info, "/api/tree": api_tree, "/api/allfiles": api_allfiles,
+           "/api/search": api_search, "/api/git/info": api_git_info, "/api/git/status": api_git_status,
+           "/api/git/show": api_git_show}
+POST_API = {"/api/stat": api_stat, "/api/new": api_new, "/api/rename": api_rename, "/api/delete": api_delete,
+            "/api/git/discard": api_git_discard}
 
 
 # ---------------------------------------------------------------- processes
@@ -405,13 +1823,27 @@ def ask_info():
     return info
 
 
-def claude_args(model, persist=True, resume=None):
+def file_type(path):
+    """How the prompts name a file's type ("Python", "plain text"); None for markdown."""
+    return None if is_markdown(path) else language_of(path) or "plain text"
+
+
+def system_prompt(path=None):
+    """The system prompt for a file: the markdown one, or one for code and other text that names
+    the file type (from the name alone, so it is the same for every call about the file)."""
+    lang = file_type(path)
+    if lang is None:
+        return SYSTEM_PROMPT
+    return CODE_SYSTEM_PROMPT.format(lang=lang, valid="text" if lang == "plain text" else f"valid {lang}")
+
+
+def claude_args(model, persist=True, resume=None, path=None):
     args = ["-p", "--output-format", "json"]
     if not persist:
         args.append("--no-session-persistence")
     if resume:  # fork, so the parent session never changes
         args += ["--resume", resume, "--fork-session"]
-    args += ["--append-system-prompt", SYSTEM_PROMPT]
+    args += ["--append-system-prompt", system_prompt(path)]
     if model:
         args += ["--model", model]
     return args + ["--tools", "Skill,Read", "--allowedTools", "Skill,Read"]
@@ -595,7 +2027,9 @@ def run_claude(args, prompt):
 
 
 def doc_tag(path, doc):
-    return f'<document path="{path}">\n{doc}\n</document>'
+    lang = file_type(path)
+    kind = f' type="{lang}"' if lang else ""
+    return f'<document path="{path}"{kind}>\n{doc}\n</document>'
 
 
 def doc_diff(old, new, path):
@@ -638,8 +2072,12 @@ def build_request(req, update=""):
         parts.append(f"<previous_attempt>\n{req['previous']}\n</previous_attempt>\n"
                      "The user was not satisfied with the previous attempt; the instruction "
                      "above is their feedback on it.")
-    parts.append("Reply with the replacement text only." if mode == "replace"
-                 else "Reply with your comments only.")
+    if mode != "replace":
+        parts.append("Reply with your comments only.")
+    elif is_markdown(req.get("path")):
+        parts.append("Reply with the replacement text only.")
+    else:
+        parts.append("Reply with the replacement text only, with no code fence around it.")
     return f'<request path="{req.get("path") or ""}">\n' + "\n\n".join(parts) + "\n</request>"
 
 
@@ -675,9 +2113,10 @@ def _base_session_locked(key, doc):
                     ASK_BASES.move_to_end(key)
             return base["session"], diff
     t0 = time.time()
-    msg = (doc_tag(path, doc) + "\n\nThis is the document the user is editing. Each later message "
+    what = "document" if is_markdown(path) else "file"
+    msg = (doc_tag(path, doc) + f"\n\nThis is the {what} the user is editing. Each later message "
            "is one independent request about it. Reply with just OK.")
-    data = run_claude(claude_args(model), msg)
+    data = run_claude(claude_args(model, path=path), msg)
     sid = data.get("session_id")
     if not sid:
         raise RuntimeError("claude gave no session id")
@@ -715,7 +2154,7 @@ def ask_forked(req, key):
     if parent is None:
         parent, diff = base_session(key, doc)
     try:
-        data = run_claude(claude_args(key[3], resume=parent), build_request(req, diff))
+        data = run_claude(claude_args(key[3], resume=parent, path=path), build_request(req, diff))
     except RuntimeError as exc:
         # forget the parent only when claude no longer has it: a failure of the launcher, a
         # request too large to pass, or a passing API error leaves it good for the next card
@@ -742,12 +2181,18 @@ def remember_card(sid, key, doc):
             chars -= len(ASK_CARDS.popitem(last=False)[1]["doc"])
 
 
-def unfence(text: str, original: str) -> str:
+def unfence(text: str, original: str, code=False) -> str:
+    """The reply without a code fence around it (unless the selection had one). For code
+    (code=True) the first line keeps its indentation, and a selection's final newline stays."""
     t = text.strip()
     if t.startswith("```") and t.endswith("```") and not original.lstrip().startswith("```"):
         lines = t.splitlines()
         if len(lines) >= 2:
             t = "\n".join(lines[1:-1])
+    elif code:
+        t = re.sub(r"\A(?:[ \t]*\n)+", "", text.replace("\r\n", "\n")).rstrip()
+    if code and original.endswith("\n") and t and not t.endswith("\n"):
+        t += "\n"
     return t
 
 
@@ -761,14 +2206,14 @@ def ask_claude(req):
         why = " ".join(str(exc).split())[:300]
         print(f"[ask] fork failed, stateless: {why}", flush=True)
         msg = doc_tag(key[2], doc) + "\n\n" + build_request(req)
-        data, forked = run_claude(claude_args(key[3], persist=False), msg), False
+        data, forked = run_claude(claude_args(key[3], persist=False, path=key[2]), msg), False
     u = data.get("usage") or {}
     print(f"[ask] {'forked' if forked else 'stateless'} reply in {time.time() - t0:.1f}s; input tokens: "
           f"{u.get('input_tokens')} new, {u.get('cache_read_input_tokens')} cached, "
           f"{u.get('cache_creation_input_tokens')} written to the cache", flush=True)
     original = doc[int(req.get("start", 0)):int(req.get("end", 0))]
     return {
-        "result": unfence(data.get("result", ""), original),
+        "result": unfence(data.get("result", ""), original, code=not is_markdown(key[2])),
         "seconds": round(time.time() - t0, 1),
         "cost": data.get("total_cost_usd"),
         "session": data.get("session_id") if forked else None,  # Retry / Refine send it back
@@ -788,29 +2233,60 @@ def prepare_ask(req):
 
 # ---------------------------------------------------------------- pdf
 
+RAW_SRC_RE = re.compile(r'src="/raw/([^"]*)"')
+
+
+def pdf_image_src(m):
+    """Rewrite one <img src="/raw/PATH"> for the print page: Chrome reads the image straight from
+    disk (a file:// URL), but only when PATH stays inside ROOT (safe_path resolves it, so neither
+    ../ in the string nor a symlink can reach a file outside the folder); otherwise the src is
+    dropped. The agent fully controls the HTML posted to /api/pdf, so this is checked here, not
+    with a blind string replace."""
+    path = unquote(m.group(1).split("?", 1)[0], errors="surrogateescape")
+    try:
+        p = safe_path(path)
+    except (ValueError, OSError):
+        return 'src=""'
+    return f'src="{p.as_uri()}"'
+
+
 def export_pdf(req):
-    """Print the editor's rendered HTML to <name>.pdf beside the markdown file."""
+    """Print the editor's rendered HTML to <name>.pdf beside the markdown file. The print HTML is
+    agent-influenced (whatever is posted as req["html"]), so it is rendered OUTSIDE ROOT, a meta
+    Content-Security-Policy in the page blocks scripts, frames and plugins (only images and the
+    stylesheets load), image sources are resolved through safe_path, and the .pdf is written with
+    O_NOFOLLOW so a symlink the agent planted at <name>.pdf cannot redirect the write out of ROOT."""
     if not CHROME_BIN:
         raise RuntimeError("PDF export needs Google Chrome or Chromium (or set MDEDIT_CHROME)")
     md = safe_path(req["path"])
+    html = req["html"]
+    if not isinstance(html, str):
+        raise ValueError("html must be a string")
     pdf = md.with_suffix(".pdf")
-    # images point at the /raw/ route; Chrome reads them straight from disk instead
-    body = req["html"].replace('src="/raw/', f'src="{ROOT.as_uri()}/')
+    if os.path.islink(pdf) or (pdf.exists() and not pdf.is_file()):
+        raise RuntimeError("refusing to write the PDF: a symlink or non-file is in its place")
+    body = RAW_SRC_RE.sub(pdf_image_src, html)
     page = PDF_TEMPLATE.format(title=md.stem.replace("<", "&lt;"), body=body)
-    # the page sits beside the .md so relative image links resolve
-    tmp_html = md.with_name(f".{md.stem}.print.html")
-    tmp_html.write_text(page, encoding="utf-8")
-    profile = tempfile.mkdtemp(prefix="mdedit-chrome-")
+    profile = tempfile.mkdtemp(prefix="mdedit-chrome-")  # outside ROOT: the agent cannot touch it
+    tmp_html = Path(profile) / "print.html"
+    out_pdf = Path(profile) / "out.pdf"
     try:
+        tmp_html.write_text(page, encoding="utf-8")
         proc = subprocess.run(
             [CHROME_BIN, "--headless=new", "--disable-gpu", "--no-first-run", "--no-pdf-header-footer",
              f"--user-data-dir={profile}", "--virtual-time-budget=15000", "--run-all-compositor-stages-before-draw",
-             f"--print-to-pdf={pdf}", tmp_html.as_uri()],
+             f"--print-to-pdf={out_pdf}", tmp_html.as_uri()],
             capture_output=True, text=True, timeout=120)
-        if proc.returncode != 0 or not pdf.exists():
+        if proc.returncode != 0 or not out_pdf.exists():
             raise RuntimeError(f"Chrome failed to print: {(proc.stderr or proc.stdout).strip()[-800:]}")
+        data = out_pdf.read_bytes()
+        try:
+            fd = os.open(pdf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+        except OSError as exc:
+            raise RuntimeError(f"refusing to write the PDF: {exc.strerror or exc}")
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
     finally:
-        tmp_html.unlink(missing_ok=True)
         shutil.rmtree(profile, ignore_errors=True)
     return {"pdf": pdf.relative_to(ROOT).as_posix(), "bytes": pdf.stat().st_size}
 
@@ -1235,7 +2711,25 @@ class WSProtocolError(Exception):
 # PUT and WebSocket request, so other websites are refused. Any port is fine, so port
 # forwarding (8765 → 8766, say) still works.
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+REQUEST = threading.local()  # .conn: the socket of the API request this thread is answering
+QUIET_POLLS = ("/api/stat", "/api/git/status", "/api/git/info")  # not logged when they succeed
 HOST_RE = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[^\[\]:/@\s]+)(?::[0-9]{1,5})?")
+# Content types that run script or embed documents when a browser opens them as a page (as
+# opposed to an <img> subresource): /raw/ serves these as a download, so a link or placeholder
+# in the preview cannot run them in the editor's origin even if the sandbox CSP were bypassed.
+RAW_ACTIVE = {"text/html", "application/xhtml+xml", "image/svg+xml", "text/xml", "application/xml",
+              "text/javascript", "application/javascript", "application/ecmascript", "text/ecmascript",
+              "application/pdf"}
+# The editor page's own Content-Security-Policy: its code and the pinned CDN libraries, nothing
+# else. Kept permissive enough (inline + eval, the two CDNs, ws: for the terminal) not to break
+# the no-build front end, while still refusing script, frames or plugins from anywhere else.
+APP_CSP = ("default-src 'self'; "
+           "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net blob:; "
+           "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; "
+           "img-src 'self' data: blob: http: https:; "
+           "font-src 'self' data: https://cdnjs.cloudflare.com https://cdn.jsdelivr.net; "
+           "connect-src 'self' https://cdnjs.cloudflare.com https://cdn.jsdelivr.net ws: wss:; "
+           "worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'")
 
 
 class Handler(SimpleHTTPRequestHandler):
@@ -1251,6 +2745,12 @@ class Handler(SimpleHTTPRequestHandler):
         m = HOST_RE.fullmatch(host)
         if not m or m.group(1).lower() not in LOCAL_HOSTS:
             return f"Host {host[:100]!r} is not this machine"
+        # Browsers say who made a request: another site's page (an <img> or <iframe> pointed at
+        # a search that runs for a minute, say) gets nothing from the API or the folder's files.
+        # Our own page's requests are same-origin, and a typed address is "none".
+        site = self.headers.get("Sec-Fetch-Site")
+        if site in ("cross-site", "same-site") and urlparse(self.path).path.startswith(("/api/", "/raw/")):
+            return f"a {site} request"
         origins = self.headers.get_all("Origin") or []
         if len(origins) > 1:
             return "more than one Origin header"
@@ -1274,11 +2774,20 @@ class Handler(SimpleHTTPRequestHandler):
         return True
 
     def log_message(self, fmt, *args):
-        if "/api/events" not in str(args[0] if args else ""):
-            super().log_message(fmt, *args)
+        line = str(args[0] if args else "")
+        if "/api/events" in line:
+            return
+        if any(p in line for p in QUIET_POLLS) and len(args) > 1 and str(args[1]) == "200":
+            return  # the page polls these every few seconds
+        super().log_message(fmt, *args)
 
     def end_headers(self):
         self.send_header("Cache-Control", "no-store")
+        # the editor page (and any HTML the static handler serves) gets the site-wide CSP, unless
+        # the response already set its own (the /raw/ sandbox policy), so the two never collide
+        buf = b"".join(getattr(self, "_headers_buffer", None) or []).lower()
+        if b"text/html" in buf and b"content-security-policy" not in buf:
+            self.send_header("Content-Security-Policy", APP_CSP)
         super().end_headers()
 
     def send_json(self, obj, status=200):
@@ -1290,20 +2799,80 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def send_raw(self, rel):
-        """Serve a file from the document root (images referenced by the markdown)."""
+        """Serve a file from the document root (images referenced by the markdown). The agent
+        controls these files, so the response is locked down: a file opened on its own (an SVG or
+        HTML file in the folder, say) must not run scripts in the editor's origin, which can use
+        the API. The file is streamed, so opening a huge artefact does not read it all into memory."""
         p = safe_path(rel)
-        if not p.is_file():
+        try:
+            st = os.stat(p)
+        except OSError:
             return self.send_json({"error": "not found"}, 404)
-        data = p.read_bytes()
+        if not stat.S_ISREG(st.st_mode):
+            return self.send_json({"error": "not found"}, 404)
+        ctype = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
         self.send_response(200)
-        self.send_header("Content-Type", mimetypes.guess_type(p.name)[0] or "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(st.st_size))
+        # the sandbox keeps an opened SVG/HTML file from scripting in our origin; nosniff stops a
+        # mislabelled file being run as script; <img> ignores both headers
+        self.send_header("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; "
+                                                    "style-src 'unsafe-inline'")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        # a type that runs script or embeds a document, opened as a page (not fetched as an image),
+        # is downloaded rather than rendered; the name is kept out of the header (the agent chooses
+        # it, and it may hold CR/LF) to avoid a header injection
+        if (ctype in RAW_ACTIVE or ctype.endswith("+xml")) and self.headers.get("Sec-Fetch-Dest") != "image":
+            self.send_header("Content-Disposition", "attachment")
         self.end_headers()
-        self.wfile.write(data)
+        self.stream_file(p, st.st_size)
+
+    def stream_file(self, p, size):
+        """Send `size` bytes of `p` in 64 KiB pieces, so a huge file is never read whole."""
+        remaining = size
+        try:
+            with open(p, "rb") as f:
+                while remaining > 0:
+                    chunk = f.read(min(1 << 16, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
 
     def read_json(self):
         n = int(self.headers.get("Content-Length") or 0)
         return json.loads(self.rfile.read(n) or b"{}")
+
+    def answer(self, fn, arg):
+        """Reply with fn(arg) as JSON, or {"error": message}: ApiError has its own status, bad
+        input is 400 and a failing file operation 500."""
+        REQUEST.conn = self.connection  # a long search stops when its client goes away
+        try:
+            if not isinstance(arg, dict):
+                raise ValueError("expected a JSON object")
+            res, status = fn(arg), 200
+        except ApiError as exc:
+            res, status = {"error": str(exc)}, exc.status
+        except KeyError as exc:
+            res, status = {"error": f"missing {exc.args[0] if exc.args else 'parameter'}"}, 400
+        except (ValueError, TypeError) as exc:
+            res, status = {"error": str(exc)}, 400
+        except subprocess.TimeoutExpired:
+            res, status = {"error": "git took too long"}, 504
+        except OSError as exc:
+            msg = f"{exc.strerror}: {exc.filename}" if exc.strerror and exc.filename else str(exc)
+            res, status = {"error": msg}, 404 if isinstance(exc, FileNotFoundError) else 500
+        except Exception as exc:  # a bug: still answer, rather than drop the connection
+            traceback.print_exc()
+            res, status = {"error": f"internal error: {type(exc).__name__}: {exc}"}, 500
+        finally:
+            REQUEST.conn = None
+        try:
+            return self.send_json(res, status)
+        except (BrokenPipeError, ConnectionResetError):  # e.g. a search the page gave up on
+            pass
 
     def do_HEAD(self):
         if not self.guard():
@@ -1313,7 +2882,8 @@ class Handler(SimpleHTTPRequestHandler):
         u = urlparse(self.path)
         if self.guard(need_origin=u.path == "/api/term"):
             return
-        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        # surrogateescape: a file name that is not UTF-8 comes back as the bytes it is on disk
+        q = {k: v[0] for k, v in parse_qs(u.query, errors="surrogateescape").items()}
         try:
             if u.path == "/api/config":
                 return self.send_json({"root": str(ROOT), "initial": INITIAL, "skills": list_skills(),
@@ -1324,28 +2894,27 @@ class Handler(SimpleHTTPRequestHandler):
                 p = safe_path(q["path"])
                 if not p.is_file() or p.suffix.lower() != ".pdf":
                     return self.send_json({"error": "not found"}, 404)
-                data = p.read_bytes()
+                size = p.stat().st_size
                 self.send_response(200)
                 self.send_header("Content-Type", "application/pdf")
-                self.send_header("Content-Disposition", f'attachment; filename="{p.name}"')
-                self.send_header("Content-Length", str(len(data)))
+                # the agent chooses the name and it may hold CR/LF or quotes: percent-encoded
+                # (RFC 5987) it cannot break out of the header
+                name = quote(p.name.encode("utf-8", "surrogateescape"), safe="")
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{name}")
+                self.send_header("Content-Length", str(size))
                 self.end_headers()
-                self.wfile.write(data)
+                self.stream_file(p, size)
                 return
             if u.path == "/api/browse":
                 return self.send_json(browse(q.get("dir", "")))
             if u.path == "/api/files":
                 return self.send_json(list_files())
-            if u.path == "/api/file":
-                p = safe_path(q["path"])
-                if not p.is_file():
-                    return self.send_json({"error": "not found"}, 404)
-                return self.send_json({"path": q["path"], "text": p.read_text(encoding="utf-8"),
-                                       "version": version_of(p)})
+            if u.path in GET_API:  # /api/file, tree, allfiles, search, git/*
+                return self.answer(GET_API[u.path], q)
             if u.path == "/api/events":
                 return self.events()
             if u.path.startswith("/raw/"):
-                return self.send_raw(unquote(u.path[len("/raw/"):]))
+                return self.send_raw(unquote(u.path[len("/raw/"):], errors="surrogateescape"))
         except (ValueError, KeyError) as exc:
             return self.send_json({"error": str(exc)}, 400)
         return super().do_GET()
@@ -1359,16 +2928,28 @@ class Handler(SimpleHTTPRequestHandler):
             req = self.read_json()
             p = safe_path(req["path"])
             base = req.get("base_version")
-            if not req.get("force") and base is not None and version_of(p) != base:
-                return self.send_json({"error": "conflict", "version": version_of(p),
-                                       "text": p.read_text(encoding="utf-8") if p.exists() else ""}, 409)
+            version = version_of(p)
+            if not req.get("force") and base is not None and version != base:
+                # the disk's text as GET /api/file gives it; null when it is not text any more
+                # (binary, not UTF-8, over 5 MB), which the page can only overwrite
+                return self.send_json({"error": "conflict", "version": version, "text": disk_text(p)}, 409)
+            text, mode = req["text"], None
+            if p.is_file():  # keep an existing file's permissions (a script stays executable) and CRLFs
+                mode = p.stat().st_mode & 0o7777
+                if "\r" not in text and uses_crlf(p):
+                    text = text.replace("\n", "\r\n")
             p.parent.mkdir(parents=True, exist_ok=True)
             tmp = p.with_name("." + p.name + ".tmp")
-            tmp.write_text(req["text"], encoding="utf-8")
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(text)
+            if mode is not None:
+                os.chmod(tmp, mode)
             os.replace(tmp, p)
             return self.send_json({"version": version_of(p)})
         except (ValueError, KeyError) as exc:
             return self.send_json({"error": str(exc)}, 400)
+        except OSError as exc:  # e.g. a read-only file
+            return self.send_json({"error": f"could not save: {exc.strerror or exc}"}, 500)
 
     def do_POST(self):
         if self.guard(need_origin=True):
@@ -1382,16 +2963,8 @@ class Handler(SimpleHTTPRequestHandler):
                 initial = set_root(req["path"])
                 print(f"[root] {ROOT}", flush=True)
                 return self.send_json({"root": str(ROOT), "initial": initial, "files": list_files()})
-            if u.path == "/api/new":
-                rel = req["path"].strip()
-                if not rel.lower().endswith(MD_EXT):
-                    rel += ".md"
-                p = safe_path(rel)
-                if p.exists():
-                    return self.send_json({"error": "file already exists"}, 409)
-                p.parent.mkdir(parents=True, exist_ok=True)
-                p.write_text(req.get("text", f"# {p.stem}\n\n"), encoding="utf-8")
-                return self.send_json({"path": rel, "version": version_of(p)})
+            if u.path in POST_API:  # /api/stat, new, rename, delete, git/discard
+                return self.answer(POST_API[u.path], req)
             if u.path in ("/api/ask", "/api/ask/prepare"):
                 info = ask_info()
                 if not info["available"]:
@@ -1639,6 +3212,7 @@ def main():
             signal.signal(sig, _interrupt)
     atexit.register(TERM.kill)
     atexit.register(end_asks)
+    atexit.register(end_searches)
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -1648,6 +3222,7 @@ def main():
     finally:
         TERM.kill()
         end_asks()
+        end_searches()
         server.server_close()
 
 

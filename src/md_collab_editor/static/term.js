@@ -206,12 +206,21 @@ const Term = (() => {
 
   function clearPending() { pending = []; pendingLen = 0; }
 
+  // Input for the session (typed keys, or Send to Claude terminal's text): sent now if it can
+  // take it, else queued behind any earlier input. False if it goes nowhere: the connection to
+  // the session on screen dropped, or the queue is full.
+  function input(s) {
+    if (lost) return false;
+    if (ready()) { flush(); sendBytes(enc.encode(s)); return true; }
+    if (pendingLen + s.length > PENDING_MAX) return false;
+    pending.push(s); pendingLen += s.length;
+    return true;
+  }
+
   function onInput(s) {
     if (ended()) { if (s === '\r') restart(); return; }
-    if (lost) return;
-    if (ready()) { flush(); sendBytes(enc.encode(s)); return; }
-    if (replaying && REPLY.test(s)) return;
-    if (pendingLen + s.length <= PENDING_MAX) { pending.push(s); pendingLen += s.length; }
+    if (replaying && REPLY.test(s)) return;   // never when ready()
+    input(s);
   }
 
   // Ctrl+Shift+C copies; Ctrl+Shift+V (and Ctrl+V off the Mac) is left to the browser,
@@ -307,6 +316,18 @@ const Term = (() => {
     },
     fit: syncSize,
     focus() { if (term && shown()) term.focus(); },
+    // for Send to Claude terminal (ui.js): has this connection's status reported a running
+    // session (so its folder is known), its folder, and typing into it (bracketed: as one
+    // paste, so Claude Code takes it literally). The text goes through the same queue as
+    // typed keys, so text sent while the replay is drawn, or while reconnecting, is not lost.
+    available: () => !!(conf && conf.available && !broken),
+    running: () => open() && !fresh && status.state === 'running',
+    state: () => status.state,   // none | running | exited | failed
+    cwd: () => status.cwd || null,
+    sendText(text, { bracketed = false } = {}) {
+      if (!term || ended()) return false;
+      return input(bracketed ? `\x1b[200~${text}\x1b[201~` : text);
+    },
   };
 })();
 window.Term = Term;
