@@ -46,7 +46,7 @@ import uuid
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 try:  # PTYs need a POSIX system (Linux, macOS)
     import fcntl
@@ -2825,7 +2825,11 @@ class Handler(SimpleHTTPRequestHandler):
         if (ctype in RAW_ACTIVE or ctype.endswith("+xml")) and self.headers.get("Sec-Fetch-Dest") != "image":
             self.send_header("Content-Disposition", "attachment")
         self.end_headers()
-        remaining = st.st_size
+        self.stream_file(p, st.st_size)
+
+    def stream_file(self, p, size):
+        """Send `size` bytes of `p` in 64 KiB pieces, so a huge file is never read whole."""
+        remaining = size
         try:
             with open(p, "rb") as f:
                 while remaining > 0:
@@ -2890,13 +2894,16 @@ class Handler(SimpleHTTPRequestHandler):
                 p = safe_path(q["path"])
                 if not p.is_file() or p.suffix.lower() != ".pdf":
                     return self.send_json({"error": "not found"}, 404)
-                data = p.read_bytes()
+                size = p.stat().st_size
                 self.send_response(200)
                 self.send_header("Content-Type", "application/pdf")
-                self.send_header("Content-Disposition", f'attachment; filename="{p.name}"')
-                self.send_header("Content-Length", str(len(data)))
+                # the agent chooses the name and it may hold CR/LF or quotes: percent-encoded
+                # (RFC 5987) it cannot break out of the header
+                name = quote(p.name.encode("utf-8", "surrogateescape"), safe="")
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{name}")
+                self.send_header("Content-Length", str(size))
                 self.end_headers()
-                self.wfile.write(data)
+                self.stream_file(p, size)
                 return
             if u.path == "/api/browse":
                 return self.send_json(browse(q.get("dir", "")))

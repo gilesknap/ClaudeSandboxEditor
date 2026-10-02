@@ -87,3 +87,16 @@ def test_app_page_has_a_site_wide_csp_but_json_and_raw_do_not_get_it(srv, ws):
     _, pic, _ = raw(srv, "/raw/pic.png", dest="image")
     assert "sandbox" in pic["content-security-policy"] and "default-src 'self'" not in pic["content-security-policy"], \
         "a raw file keeps its own locked-down policy, not the app page's"
+
+
+def test_download_keeps_an_agent_chosen_name_out_of_the_headers(srv, ws):
+    """A PDF name holding CR/LF or quotes cannot inject a header; the file is streamed whole."""
+    from urllib.parse import quote
+    name = 'rpt"\r\nX-Injected: 1\r\n.pdf'
+    data = b"%PDF-1.4\n" + bytes(range(256)) * 400
+    (ws / name).write_bytes(data)
+    status, h, body = raw(srv, "/api/download?path=" + quote(name, safe=""))
+    assert status == 200 and h["content-type"] == "application/pdf"
+    assert "x-injected" not in h
+    assert h["content-disposition"] == "attachment; filename*=UTF-8''" + quote(name, safe="")
+    assert body == data
