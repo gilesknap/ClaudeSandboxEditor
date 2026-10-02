@@ -26,6 +26,18 @@ md-editor = "md_collab_editor.server:main"
 Repository = "https://github.com/garethnisbet/MDCollaborativeEditor"
 Issues = "https://github.com/garethnisbet/MDCollaborativeEditor/issues"
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    # its Chromium build matches the Node Playwright 1.63 in claude-sandbox; it needs Python 3.10+,
+    # so on 3.9 the browser tests are skipped
+    "playwright==1.63.0; python_version >= '3.10'",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["e2e: drives the editor in headless Chromium (Playwright); skipped when no browser is installed"]
+
 [tool.hatch.version]
 path = "src/md_collab_editor/__init__.py"
 

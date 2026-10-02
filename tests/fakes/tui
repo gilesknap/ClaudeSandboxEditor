@@ -1,0 +1,43 @@
+#!/usr/bin/env python3
+"""Stand-in for a full-screen agent in the terminal tests. Like Claude Code it sets its terminal
+modes once, at the start (the alternate screen, mouse reporting, bracketed paste, ...), here
+in pieces written apart, so the server reads them split. Then it writes more than the
+server's 512 KiB of scrollback, so the sequences that set them are trimmed off, and prints
+READY. From then on it reports, each on a line of its own, every SIGWINCH as
+"WINCH <cols>x<rows>" and every read of its (raw) input as "GOT <bytes>", ESC shown as ^[.
+"""
+import fcntl
+import os
+import signal
+import struct
+import termios
+import time
+import tty
+
+START = [b"\x1b[?1049h\x1b[?1h\x1b[?7l\x1b[?25l", b"\x1b[?66h\x1b[?1000;1006", b"h\x1b[?1003h",
+         b"\x1b[?20", b"04h\x1b[?1004h\x1b[?66l\x1b", b"[2J\x1b[H"]
+
+
+def say(text):
+    os.write(1, text.encode("latin-1") + b"\r\n")
+
+
+def winch(signum, frame):
+    rows, cols = struct.unpack("HHHH", fcntl.ioctl(1, termios.TIOCGWINSZ, b"\0" * 8))[:2]
+    say(f"WINCH {cols}x{rows}")
+
+
+tty.setraw(0)
+for piece in START:
+    os.write(1, piece)
+    time.sleep(0.05)   # so the server reads the pieces apart
+line = b"x" * 98 + b"\r\n"
+for _ in range(6000):   # 600 kB
+    os.write(1, line)
+signal.signal(signal.SIGWINCH, winch)
+say("READY")
+while True:
+    data = os.read(0, 4096)
+    if not data:
+        break
+    say("GOT " + data.decode("latin-1").replace("\x1b", "^["))

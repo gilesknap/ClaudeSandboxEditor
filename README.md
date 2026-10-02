@@ -27,17 +27,21 @@ md-editor                       # edit the .md files in the current folder
 md-editor ~/notes               # edit any folder
 md-editor ~/proj/README.md      # edit one file (its folder becomes the root)
 md-editor --port 9000 --no-browser
+md-editor --agent claude        # side-panel terminal runs Claude Code without the sandbox
+md-editor --ask-agent claude    # Ask Claude runs claude -p without the sandbox
 ```
 
-It needs only Python 3.9+ (standard library, no dependencies) and the `claude` CLI on your PATH; uv can't install `claude`, because it isn't a Python package. Without it, everything except *Ask Claude* still works. The page loads its libraries from a CDN, so the browser needs internet access.
+The editor itself needs only Python 3.9+ (standard library, no dependencies). By default *Ask Claude* and the side-panel terminal both run Claude Code inside [claude-sandbox](https://pypi.org/project/claude-sandbox/), which needs [uv](https://docs.astral.sh/uv/), rootless podman (or docker) and `/dev/net/tun` on the host, and Linux or macOS. With `--ask-agent claude` or `--agent claude` they use the `claude` CLI on your PATH instead; uv can't install `claude`, because it isn't a Python package. Without any of these, everything except Claude still works. The page loads its libraries from a CDN, so the browser needs internet access.
 
-To work on the editor itself, clone the repo and run `uv run md-editor docs`, which uses the code in the checkout.
+The server listens on 127.0.0.1 only and checks the `Host` and `Origin` of every request, so other websites can't use it, even by DNS rebinding; forwarding the port to another local port (8765 to 8766, say) still works.
+
+To work on the editor itself, clone the repo and run `uv run md-editor docs`, which uses the code in the checkout. Run the tests with `uv run pytest`; the browser tests also need `uv run playwright install chromium` (and Python 3.10 or later), and are skipped without it. The tests use stand-ins for claude-sandbox and Claude Code, so they need neither, and GitHub Actions runs them on Python 3.9 and 3.13 for every push and pull request. The terminal tests, the browser tests and the tests that go through the claude-sandbox stand-in need Linux (they use util-linux 2.35+ `script`, GNU tools and `/proc`), so on other systems they are skipped.
 
 ## Working with Claude
 
 1. **Highlight** text in the editor or in the rendered preview. In the preview a pop-up opens straight away; in the editor click the small *✦ Ask Claude* pill or press <kbd>Ctrl</kbd>+<kbd>J</kbd>.
 2. **Choose** a preset (*My style*, *Improve*, *Tighten*, *Expand*, *Simplify*, *Fix grammar*, *More formal/casual*, *To bullets/prose*, *Critique*) or type your own instruction. An instruction ending in `?` is treated as a question: Claude replies with a comment and leaves the text alone.
-3. A **card** appears in the Claude panel, and the passage is highlighted in purple while Claude works and in amber when the suggestion is ready. Each card offers:
+3. A **card** appears on the *Suggestions* tab of the Claude panel, and the passage is highlighted in purple while Claude works and in amber when the suggestion is ready. Each card offers:
    - **Changes / Preview / Edit**: a word-level diff, the rendered result, or a text box for tweaking it by hand;
    - **Accept**: replace the passage (Ctrl+Z undoes it);
    - **Keep original**: discard the suggestion;
@@ -47,7 +51,28 @@ To work on the editor itself, clone the repo and run `uv run md-editor docs`, wh
 
 You can run several requests at once, and you can keep editing while Claude works, because each card tracks its passage as the text moves. *My style* uses the `nisbet-writing-style` skill; any skill in `~/.claude/skills` appears as a preset. The model menu in the top bar picks Opus, Sonnet or Haiku.
 
-Requests run through `claude -p` (headless Claude Code), so they use your existing Claude login and no API key is needed.
+### Where requests run
+
+Each request runs `claude -p` (headless Claude Code), with its tools limited to reading files and using skills, so it uses your Claude login and needs no API key.
+
+- By default it runs inside claude-sandbox, as `uvx claude-sandbox@latest shell -c …` in the open folder (the requirements are the [terminal's](#claude-code-in-the-side-panel)). The request reaches the container through a short-lived file, `.md-editor-ask-….txt`, in the open folder, so the folder must be writable. Documents larger than about 100 kB can't be passed into the sandbox, so *Ask Claude* reports an error for them. claude-sandbox stops the folder's container when its last session ends, so unless the Terminal tab has a session running in the same folder, every request waits for the container to start again; a terminal session started just as a request finishes can find the container stopping, and **Restart** fixes that.
+- `--ask-agent` (or the `MDEDIT_ASK_AGENT` environment variable) picks how requests run: `md-editor --ask-agent claude` runs `claude -p` natively, without the sandbox, and `--ask-agent none` turns *Ask Claude* off (the button is greyed out and says why).
+- The document is sent to Claude once per version. When the *✦ Ask Claude* pill or the ask bar appears, a Claude session that holds the document starts in the background, and each card continues a copy of it, sending only the selection and the instruction (and, after small edits, a diff), so later cards are quicker and cheaper. *Retry* and *Refine* continue the card's own conversation. These sessions belong to the folder `~/.cache/md-editor/ask` (in the container, or in your own home folder when run natively), so they stay out of your project's `/resume` list.
+
+## Claude Code in the side panel
+
+The ✦ panel has two tabs: **Suggestions** holds the *Ask Claude* cards, and **Terminal** runs a full interactive Claude Code session in the folder you have open. Ask it to work on your documents and its edits appear in the editor as it saves them. Drag the panel's left edge to widen it.
+
+By default the terminal runs `uvx claude-sandbox@latest`, which runs Claude Code inside a [claude-sandbox](https://pypi.org/project/claude-sandbox/) container for the open folder. That needs [uv](https://docs.astral.sh/uv/), rootless podman (or docker) and `/dev/net/tun` on the host; the first start pulls the container image, so it takes a while.
+
+- The session starts the first time the Terminal tab is shown. It survives page reloads and ends when md-editor quits. After a reload or reconnect the last 512 KiB of output is replayed, the terminal modes Claude Code set (its full screen, mouse reporting, bracketed paste) are restored, and Claude Code redraws its screen.
+- There is one session, shared by every browser tab, so it is best open in one tab at a time: it has one size, set by the tab that resized it last, and other tabs draw it wrongly until they resize it.
+- **Restart** ends the session and starts a new one in the open folder. When a session ends by itself, press <kbd>Enter</kbd> to start another.
+- If you open a different folder, the session stays where it was and a notice offers to restart it in the new folder.
+- <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>C</kbd> copies the terminal selection, and <kbd>Ctrl</kbd>+<kbd>V</kbd> pastes. While the terminal has focus the editor's own shortcuts are off, so keys such as <kbd>Ctrl</kbd>+<kbd>O</kbd> and <kbd>Esc</kbd> go to Claude Code.
+- `--agent` (or the `MDEDIT_AGENT` environment variable) picks the command: `md-editor --agent claude` runs Claude Code natively, without the sandbox, and `--agent none` turns the terminal off.
+
+The terminal needs Linux or macOS, because it runs on a pseudo-terminal. Only the editor's own page can connect to it, because the server checks the `Host` and `Origin` of every request.
 
 ## Working with Claude Code in a terminal
 
@@ -73,7 +98,8 @@ Click **⬇ PDF** in the top bar. The document is rendered in GitHub's light sty
 
 All code lives in `src/md_collab_editor/`:
 
-- `server.py`: HTTP server (file API, folder browsing and root switching, change events, `/api/ask` → `claude -p`, `/api/pdf` → headless Chrome)
+- `server.py`: HTTP server (file API, folder browsing and root switching, change events, `/api/ask` → `claude -p` (in claude-sandbox by default), `/api/pdf` → headless Chrome, `/api/term` → WebSocket onto the side-panel terminal's PTY)
 - `static/index.html`, `static/app.css`: layout and GitHub-style theme
 - `static/render.js`: markdown → HTML, with source offsets on every block so preview selections map back to the source
 - `static/app.js`: editor, sync, selection mapping, ask bar, suggestion cards and word diff
+- `static/term.js`: the side-panel terminal (xterm.js)
