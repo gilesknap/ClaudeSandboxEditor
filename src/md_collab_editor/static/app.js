@@ -9,14 +9,20 @@ const store = {
 
 // ------------------------------------------------------------------ state
 
-const cur = { path: null, version: null, dirty: false, saving: false };
+// The file in the editor below (the active tab, when it is a file tab). tabs.js owns the open
+// files: one model (and CodeMirror Doc) per file, swapped in when its tab is activated.
+const cur = {
+  get model() { const t = Tabs.active(); return t && t.type === 'file' ? t.model : null; },
+  get path() { return cur.model?.path || null; },
+  get dirty() { return !!cur.model?.dirty; },
+  get md() { return cur.model?.category === 'md'; },
+};
 MD.setDocPath(() => cur.path || '');
 let blocks = [];          // [{el, s, e}] from the last render
 let blockLines = [];      // [{el, line}] for scroll sync
-let cards = [];
+let cards = [];           // Ask Claude cards, each bound to its file's model (c.model)
 let cardSeq = 0;
 let skills = [];
-let applyingRemote = false;
 let askConf = { available: false, reason: '' };   // /api/config's "ask": can Ask Claude run?
 
 // ------------------------------------------------------------------ editor
@@ -27,19 +33,31 @@ const cm = CodeMirror($('#editor'), {
   indentUnit: 2,
   tabSize: 4,
   extraKeys: {
-    Enter: 'newlineAndIndentContinueMarkdownList',
+    Enter: c => c.execCommand(cur.md ? 'newlineAndIndentContinueMarkdownList' : 'newlineAndIndent'),
+    'Ctrl-Alt-L': () => sendSelectionToTerminal(), 'Cmd-Alt-L': () => sendSelectionToTerminal(),
     'Ctrl-B': () => cmd('bold'), 'Cmd-B': () => cmd('bold'),
     'Ctrl-I': () => cmd('italic'), 'Cmd-I': () => cmd('italic'),
     'Ctrl-K': () => cmd('link'), 'Cmd-K': () => cmd('link'),
     'Ctrl-S': () => save(), 'Cmd-S': () => save(),
     'Ctrl-O': () => openBrowser(), 'Cmd-O': () => openBrowser(),
     'Ctrl-J': () => openAsk('editor', true), 'Cmd-J': () => openAsk('editor', true),
-    Tab: c => c.somethingSelected() ? c.indentSelection('add') : c.execCommand('insertSoftTab'),
+    Tab: c => c.somethingSelected() ? c.indentSelection('add') : c.execCommand(c.getOption('indentWithTabs') ? 'insertTab' : 'insertSoftTab'),
     'Shift-Tab': c => c.indentSelection('subtract'),
   },
 });
+Tabs.init(cm);
+
+// "@path#L3-7 " into the Claude terminal for the editor's selection (Ctrl/Cmd+Alt+L)
+function sendSelectionToTerminal() {
+  if (!cur.model) return;
+  const from = cm.getCursor('from'), to = cm.getCursor('to');
+  let last = to.line;
+  if (to.ch === 0 && to.line > from.line) last--;   // a selection of whole lines ends at the next line's start
+  UI.sendToTerminal(cur.path, cm.somethingSelected() ? { from: from.line + 1, to: last + 1 } : null);
+}
 
 function cmd(name) {
+  if (!cur.md && !['undo', 'redo', 'ask'].includes(name)) return;   // markdown formatting
   const doc = cm.getDoc();
   const sel = doc.getSelection();
   const wrap = (a, b, ph) => {
@@ -93,10 +111,17 @@ function cmd(name) {
 }
 
 // Spell checking (spell.js): misspelt words get a wavy underline; code, URLs and HTML are skipped.
-let spellOn = store.get('mdedit.spell', '1') === '1';
+// On by default for markdown and off for other files, remembered separately for each.
+const spellKey = () => cur.model && !cur.md ? 'mdedit.spell.other' : 'mdedit.spell';
+const spellPref = () => store.get(spellKey(), spellKey() === 'mdedit.spell' ? '1' : '0') === '1';
+let spellOn = spellPref();
 const NO_SPELL = '.cm-comment, .cm-url, .cm-string, .cm-tag, .cm-attribute, .cm-formatting-code-block';
 cm.on('renderLine', (c, line, el) => {
   if (!spellOn || !el.querySelector('.cm-spell-error')) return;
+  if (!cur.md) {   // code: only comments and strings are prose
+    for (const s of el.querySelectorAll('.cm-spell-error')) if (!/\bcm-(comment|string)\b/.test(s.className)) s.classList.add('nospell');
+    return;
+  }
   const st = c.getStateAfter(c.getLineNumber(line) - 1, true);
   const md = st && (st.base || st);   // gfm wraps the markdown state in an overlay
   if (md && (md.code || md.localMode || md.fencedEndRE) || el.querySelector('.cm-formatting-code-block')) {
@@ -112,7 +137,7 @@ function refreshSpell() {
 function setSpell(on) {
   spellOn = on;
   $('#spell').classList.toggle('on', on);
-  store.set('mdedit.spell', on ? '1' : '0');
+  store.set(spellKey(), on ? '1' : '0');
   refreshSpell();
 }
 $('#spell').classList.toggle('on', spellOn);
@@ -178,6 +203,14 @@ function scheduleRender() { clearTimeout(renderT); renderT = setTimeout(renderPr
 
 function renderPreview() {
   const pane = $('#preview-pane');
+  if (!cur.md) {   // only markdown has a preview
+    clearTimeout(renderT);
+    blocks = [];
+    blockLines = [];
+    $('#preview').replaceChildren();
+    updateStats();
+    return;
+  }
   const top = pane.scrollTop;
   blocks = MD.render(cm.getValue(), $('#preview'));
   blockLines = blocks.filter(b => b.s >= 0).map(b => ({ el: b.el, line: cm.posFromIndex(b.s).line }));
@@ -189,6 +222,7 @@ function renderPreview() {
 function highlightPreviewCards() {
   for (const b of blocks) b.el.classList.remove('claude-hl', 'claude-hl-ready');
   for (const c of cards) {
+    if (c.model !== cur.model) continue;
     const r = c.marker?.find();
     if (!r || !['pending', 'ready'].includes(c.status)) continue;
     const s = cm.indexFromPos(r.from), e = cm.indexFromPos(r.to);
@@ -199,6 +233,11 @@ function highlightPreviewCards() {
 }
 
 function updateStats() {
+  if (!cur.model) { $('#stat-words').textContent = ''; $('#stat-cursor').textContent = ''; return; }
+  if (!cur.md) {
+    $('#stat-words').textContent = `${cm.lineCount().toLocaleString()} lines · ${cm.getValue().length.toLocaleString()} chars`;
+    return;
+  }
   const text = cm.getValue();
   const words = (text.match(/[\p{L}\p{N}'’-]+/gu) || []).length;
   $('#stat-words').textContent = `${words.toLocaleString()} words · ${text.length.toLocaleString()} chars`;
@@ -253,6 +292,7 @@ $('#preview-pane').addEventListener('scroll', () => {
 });
 
 // ------------------------------------------------------------------ files & saving
+// Opening, saving, autosave and on-disk changes live in tabs.js; the tree in explorer.js.
 
 async function api(method, url, body) {
   const r = await fetch(url, {
@@ -264,160 +304,54 @@ async function api(method, url, body) {
   return data;
 }
 
-function setSaveState(text, cls = '') {
-  const el = $('#save-state');
-  el.textContent = text;
-  el.className = cls || 'muted';
+function setSaveState(text, cls = '') { Tabs.setStatus(text, cls); }
+const save = (force = false) => Tabs.save(undefined, force);
+
+cm.on('change', () => scheduleRender());
+
+let fileList = [];   // the markdown files (/api/config, /api/root): candidates for a first file
+
+// Nothing remembered or asked for: open a markdown file, as the editor always has.
+async function openFirst() {
+  const want = [store.get('mdedit.last', null), fileList[0]?.path].find(p => p && fileList.some(f => f.path === p));
+  if (want) return Tabs.open(want, { preview: false });
+  // a new, empty folder gets an untitled.md to start with
+  const top = await api('GET', '/api/tree?dir=&all=0').catch(() => null);
+  if (top && Array.isArray(top.entries) && !top.entries.length) {
+    const r = await api('POST', '/api/new', { path: 'untitled.md', text: '# Untitled\n\n' }).catch(() => null);
+    if (r) return Tabs.open(r.path, { preview: false });
+  }
+  return null;
 }
 
-async function openFile(path) {
-  if (cur.dirty) await save();
-  let f;
-  try { f = await api('GET', `/api/file?path=${encodeURIComponent(path)}`); }
-  catch (e) { setSaveState(`Could not open ${path}: ${e.message}`, 'err'); return; }
-  for (const c of cards) c.marker?.clear();
-  cards = [];
-  renderCards();
-  Object.assign(cur, { path, version: f.version, dirty: false });
-  applyingRemote = true;
-  cm.setValue(f.text);
-  cm.clearHistory();
-  applyingRemote = false;
-  $('#doc-name').textContent = path;
-  document.title = `${path.split('/').pop()} — MD Editor`;
-  history.replaceState(null, '', `#${encodeURIComponent(path)}`);
-  store.set('mdedit.last', path);
-  setSaveState('Saved');
-  hideBanner();
-  renderPreview();
-  markActiveFile();
-}
-
-let saveT;
-cm.on('change', (_, change) => {
-  scheduleRender();
-  if (applyingRemote || !cur.path) return;
-  cur.dirty = true;
-  setSaveState('Editing…');
-  clearTimeout(saveT);
-  saveT = setTimeout(save, 800);
+// The active tab changed (or its file was renamed): fit the layout to its kind.
+Tabs.on('deactivate', t => {
+  if (t && t.type === 'file' && t.model.category === 'md') t.model.previewTop = $('#preview-pane').scrollTop;
 });
-
-async function save(force = false) {
-  clearTimeout(saveT);
-  if (!cur.path || cur.saving) { if (cur.saving) saveT = setTimeout(save, 300); return; }
-  if (!cur.dirty && !force) return;
-  const text = cm.getValue();
-  cur.saving = true;
-  setSaveState('Saving…');
-  try {
-    const r = await api('PUT', '/api/file', { path: cur.path, text, base_version: cur.version, force });
-    cur.version = r.version;
-    if (cm.getValue() === text) { cur.dirty = false; setSaveState('Saved'); }
-    hideBanner();
-  } catch (e) {
-    if (e.status === 409) {
-      setSaveState('Conflict', 'err');
-      showBanner('This file was changed on disk while you were editing.',
-        [['Load disk version', () => applyRemote(e.data.text, e.data.version)],
-         ['Keep mine (overwrite)', () => save(true)]]);
-    } else setSaveState(`Save failed: ${e.message}`, 'err');
-  } finally {
-    cur.saving = false;
+Tabs.on('activate', t => {
+  const md = cur.md;
+  for (const b of document.querySelectorAll('#view-mode button')) {
+    b.disabled = !md;
+    b.title = md ? '' : 'The preview is only for markdown files';
   }
-}
-
-// Replace the editor text with `text` by editing only the changed middle, so the
-// cursor, undo history and Claude markers elsewhere survive; flash what changed.
-function applyRemote(text, version) {
-  const old = cm.getValue();
-  cur.version = version;
-  cur.dirty = false;
-  if (old !== text) {
-    let a = 0;
-    while (a < old.length && a < text.length && old[a] === text[a]) a++;
-    let b = 0;
-    while (b < old.length - a && b < text.length - a && old[old.length - 1 - b] === text[text.length - 1 - b]) b++;
-    const from = cm.posFromIndex(a), to = cm.posFromIndex(old.length - b);
-    const ins = text.slice(a, text.length - b);
-    applyingRemote = true;
-    cm.replaceRange(ins, from, to, 'remote');
-    applyingRemote = false;
-    if (ins) {
-      const m = cm.markText(from, cm.posFromIndex(a + ins.length), { className: 'remote-flash' });
-      setTimeout(() => m.clear(), 2500);
-    }
+  const pdf = $('#export-pdf');
+  pdf.disabled = !md;
+  pdf.title = md ? 'Export as PDF: saved next to the .md file and downloaded (the browser\'s Print prints the preview)' : 'PDF export is only for markdown files';
+  const askBtn = $('#toolbar [data-cmd="ask"]');
+  askBtn.disabled = !askConf.available || !cur.model;
+  if (spellPref() !== spellOn) {   // the overlay belongs to the editor, so it survives swapDoc
+    spellOn = !spellOn;
+    $('#spell').classList.toggle('on', spellOn);
+    refreshSpell();
   }
-  setSaveState('Updated from disk', 'ok');
-  hideBanner();
-}
-
-function showBanner(msg, actions) {
-  const el = $('#banner');
-  el.replaceChildren(Object.assign(document.createElement('span'), { textContent: msg }));
-  for (const [label, fn] of actions) {
-    const b = Object.assign(document.createElement('button'), { textContent: label });
-    b.onclick = fn;
-    el.appendChild(b);
-  }
-  el.hidden = false;
-}
-function hideBanner() { $('#banner').hidden = true; }
-
-let fileList = [];
-function renderFiles() {
-  const ul = $('#file-list');
-  ul.replaceChildren();
-  for (const f of fileList) {
-    const li = document.createElement('li');
-    const parts = f.path.split('/');
-    li.innerHTML = (parts.length > 1 ? `<span class="muted">${esc(parts.slice(0, -1).join('/'))}/</span>` : '') + esc(parts.at(-1));
-    li.dataset.path = f.path;
-    li.title = f.path;
-    li.onclick = () => openFile(f.path);
-    ul.appendChild(li);
-  }
-  markActiveFile();
-}
-function markActiveFile() {
-  document.querySelectorAll('#file-list li').forEach(li => li.classList.toggle('active', li.dataset.path === cur.path));
-}
-
-$('#new-file').onclick = () => {
-  if ($('#new-file-input')) return;
-  const input = Object.assign(document.createElement('input'), { id: 'new-file-input', placeholder: 'name.md, then Enter' });
-  $('#file-list').before(input);
-  input.focus();
-  input.onkeydown = async e => {
-    if (e.key === 'Escape') input.remove();
-    if (e.key !== 'Enter' || !input.value.trim()) return;
-    try {
-      const r = await api('POST', '/api/new', { path: input.value.trim() });
-      input.remove();
-      fileList = await api('GET', '/api/files');
-      renderFiles();
-      openFile(r.path);
-    } catch (err) { input.classList.add('bad'); input.title = err.message; }
-  };
-  input.onblur = () => setTimeout(() => input.remove(), 150);
-};
-
-function listenForChanges() {
-  const es = new EventSource('/api/events');
-  es.onmessage = async ev => {
-    fileList = JSON.parse(ev.data);
-    renderFiles();
-    const f = fileList.find(x => x.path === cur.path);
-    if (!f || f.version === cur.version || cur.saving) return;
-    const disk = await api('GET', `/api/file?path=${encodeURIComponent(cur.path)}`);
-    if (disk.version === cur.version || cur.saving) return;
-    if (disk.text === cm.getValue()) { cur.version = disk.version; return; }
-    if (!cur.dirty) applyRemote(disk.text, disk.version);
-    else showBanner('This file was changed on disk while you were editing.',
-      [['Load disk version', () => applyRemote(disk.text, disk.version)],
-       ['Keep mine (overwrite)', () => save(true)]]);
-  };
-}
+  closeAsk();
+  pill.hidden = true;
+  previewRange = null;
+  if (cur.model && $('#main').classList.contains('preview')) cm.refresh();   // the editor was hidden
+  renderPreview();
+  if (md) $('#preview-pane').scrollTop = cur.model.previewTop || 0;
+  if (cur.model) { const c = cm.getCursor(); $('#stat-cursor').textContent = `Ln ${c.line + 1}, Col ${c.ch + 1}`; }
+});
 
 // ------------------------------------------------------------------ selection → source range
 
@@ -562,7 +496,7 @@ function prepareAsk() {
 
 // Ask Claude can't run (see askConf.reason): show why on the Suggestions tab.
 function showAskUnavailable() {
-  document.body.classList.remove('no-claude');
+  showClaudePanel();
   setPanelTab('suggestions', false);
   renderCards();
   cm.refresh();
@@ -570,6 +504,7 @@ function showAskUnavailable() {
 
 function openAsk(source, focus) {
   if (!askConf.available) { if (focus) showAskUnavailable(); return; }
+  if (!cur.model) return;
   prepareAsk();
   askTarget = currentRange(source);
   if (source !== 'preview') previewRange = null;
@@ -627,19 +562,25 @@ function submitAsk(instr, mode, label) {
 
 // ------------------------------------------------------------------ Claude cards
 
+// Cards belong to their file's model: the marks live on its Doc, so a card keeps tracking its
+// passage (and Accept works) while another tab is active.
 function markCard(c, cls) {
+  const doc = c.model.doc;
   const r = c.marker?.find();
   c.marker?.clear();
   if (!r && c.marker) { c.marker = null; return; }
-  const from = r ? r.from : cm.posFromIndex(c.from), to = r ? r.to : cm.posFromIndex(c.to);
-  c.marker = cm.markText(from, to, { className: `claude-mark ${cls} card-${c.id}`, clearWhenEmpty: false, inclusiveLeft: false, inclusiveRight: false });
+  const from = r ? r.from : doc.posFromIndex(c.from), to = r ? r.to : doc.posFromIndex(c.to);
+  c.marker = doc.markText(from, to, { className: `claude-mark ${cls} card-${c.id}`, clearWhenEmpty: false, inclusiveLeft: false, inclusiveRight: false });
 }
 
-function createCard({ from, to, whole, instruction, mode, label }) {
-  const c = { id: ++cardSeq, from, to, whole, instruction, mode, label, status: 'pending', original: cm.getValue().slice(from, to), result: '', view: 'diff' };
+function createCard({ model = cur.model, from, to, whole, instruction, mode, label }) {
+  if (!model) return;
+  const c = { id: ++cardSeq, model, from, to, whole, instruction, mode, label, status: 'pending', original: model.doc.getValue().slice(from, to), result: '', view: 'diff' };
   markCard(c, 'pending');
   cards.unshift(c);
-  document.body.classList.remove('no-claude');
+  // a card lives as long as its file is open: keep a preview tab from being replaced under it
+  for (const t of Tabs.list()) if (t.model === model && t.preview) Tabs.pin(t);
+  showClaudePanel();
   setPanelTab('suggestions', false);   // cards don't outlive a reload, so the remembered tab stays
   run(c);
 }
@@ -647,8 +588,8 @@ function createCard({ from, to, whole, instruction, mode, label }) {
 async function run(c, feedback) {
   const r = c.marker?.find();
   if (!r) { c.status = 'error'; c.error = 'The highlighted text was deleted.'; renderCards(); return; }
-  const doc = cm.getValue();
-  const start = cm.indexFromPos(r.from), end = cm.indexFromPos(r.to);
+  const doc = c.model.doc.getValue();
+  const start = c.model.doc.indexFromPos(r.from), end = c.model.doc.indexFromPos(r.to);
   c.original = doc.slice(start, end);
   c.status = 'pending';
   c.started = Date.now();
@@ -657,7 +598,7 @@ async function run(c, feedback) {
   renderCards();
   highlightPreviewCards();
   const body = {
-    path: cur.path, doc, start, end, mode: c.mode, model: $('#model').value,
+    path: c.model.path, doc, start, end, mode: c.mode, model: $('#model').value,
     instruction: feedback || c.instruction,
   };
   if (feedback && c.result) body.previous = c.result;
@@ -701,9 +642,10 @@ function accept(c) {
   const r = c.marker?.find();
   if (!r) { c.status = 'error'; c.error = 'The highlighted text was deleted, so there is nowhere to put the result.'; renderCards(); return; }
   const text = c.editing ?? c.result;
-  cm.replaceRange(text, r.from, r.to, '+claude');
-  const end = cm.posFromIndex(cm.indexFromPos(r.from) + text.length);
-  const m = cm.markText(r.from, end, { className: 'accepted-flash' });
+  const doc = c.model.doc;
+  doc.replaceRange(text, r.from, r.to, '+claude');
+  const end = doc.posFromIndex(doc.indexFromPos(r.from) + text.length);
+  const m = doc.markText(r.from, end, { className: 'accepted-flash' });
   setTimeout(() => m.clear(), 2000);
   c.editing = undefined;
   finish(c, 'accepted');
@@ -734,6 +676,7 @@ function cardEl(c) {
     <div class="card-head">
       <span class="badge">${statusText}</span>
       <span class="card-label" title="${esc(c.instruction)}">${esc(c.label)}</span>
+      <span class="card-file muted" title="${esc(c.model.path)}">${esc(c.model.path.split('/').pop())}</span>
       <span class="muted card-meta">${c.status === 'pending' ? '<span class="spinner"></span>' : esc(c.meta || '')}</span>
     </div>
     <div class="card-excerpt muted" title="Click to show in the editor">“${esc(excerpt.length > 140 ? excerpt.slice(0, 140) + '…' : excerpt)}”</div>
@@ -774,7 +717,7 @@ function cardEl(c) {
     }
     body.appendChild(view);
     const r = c.marker?.find();
-    if (r && cm.getRange(r.from, r.to) !== c.original) {
+    if (r && c.model.doc.getRange(r.from, r.to) !== c.original) {
       body.insertAdjacentHTML('beforeend', '<div class="warn">The highlighted text has been edited since this was requested; Accept will overwrite those edits.</div>');
     }
     btn('Accept', () => accept(c), 'primary');
@@ -789,7 +732,7 @@ function cardEl(c) {
       const r = c.marker?.find();
       if (!r) return;
       finish(c, 'dismissed');
-      createCard({ from: cm.indexFromPos(r.from), to: cm.indexFromPos(r.to), whole: c.whole, mode: 'replace', label: 'Apply feedback',
+      createCard({ model: c.model, from: c.model.doc.indexFromPos(r.from), to: c.model.doc.indexFromPos(r.to), whole: c.whole, mode: 'replace', label: 'Apply feedback',
         instruction: `Revise this passage to address the following feedback:\n\n${c.result}` });
     }, 'primary');
     btn('Dismiss', () => finish(c, 'dismissed'));
@@ -806,9 +749,11 @@ function cardEl(c) {
     el.appendChild(f);
   }
 
-  el.querySelector('.card-excerpt').onclick = () => {
+  el.querySelector('.card-excerpt').onclick = async () => {
+    if (!c.marker?.find()) return;
+    if (cur.model !== c.model) await Tabs.open(c.model.path, { preview: false });
     const r = c.marker?.find();
-    if (!r) return;
+    if (!r || cur.model !== c.model) return;
     cm.setSelection(r.from, r.to);
     cm.scrollIntoView({ from: r.from, to: r.to }, 80);
     cm.focus();
@@ -822,6 +767,15 @@ $('#clear-cards').onclick = () => {
   cards = cards.filter(c => ['pending', 'ready'].includes(c.status));
   renderCards();
 };
+
+// a closed file takes its cards with it
+Tabs.on('dispose', m => {
+  const gone = cards.filter(c => c.model === m);
+  if (!gone.length) return;
+  for (const c of gone) { c.status = 'cancelled'; c.marker?.clear(); c.marker = null; }
+  cards = cards.filter(c => c.model !== m);
+  renderCards();
+});
 
 // Word-level diff (LCS) rendered as <del>/<ins>.
 function wordDiff(a, b) {
@@ -907,29 +861,23 @@ function selectEntry(i) {
 }
 
 // Point the server at a folder, or at a file's folder, then open the file.
+// Unsaved files are saved or dropped first (paths are relative to the root), then the tabs
+// of the old root are closed and those remembered for the new one reopened.
 async function switchRoot(path) {
-  if (cur.dirty) await save();
+  if (!(await Tabs.confirmLeave('Save your changes before opening another folder?'))) return;
+  UI.stat.bump();   // drop polls of the old root's files
   let r;
   try { r = await api('POST', '/api/root', { path }); }
   catch (e) { $('#browser-msg').textContent = e.message; $('#browser-msg').className = 'err'; return; }
   $('#browser').hidden = true;
+  UI.stat.bump();
+  Tabs.closeAll();   // Ask Claude cards go with their files
   setRoot(r.root);
   fileList = r.files;
-  for (const c of cards) c.marker?.clear();
-  cards = [];
-  renderCards();
-  cur.path = null;
-  renderFiles();
-  const want = r.initial || fileList[0]?.path;
-  if (want) { await openFile(want); cm.focus(); return; }
-  Object.assign(cur, { path: null, version: null, dirty: false });
-  applyingRemote = true;
-  cm.setValue('');
-  applyingRemote = false;
-  $('#doc-name').textContent = 'No markdown files in this folder';
-  setSaveState('Use “+ New” to create one', 'muted');
-  document.body.classList.remove('no-files');
-  renderPreview();
+  await Tabs.restore();
+  if (r.initial) await Tabs.open(r.initial, { preview: false });
+  else if (!Tabs.active()) await openFirst();
+  if (cur.model) cm.focus();
 }
 
 function setRoot(root) {
@@ -937,6 +885,7 @@ function setRoot(root) {
   $('#file-root').textContent = root;
   $('#stat-root').textContent = root;
   Term.onRootChange(root);
+  UI.emit('root', root);
 }
 
 $('#open-browse').onclick = openBrowser;
@@ -964,7 +913,7 @@ $('#browser').addEventListener('keydown', e => {
 // ------------------------------------------------------------------ PDF export
 
 async function exportPdf() {
-  if (!cur.path) return;
+  if (!cur.md) return;
   if (cur.dirty) await save();
   const btn = $('#export-pdf');
   btn.disabled = true;
@@ -1008,8 +957,20 @@ function setView(mode) {
   store.set('mdedit.view', mode);
   setTimeout(() => { cm.refresh(); renderPreview(); }, 0);
 }
-$('#toggle-files').onclick = () => { document.body.classList.toggle('no-files'); store.set('mdedit.files', document.body.classList.contains('no-files') ? '0' : '1'); cm.refresh(); };
-$('#toggle-claude').onclick = () => { document.body.classList.toggle('no-claude'); cm.refresh(); Term.visible(); };
+$('#toggle-files').onclick = () => Activity.setSidebar(!Activity.sidebarOn());
+Activity.onLayout(() => cm.refresh());
+// A narrow window has room for one overlay: showing this panel hides the side bar (and
+// activity.js does the reverse).
+function showClaudePanel() {
+  document.body.classList.remove('no-claude');
+  if (matchMedia('(max-width: 800px)').matches && Activity.sidebarOn()) Activity.setSidebar(false, false);
+}
+$('#toggle-claude').onclick = () => {
+  if (document.body.classList.contains('no-claude')) showClaudePanel();
+  else document.body.classList.add('no-claude');
+  cm.refresh();
+  Term.visible();
+};
 
 function setTheme(dark) {
   document.documentElement.dataset.theme = dark ? 'dark' : 'light';
@@ -1019,12 +980,19 @@ function setTheme(dark) {
   Term.setTheme(dark);
   store.set('mdedit.theme', dark ? 'dark' : 'light');
   renderPreview();
+  UI.emit('theme', dark);
 }
 $('#theme').onclick = () => setTheme(document.documentElement.dataset.theme !== 'dark');
 $('#model').value = store.get('mdedit.model', '');
 $('#model').onchange = () => store.set('mdedit.model', $('#model').value);
 
-window.addEventListener('beforeunload', e => { if (cur.dirty) { save(); e.preventDefault(); } });
+// unsaved files: autosaved ones are saved now, and the browser asks before leaving
+window.addEventListener('beforeunload', e => {
+  if (!Tabs.anyDirty()) return;
+  for (const m of Tabs.models()) if (m.dirty && Tabs.autosave(m.category)) Tabs.save(m);
+  e.preventDefault();
+  e.returnValue = '';
+});
 
 // ------------------------------------------------------------------ Claude panel: tabs and width
 
@@ -1046,6 +1014,17 @@ document.querySelectorAll('#panel-tabs .tab').forEach(b => b.onclick = () => {
   if (b.dataset.tab === 'terminal') Term.focus();
 });
 setPanelTab(store.get('mdedit.panelTab', 'terminal'), false);
+
+// for the other modules (ui.js: Send to Claude terminal)
+window.App = {
+  cm,
+  showTerminal() {
+    showClaudePanel();
+    setPanelTab('terminal');
+    cm.refresh();
+  },
+  setPanelTab,
+};
 
 const PANEL_MIN = 280;
 const defaultPanelWidth = () => Math.max(360, Math.min(innerWidth * 0.4, 640));
@@ -1092,8 +1071,7 @@ $('#panel-resize').addEventListener('dblclick', () => {
   const saved = store.get('mdedit.theme', null);
   setTheme(saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches);
   setView(store.get('mdedit.view', innerWidth < 800 ? 'edit' : 'split'));
-  if (store.get('mdedit.files', '1') === '0' || innerWidth < 800) document.body.classList.add('no-files');
-  if (innerWidth < 1100) document.body.classList.add('no-claude');
+  if (innerWidth < 1100) document.body.classList.add('no-claude');   // activity.js decides the side bar
 
   const conf = await api('GET', '/api/config');
   skills = conf.skills;
@@ -1101,7 +1079,7 @@ $('#panel-resize').addEventListener('dblclick', () => {
   Term.init(conf.agent);
   askConf = conf.ask || { available: false, reason: 'This md-editor server has no Ask Claude support.' };
   const askBtn = $('#toolbar [data-cmd="ask"]');
-  askBtn.disabled = !askConf.available;
+  askBtn.disabled = !askConf.available || !cur.model;
   askBtn.title = askConf.available ? `Ask Claude about the selection (Ctrl+J), via ${askConf.cmd}` : `Ask Claude unavailable: ${askConf.reason}`;
   renderCards();
   const agentOk = !!conf.agent?.available;
@@ -1109,17 +1087,21 @@ $('#panel-resize').addEventListener('dblclick', () => {
   setRoot(conf.root);
   setPanelTab(agentOk ? store.get('mdedit.panelTab', 'terminal') : 'suggestions', false);
   buildPresets();
-  renderFiles();
-  const fromHash = decodeURIComponent(location.hash.slice(1));
-  const want = [conf.initial, fromHash, store.get('mdedit.last', null), fileList[0]?.path]
-    .find(p => p && fileList.some(f => f.path === p));
-  if (want) await openFile(want);
-  else {
-    const r = await api('POST', '/api/new', { path: 'untitled.md', text: '# Untitled\n\n' }).catch(() => null);
-    fileList = await api('GET', '/api/files');
-    renderFiles();
-    if (r) await openFile(r.path);
+  // read before the remembered tabs come back: activating one rewrites the URL
+  let fromHash = '';
+  try { fromHash = decodeURIComponent(location.hash.slice(1)); } catch {}
+  // the file named on the command line, once per browser tab (a reload keeps the tab on screen)
+  let initial = conf.initial;
+  try {
+    const k = 'mdedit.initial:' + conf.root;
+    if (initial && sessionStorage.getItem(k) === initial) initial = null;
+    else if (initial) sessionStorage.setItem(k, initial);
+  } catch {}
+  await Tabs.restore();   // the tabs remembered for this folder
+  for (const p of [initial, fromHash]) {   // pinned, unless it is already open
+    if (p && await Tabs.open(p, { preview: Tabs.list().some(t => t.path === p) })) break;
   }
-  listenForChanges();
-  cm.focus();
+  if (!Tabs.active()) await openFirst();
+  UI.emit('ready');
+  if (cur.model) cm.focus();
 })();
