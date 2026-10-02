@@ -154,15 +154,15 @@ def fake_agent(tmp_path, name):
     return str(p)
 
 
-def start(md_editor, tmp_path, agent_log, mode="native", env=None, **kw):
+def start(md_editor, tmp_path, agent_log, mode="native", env=None, name=None, **kw):
     """md-editor with the fake agent: native (called claude, its lock in tmp/cfg/ide) or
-    launcher (its lock in tmp/shared/.claude/ide)."""
+    launcher (its lock in tmp/shared/.claude/ide); called `name` instead, if given."""
     e = {"FAKE_AGENT_LOG": str(agent_log), "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg"),
          "CLAUDE_SANDBOX_SHARED_CONFIG": str(tmp_path / "shared")}
     if mode == "launcher":
         (tmp_path / "shared" / ".claude").mkdir(parents=True, exist_ok=True)
     e.update(env or {})
-    agent = fake_agent(tmp_path, "claude" if mode == "native" else "claude-sandbox")
+    agent = fake_agent(tmp_path, name or ("claude" if mode == "native" else "claude-sandbox"))
     return md_editor(agent=agent, env=e, **kw)
 
 
@@ -333,6 +333,14 @@ def test_messages_over_16_mib_and_bad_json(md_editor, tmp_path, agent_log):
     assert claude.wait(lambda m: m.get("error", {}).get("code") == -32700)
     claude.ws.send_frame(1, b"[1, 2]")
     assert claude.wait(lambda m: m.get("error", {}).get("code") == -32600)
+    # nested too deep for the parser (RecursionError, not ValueError): a parse error, and the
+    # link stays up
+    claude.ws.send_frame(1, b"[" * 100000 + b"]" * 100000)
+    claude.ws.send_frame(1, b'{"jsonrpc": "2.0", "method": "ide_connected", "params": {"pid": '
+                         + b"[" * 100000 + b"]" * 100000 + b"}}")
+    assert claude.ws.wait(lambda: len([m for m in claude.msgs() if m.get("error", {}).get("code") == -32700]) == 3, 5)
+    assert claude.call({"jsonrpc": "2.0", "id": 77, "method": "ping"})["result"] == {}
+    assert term.statuses()[-1]["ide"] == "connected"
     big = S.IDE_MAX_MESSAGE + 1
     claude.ws.send_frame(1, b"", length=big)   # a header claiming more than the cap: no payload is read
     assert claude.ws.wait(lambda: claude.ws.close_frames(), 5)
@@ -454,6 +462,26 @@ def test_open_diff_only_shows_text_files_in_the_session_folder(md_editor, tmp_pa
         assert texts(reply)[0] not in ("FILE_SAVED", "DIFF_REJECTED", "TAB_CLOSED"), "Claude asks in the terminal"
     assert not browser_msgs(term, "diff")
     assert claude.call(tool_call(30, "openDiff", {"old_file_path": 1}))["error"]["code"] == -32602
+    term.close()
+
+
+def test_a_proposal_shown_can_always_be_accepted(md_editor, tmp_path, agent_log, root):
+    """The page answers with the whole file as JSON in one /api/term message (at most 4 MiB):
+    a proposal over IDE_DIFF_MAX as JSON (newlines and quotes count twice) is not shown, so
+    Claude asks in the terminal, and one at the cap is accepted, with room to spare."""
+    (root / "target.md").write_text(DOC)
+    srv, term, claude = connected(md_editor, tmp_path, agent_log)
+    for rid, big in ((3, "a" * (S.IDE_DIFF_MAX - 1)), (4, "\n" * (S.IDE_DIFF_MAX // 2)), (5, '"' * (S.IDE_DIFF_MAX // 2))):
+        reply = claude.call(open_diff(rid, root / "target.md", big), 20)
+        assert reply["result"]["isError"] is True and "too large" in texts(reply)[0], (rid, reply)
+    assert not browser_msgs(term, "diff")
+    fits = "b" * (S.IDE_DIFF_MAX - 2)
+    claude.send(open_diff(6, root / "target.md", fits))
+    d = wait_browser(term, "diff", timeout=20)
+    edited = fits + "\n" + "c" * (S.WS_MAX_MESSAGE - S.IDE_DIFF_MAX - 200)   # what the page lets through
+    term.send_json({"type": "diff-decision", "id": d["id"], "accept": True, "contents": edited})
+    assert texts(claude.reply(6, 20)) == ["FILE_SAVED", edited]
+    assert not term.close_frames() and not term.eof, "the browser's socket is still up"
     term.close()
 
 
@@ -715,10 +743,10 @@ def test_no_ask_while_claude_waits_for_an_answer(md_editor, tmp_path, agent_log,
 def test_an_ask_waits_for_claude_code_to_start(md_editor, tmp_path, agent_log, root):
     """Claude Code keeps text typed before its prompt is up but drops the Enter, so an ask that
     comes as the session starts (the first one in a narrow window, or just after Restart) waits
-    until Claude Code has drawn its prompt, and the page is told; an agent that never draws it
-    is waited for until its output has been quiet for a moment."""
+    until Claude Code has drawn its prompt, and the page is told. Quiet output is no sign that
+    it is up (claude-sandbox is silent for long stretches while it makes its container)."""
     (root / "target.md").write_text(DOC)
-    srv = start(md_editor, tmp_path, agent_log, args=["--ide-link", "off"], env={"MDEDIT_START_QUIET": "30"})
+    srv = start(md_editor, tmp_path, agent_log, args=["--ide-link", "off"], env={"MDEDIT_START_QUIET": "0.3"})
     term, _, _ = session(srv, prompt=False)
     other = srv.ws()   # draws while the first one's ask waits
     other.wait_status()
@@ -740,9 +768,40 @@ def test_an_ask_waits_for_claude_code_to_start(md_editor, tmp_path, agent_log, r
     assert typed(agent_log, b"\x1b[200~Again?\x1b[201~\r", 5) == b"\x1b[200~Again?\x1b[201~\r"
     other.close()
     term.close()
-    # an agent that is not Claude Code: once its output has been quiet for START_QUIET
-    srv = start(md_editor, tmp_path, agent_log, args=["--ide-link", "off"], env={"MDEDIT_START_QUIET": "1"})
+
+
+def test_an_ask_gives_up_on_claude_code_that_has_not_started(md_editor, tmp_path, agent_log, root):
+    """claude-sandbox still making its container (or pulling its image): after START_WAIT the
+    ask fails, with nothing typed, rather than typing into the launcher; once Claude Code's
+    prompt is up, an ask goes at once."""
+    srv = start(md_editor, tmp_path, agent_log, mode="launcher",
+                env={"MDEDIT_START_WAIT": "2", "MDEDIT_START_QUIET": "0.3"})
     term, _, _ = session(srv, prompt=False)
+    agent_log.write_bytes(b"")
+    t0 = time.monotonic()
+    term.send_json({"type": "ask", "text": "Early?", "seq": 1})
+    assert wait_browser(term, "waiting", lambda m: m.get("seq") == 1, 5)
+    m = wait_browser(term, "sent", lambda m: m.get("seq") == 1, 10)
+    assert m["ok"] is False and "has not started yet" in m["error"], m
+    assert time.monotonic() - t0 >= 1.8
+    time.sleep(0.3)
+    assert agent_log.read_bytes() == b"", "nothing typed"
+    say(term, INPUT_BOX)
+    t0 = time.monotonic()
+    term.send_json({"type": "ask", "text": "Now?", "seq": 2})
+    assert wait_browser(term, "sent", lambda m: m.get("seq") == 2)["ok"] is True
+    assert typed(agent_log, b"\x1b[200~Now?\x1b[201~\r") == b"\x1b[200~Now?\x1b[201~\r"
+    assert time.monotonic() - t0 < 1.5
+    assert not browser_msgs(term, "waiting")[1:], "not waited for again"
+    term.close()
+
+
+def test_an_ask_to_another_agent_waits_for_quiet(md_editor, tmp_path, agent_log, root):
+    """An agent that is not Claude Code never draws its prompt: an ask goes once its output has
+    been quiet for START_QUIET."""
+    srv = start(md_editor, tmp_path, agent_log, name="other-agent", env={"MDEDIT_START_QUIET": "1"})
+    term, st, _ = session(srv, prompt=False)
+    assert st["ide"] == "off"
     agent_log.write_bytes(b"")
     t0 = time.monotonic()
     term.send_json({"type": "ask", "text": "Quiet?", "seq": 3})
@@ -990,15 +1049,49 @@ def test_stale_lock_files_are_swept_at_start(md_editor, tmp_path, agent_log, roo
     live.bind(str(root / ".md-editor-ide-21006.sock"))
     live.listen(4)
     (shared / "21006.lock").write_text(json.dumps(dict(mine, pid=1, mdEditorHostPid=gone.pid)))
+    # nor can what it writes stop md-editor starting: pids no process can have (os.kill raises
+    # OverflowError for them), and folders of the wrong type, are stale locks like any other
+    (shared / "21007.lock").write_text(json.dumps(dict(mine, pid=1, mdEditorHostPid=10**30)))
+    (shared / "21008.lock").write_text(json.dumps(dict(mine, pid=1, mdEditorHostPid=2**40, workspaceFolders="/")))
+    (shared / "21009.lock").write_text(json.dumps(dict(mine, pid=1, mdEditorHostPid=gone.pid,
+                                                       workspaceFolders=[123, "/tmp"])))
+    (shared / "21010.lock").write_text(json.dumps(dict(mine, pid=1, mdEditorHostPid=gone.pid,
+                                                       workspaceFolders=["/a\0b", "\ud800"])))
+    (shared / "21011.lock").write_text("[" * 30000 + "]" * 30000)   # too deep to parse: not md-editor's
     try:
         srv = start(md_editor, tmp_path, agent_log)
+        assert srv.config()["agent"]["available"], "serving: the sweep (before serving) is done, and it lived"
         assert sorted(p.name for p in d.iterdir()) == ["21001.lock", "21002.lock", "21003.lock", "21004.lock"]
         assert not os.path.lexists(root / ".md-editor-ide-21000.sock")
         assert not (shared / "21005.lock").exists(), "both folders are swept"
         assert (shared / "21006.lock").exists() and os.path.lexists(root / ".md-editor-ide-21006.sock")
+        assert sorted(p.name for p in shared.glob("*.lock")) == ["21006.lock", "21011.lock"]
         assert "removed a stale lock file" in srv.logtext()
     finally:
         live.close()
+
+
+def test_a_lock_file_the_agent_garbles_does_not_stop_a_restart(md_editor, tmp_path, agent_log):
+    """In launcher mode the agent can write the lock folder: whatever it puts in the link's lock
+    file (JSON nested too deep to parse, say), the link still closes and the session restarts;
+    the lock, no longer the link's, is left alone."""
+    srv = start(md_editor, tmp_path, agent_log, mode="launcher")
+    term, _, _ = session(srv)
+    lock = the_lock(lock_dir(tmp_path, "launcher"))
+    sock = srv.root / f".md-editor-ide-{lock.stem}.sock"
+    assert sock.exists()
+    lock.unlink()
+    lock.write_text("[" * 30000 + "]" * 30000)
+    term.send_json({"type": "restart"})
+    st = term.wait_status(lambda s: s["id"] == 2 and s["state"] == "running")
+    assert st["ide"] == "waiting"
+    deadline = time.monotonic() + 5
+    while os.path.lexists(sock) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not os.path.lexists(sock), "the old link closed"
+    assert lock.read_text().startswith("[[["), "not the link's lock any more: left alone"
+    assert len(list(lock_dir(tmp_path, "launcher").glob("*.lock"))) == 2, "the new link has its own"
+    term.close()
 
 
 def test_lock_file_deleted_is_written_again(md_editor, tmp_path, agent_log):

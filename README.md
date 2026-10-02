@@ -45,7 +45,7 @@ There is one Claude Code session: the one in the side panel's terminal (see [Cla
 2. **Choose** a preset (*My style*, *Improve*, *Tighten*, *Expand*, *Simplify*, *Fix grammar*, *More formal/casual*, *To bullets/prose*, *Critique*) or type your own question or instruction and press <kbd>Enter</kbd>.
 3. The panel shows the terminal, and the question goes to Claude Code with <kbd>Enter</kbd> pressed for you, so Claude starts straight away. A file with unsaved changes is saved first (a short message says so), so that Claude reads what you see. Claude answers in the terminal, where you can carry on the conversation, and makes any change to the file itself: the editor shows it as it lands.
 
-If the session has only just started, the question waits until Claude Code is ready for it. If Claude Code is asking *you* something in the terminal (whether it may make an edit or run a command, say), the question is not sent and a message says why: the <kbd>Enter</kbd> would answer Claude's question, with its default "Yes". Answer it in the terminal (or accept or reject the [proposed change](#reviewing-claudes-edits)), then ask again.
+If the session has only just started, the question waits until Claude Code has drawn its prompt. claude-sandbox can take much longer than that to start (the first time, it has to fetch its image): if Claude Code is still not up after 20 seconds, nothing is typed and a message asks you to try again once it is. If Claude Code is asking *you* something in the terminal (whether it may make an edit or run a command, say), the question is not sent and a message says why: the <kbd>Enter</kbd> would answer Claude's question, with its default "Yes". Answer it in the terminal (or accept or reject the [proposed change](#reviewing-claudes-edits)), then ask again.
 
 *My style* uses the `nisbet-writing-style` skill; any skill in `~/.claude/skills` appears as a preset. Choose Claude's model in the session itself, with `/model`.
 
@@ -62,9 +62,10 @@ To review each edit before it is made, switch Claude Code to ask first: press <k
 
 - You can edit the right-hand side; the arrows between the sides put a change back as it was.
 - **Accept** (<kbd>Ctrl</kbd>+<kbd>Enter</kbd>) lets Claude write the right-hand side, your edits included. md-editor itself writes nothing: Claude does, and the editor shows the result.
+- A proposed file over about 3 MB is not shown: Claude then asks in the terminal only.
 - **Reject** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd>), or closing the tab, tells Claude no; Claude stops and waits for you in the terminal.
 - Answering Claude's own question in the terminal instead closes the tab.
-- While a change waits, the file is read-only (in its own tab, under a banner, and in its Source Control diff) and is not saved, so nothing you type can race Claude's write. A change that arrives while you are typing in another file opens in a tab beside it, with a short message, rather than taking the keyboard away.
+- While a change waits, the file is read-only (in its own tab, under a banner, and in its Source Control diff) and is not saved, so nothing you type can race Claude's write. The left-hand side is the file on disk: if its tab had unsaved changes when the proposal came, the banner and the proposal say they are not in it. A change that arrives while you are typing in another file opens in a tab beside it, with a short message, rather than taking the keyboard away.
 - A waiting change comes back if you reload the page, even with the Claude panel hidden. It belongs to the session, not to the open folder: opening another folder, or *Close saved*, leaves it waiting.
 
 ### Changes in 0.4.0

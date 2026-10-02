@@ -1834,6 +1834,7 @@ class _Proc:
         self.retired = False           # replaced or killed: drop its output, announce no exit
         self.started = time.monotonic()
         self.last_out = None           # when it last wrote anything
+        self.prompted = False          # it has drawn Claude Code's prompt glyph (so Claude Code is up)
 
 
 class TermSession:
@@ -2014,6 +2015,9 @@ class TermSession:
                 rec.last_out = time.monotonic()
                 if self.cur is rec:
                     self._append(data)
+                    # the glyph may be split between two reads
+                    if not rec.prompted and PROMPT_GLYPH in self.scrollback[-(len(data) + len(PROMPT_GLYPH) - 1):]:
+                        rec.prompted = True
                     self._broadcast(ws_frame(OP_BIN, data))
         rec.closed = True  # a writer waiting for room gives up and releases wlock
         with rec.wlock, self.lock:
@@ -2175,23 +2179,34 @@ class TermSession:
     def _wait_ready(self, rec, alive, waiting):
         """An ask in a session that has only just started waits until Claude Code can take it:
         it keeps text typed before its prompt is drawn, but drops the Enter. Ready once it has
-        drawn its prompt (or a menu, which the ask then refuses to answer) or, for an agent that
-        is not Claude Code, its output has been quiet for START_QUIET; never more than START_WAIT
-        after the agent started. `waiting()` is called once if it has waited a second. False if
-        the session ended or was replaced, or the browser went, meanwhile."""
+        drawn its prompt (or a menu, which the ask then refuses to answer).
+
+        For Claude Code (the agent is claude or claude-sandbox: ide_mode) nothing else will do:
+        claude-sandbox can be silent for long stretches while it makes its container, and a first
+        image pull takes minutes. An ask waits for it at most START_WAIT, then fails with nothing
+        typed. An agent that is not Claude Code never draws the prompt: it is ready once its
+        output has been quiet for START_QUIET, or START_WAIT after it started.
+
+        `waiting()` is called once if it has waited a second. Returns None when ready, else why
+        not (also when the session ended or was replaced, or the browser went, meanwhile)."""
+        claude = ide_mode() is not None
         told, since = False, time.monotonic()
         while True:
             with self.lock:
                 if self.cur is not rec:
-                    return False
-                last = rec.last_out
+                    return "The Claude session ended before it could take the question."
+                last, prompted = rec.last_out, rec.prompted
             now = time.monotonic()
-            if now - rec.started >= START_WAIT or self.prompt_state() is not None:
-                return True
-            if last is not None and now - last >= START_QUIET:
-                return True
+            if prompted:
+                return None
+            if claude:
+                if now - since >= START_WAIT:
+                    return ("Claude Code has not started yet (its prompt is not up), so the question was not sent: "
+                            "ask again once it is.")
+            elif now - rec.started >= START_WAIT or (last is not None and now - last >= START_QUIET):
+                return None
             if not alive():
-                return False
+                return "The Claude session ended before it could take the question."
             if not told and now - since >= 1:
                 told = True
                 waiting()
@@ -2212,8 +2227,9 @@ class TermSession:
         rec, bridge, why = self._ide()
         if why:
             return {"ok": False, "error": why}
-        if not self._wait_ready(rec, alive, waiting):
-            return {"ok": False, "error": "The Claude session ended before it could take the question."}
+        why = self._wait_ready(rec, alive, waiting)
+        if why:
+            return {"ok": False, "error": why}
         why = self._answer_pending(bridge)
         if why:
             return {"ok": False, "error": why}
@@ -2533,6 +2549,10 @@ IDE_ENTER_DELAY = 0.1        # seconds between pasting a question and pressing E
 IDE_LOCK_CHECK = 5           # seconds between checks that the lock file is still there
 IDE_RESEND = 0.5             # seconds after ide_connected that the selection is sent again
 IDE_DIFFS_MAX = 16           # proposed edits waiting for the user at once
+# The page answers a proposal with the whole (edited) file as JSON in one /api/term message,
+# which may be at most WS_MAX_MESSAGE (4 MiB): a proposal bigger than this as JSON is not shown,
+# so there is room for the user's edits, and an Accept always fits
+IDE_DIFF_MAX = 3 << 20
 IDE_CONNS_MAX = 8            # connections to the listener at once (Claude needs one)
 IDE_HANDSHAKE = env_seconds("MDEDIT_IDE_HANDSHAKE", 10)  # seconds a connection has to send its upgrade
 # Proposed edits are numbered `<this process's salt>-<n>`: a page that outlives an md-editor (it
@@ -2540,9 +2560,10 @@ IDE_HANDSHAKE = env_seconds("MDEDIT_IDE_HANDSHAKE", 10)  # seconds a connection 
 DIFF_SALT = secrets.token_hex(4)
 DIFF_IDS = itertools.count(1)
 # An ask that comes while the agent is starting waits until Claude Code can take it (Claude Code
-# keeps text typed before its prompt is up, but drops the Enter): until it draws its prompt, or
-# its output has been quiet for START_QUIET, for at most START_WAIT after it was spawned.
-START_WAIT = 20
+# keeps text typed before its prompt is up, but drops the Enter): until it draws its prompt, for
+# at most START_WAIT (then it fails); an agent that is not Claude Code, until its output has been
+# quiet for START_QUIET, for at most START_WAIT after it was spawned (_wait_ready).
+START_WAIT = env_seconds("MDEDIT_START_WAIT", 20)
 START_QUIET = env_seconds("MDEDIT_START_QUIET", 2)
 PROMPT_GLYPH = "❯".encode()  # Claude Code's prompt, and the cursor of its menus
 # what follows the glyph when it marks a menu's choice ("❯ 1. Yes"); its input box has a no-break
@@ -2660,6 +2681,8 @@ def pid_alive(pid):
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
+    except (OverflowError, ValueError):  # no process can have it (a lock may say anything)
+        return False
     except OSError:  # EPERM: someone else's
         pass
     return True
@@ -2676,7 +2699,7 @@ def read_lock(name, dir_fd=None):
             data = json.loads(os.read(fd, 1 << 16).decode("utf-8"))
         finally:
             os.close(fd)
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):  # RecursionError: nested too deep to parse
         return None
     return data if isinstance(data, dict) else None
 
@@ -2698,38 +2721,48 @@ def sweep_ide_locks():
         except OSError:
             continue
         try:
-            names = os.listdir(dfd)
-        except OSError:
-            names = []
-        for name in names:
-            m = re.fullmatch(r"([0-9]+)\.lock", name)
-            if not m:
-                continue
-            data = read_lock(name, dfd)
-            if data is None or data.get("ideName") != "md-editor":
-                continue
-            pid = data.get("mdEditorHostPid")
-            if type(pid) is not int or pid <= 0 or (pid != os.getpid() and pid_alive(pid)):
-                continue
-            folders = data.get("workspaceFolders")
-            sock = None
-            if isinstance(folders, list) and folders and isinstance(folders[0], str) and os.path.isabs(folders[0]):
-                sock = os.path.join(folders[0], f".md-editor-ide-{m.group(1)}.sock")
-                try:
-                    if not stat.S_ISSOCK(os.lstat(sock).st_mode):
-                        sock = None
-                except (OSError, ValueError):
-                    sock = None
-            if sock and socket_alive(sock):  # someone's link is live there: not stale, whatever it says
-                continue
-            remove_file(name, dfd)
-            print(f"[ide] removed a stale lock file: {os.path.join(d, name)}", flush=True)
             try:
-                if sock and stat.S_ISSOCK(os.lstat(sock).st_mode):
-                    os.unlink(sock)
+                names = os.listdir(dfd)
             except OSError:
-                pass
-        os.close(dfd)
+                names = []
+            for name in names:
+                m = re.fullmatch(r"([0-9]+)\.lock", name)
+                if not m:
+                    continue
+                try:  # whatever one lock holds, md-editor starts
+                    _sweep_lock(d, dfd, name, m.group(1))
+                except Exception as exc:
+                    print(f"[ide] could not check lock file {os.path.join(d, name)}: {type(exc).__name__}", flush=True)
+        finally:
+            os.close(dfd)
+
+
+def _sweep_lock(d, dfd, name, port):
+    """sweep_ide_locks for one lock file `name` in folder d (open as dfd)."""
+    data = read_lock(name, dfd)
+    if data is None or data.get("ideName") != "md-editor":
+        return
+    pid = data.get("mdEditorHostPid")
+    if type(pid) is not int or pid <= 0 or (pid != os.getpid() and pid_alive(pid)):
+        return
+    folders = data.get("workspaceFolders")
+    sock = None
+    if isinstance(folders, list) and folders and isinstance(folders[0], str) and os.path.isabs(folders[0]):
+        sock = os.path.join(folders[0], f".md-editor-ide-{port}.sock")
+        try:
+            if not stat.S_ISSOCK(os.lstat(sock).st_mode):
+                sock = None
+        except (OSError, ValueError):
+            sock = None
+    if sock and socket_alive(sock):  # someone's link is live there: not stale, whatever it says
+        return
+    remove_file(name, dfd)
+    print(f"[ide] removed a stale lock file: {os.path.join(d, name)}", flush=True)
+    try:
+        if sock and stat.S_ISSOCK(os.lstat(sock).st_mode):
+            os.unlink(sock)
+    except OSError:
+        pass
 
 
 def inside(path, folder):
@@ -2876,6 +2909,12 @@ def paste_bytes(text):
     except UnicodeEncodeError:
         data = text.encode("utf-8", "replace")
     return b"\x1b[200~" + data + b"\x1b[201~"
+
+
+def json_size(text):
+    """The bytes of str `text` as a JSON string, as a browser's JSON.stringify writes it: UTF-8,
+    with quotes, backslashes, control characters and lone surrogates escaped."""
+    return len(json.dumps(text, ensure_ascii=False).encode("utf-8", "backslashreplace"))
 
 
 def rpc_result(rid, result):
@@ -3129,7 +3168,7 @@ class IdeBridge:
             return
         try:
             msg = json.loads(payload.decode("utf-8"))
-        except ValueError:
+        except (ValueError, RecursionError):  # RecursionError: nested too deep to parse
             conn.send(rpc_error(None, -32700, "parse error"))
             return
         if not isinstance(msg, dict):
@@ -3146,7 +3185,11 @@ class IdeBridge:
         params = msg.get("params")
         params = params if isinstance(params, dict) else {}
         if "id" not in msg:
-            return self._notification(conn, method, params)
+            try:
+                self._notification(conn, method, params)
+            except Exception:  # a bug: the link stays up
+                traceback.print_exc()
+            return
         try:
             out = self._request(conn, rid, method, params)
         except Exception as exc:  # a bug: still answer
@@ -3245,8 +3288,8 @@ class IdeBridge:
                 why = f"md-editor shows changes to files in {self.cwd} only"
             elif ".git" in Path(os.path.relpath(real, self.cwd)).parts:
                 why = "md-editor does not show changes inside .git"
-            elif len(contents) > TEXT_MAX:
-                why = "the file is too large for md-editor to show"
+            elif json_size(contents) > IDE_DIFF_MAX:
+                why = "the proposed file is too large for md-editor to show"
             else:
                 disk, exists = read_inside(real, self.cwd)  # never through a link swapped in since
                 if disk is None:
@@ -3831,7 +3874,7 @@ class Handler(WSReader, SimpleHTTPRequestHandler):
                 client.writing = False
         try:
             msg = json.loads(payload.decode("utf-8"))
-        except ValueError:  # includes UnicodeDecodeError
+        except (ValueError, RecursionError):  # includes UnicodeDecodeError; nested too deep
             return
         if not isinstance(msg, dict):
             return

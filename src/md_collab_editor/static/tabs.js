@@ -61,9 +61,10 @@
 //   Tabs.autosave(category) → bool     the autosave setting for 'md' / 'other'
 //   Tabs.hold(path, {msg, actions}) → release()   while Claude's proposed change to a file
 //                                      waits for an answer (proposal.js): its tab is read-only
-//                                      under a banner (msg, [[label, fn]…]) and it is not
-//                                      saved, so nothing races Claude's own write. Also for a
-//                                      file opened later; holds stack. Tabs.held(model) → bool
+//                                      under a banner (msg, [[label, fn]…]; msg may be a
+//                                      function of the model) and it is not saved, so nothing
+//                                      races Claude's own write. Also for a file opened later;
+//                                      holds stack. Tabs.held(model) → bool
 //   Tabs.on(event, fn) → off()         events:
 //       'activate' (tab, prevTab)   'deactivate' (tab)   'open' (tab)   'close' (tab)
 //       'change' (model, change)    any edit of a model's doc (also from linked docs)
@@ -522,7 +523,8 @@ const Tabs = (() => {
     const m = activeModel();
     const banner = m && (m.banner || (heldBy(m) || {}).banner);
     if (!banner) { el.hidden = true; return; }
-    el.replaceChildren(Object.assign(document.createElement('span'), { textContent: banner.msg }));
+    const msg = typeof banner.msg === 'function' ? banner.msg(m) : banner.msg;
+    el.replaceChildren(Object.assign(document.createElement('span'), { textContent: msg }));
     for (const [label, fn] of banner.actions || []) {
       const b = Object.assign(document.createElement('button'), { type: 'button', textContent: label });
       b.onclick = fn;

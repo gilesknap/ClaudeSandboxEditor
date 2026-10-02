@@ -34,6 +34,9 @@ const Proposals = (() => {
   const svg = body => `<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round">${body}</svg>`;
   const ICON = { up: svg('<path d="M8 13V3M3.5 7.5 8 3l4.5 4.5"/>'), down: svg('<path d="M8 3v10M3.5 8.5 8 13l4.5-4.5"/>') };
   const HOLD_AFTER_ACCEPT = 4000;   // ms the file stays read-only after Accept, until Claude writes it
+  // bytes of an Accept's text as JSON: the answer goes in one /api/term message, and the server
+  // closes the socket on one over 4 MiB (WS_MAX_MESSAGE); it shows proposals of at most 3 MiB
+  const ANSWER_MAX = (4 << 20) - 4096;
 
   const shown = new Map();   // id → proposal
   const done = new Set();    // ids answered or withdrawn here
@@ -49,7 +52,8 @@ const Proposals = (() => {
     if (p.release) { p.release(); p.release = null; }
     if (!p.path) return;
     p.release = Tabs.hold(p.path, {
-      msg: `Claude has proposed a change to ${p.name}: it stays read-only until you accept or reject it.`,
+      msg: m => `Claude has proposed a change to ${p.name}: it stays read-only until you accept or reject it.`
+        + (m.dirty ? ' Its unsaved changes here are not in the proposal, which is compared with the file on disk.' : ''),
       actions: [['Show the proposed change', () => { if (!p.tab.closed) Tabs.activate(p.tab); }]],
     });
   }
@@ -128,7 +132,8 @@ const Proposals = (() => {
     title.textContent = `✻ ${p.path || p.abs}`;
     title.title = p.abs;
     view.querySelector('.diff-base').textContent = p.isNew ? 'a new file, proposed by Claude' : 'proposed by Claude';
-    view.querySelector('.proposal-note').textContent = `Left: the file now. Right: Claude's version, which you can edit (the arrows put a change back). Accept lets Claude write the right-hand side; Reject tells Claude no.`;
+    p.el.note = view.querySelector('.proposal-note');
+    note(p);
     p.el.head.addEventListener('click', e => {
       const b = e.target.closest('button');
       if (!b) return;
@@ -146,6 +151,16 @@ const Proposals = (() => {
       if (e.shiftKey) reject(p); else accept(p);
     });
     build(p);
+  }
+
+  // what the sides are; the left is the file on disk, which is not what its tab shows when that
+  // has unsaved changes (held, they wait for the answer)
+  function note(p) {
+    const m = p.path && Tabs.model(p.path);
+    p.el.note.textContent = (m && m.dirty
+      ? 'Left: the file on disk, without the unsaved changes in its tab. '
+      : 'Left: the file now. ')
+      + `Right: Claude's version, which you can edit (the arrows put a change back). Accept lets Claude write the right-hand side; Reject tells Claude no.`;
   }
 
   // CodeMirror measures what it shows, so the view is made while its tab is on screen
@@ -173,6 +188,7 @@ const Proposals = (() => {
   }
 
   function show(p) {
+    if (p.el) note(p);
     if (!p.built) { build(p); return; }
     const ed = p.mv.editor(), orig = p.mv.leftOriginal();
     ed.refresh();
@@ -226,6 +242,10 @@ const Proposals = (() => {
     if (p.answered || !p.doc) return;
     const contents = p.doc.getValue();
     if (contents === p.old) { UI.toast('The right-hand side is the same as the file: nothing to accept.'); return; }
+    if (new TextEncoder().encode(JSON.stringify(contents)).length > ANSWER_MAX) {
+      UI.toast('The right-hand side is too large to send back to Claude (over 4 MB): shorten it, or reject the change.', { kind: 'err' });
+      return;
+    }
     answer(p, { accept: true, contents });
     // Claude writes the file next: keep it read-only until the change arrives (or a moment)
     const release = p.release;

@@ -55,19 +55,19 @@ def cfg(tmp_path_factory):
 
 
 def fake_claude(d):
-    """bash, called claude (so md-editor runs it natively, with the IDE link on TCP)."""
+    """bash, called claude (so md-editor runs it natively, with the IDE link on TCP). It first
+    draws Claude Code's prompt glyph, as Claude Code does once it is up: an ask in a session just
+    started waits for that."""
     d.mkdir(parents=True, exist_ok=True)
     claude = d / "claude"
-    claude.write_text("#!/bin/sh\nexec bash --norc --noprofile -i\n", encoding="utf-8")
+    claude.write_text("#!/bin/sh\nprintf '\\342\\235\\257\\302\\240\\r\\n'\nexec bash --norc --noprofile -i\n",
+                      encoding="utf-8")
     claude.chmod(0o755)
     return str(claude)
 
 
 def server_env(cfg):
-    # bash draws no Claude Code prompt, so an ask in a session just started waits until its
-    # output has been quiet for MDEDIT_START_QUIET: short here
-    return dict(SERVER_ENV, HISTFILE=os.devnull, CLAUDE_CONFIG_DIR=str(cfg), MDEDIT_IDE_LINK="auto",
-                MDEDIT_START_QUIET="0.5")
+    return dict(SERVER_ENV, HISTFILE=os.devnull, CLAUDE_CONFIG_DIR=str(cfg), MDEDIT_IDE_LINK="auto")
 
 
 @pytest.fixture(scope="module")
@@ -420,6 +420,32 @@ def test_accepting_a_proposed_edit_hands_back_the_edited_text(page, ide, doc):
     page.wait_for_function("() => App.cm.getValue().includes('Added in the diff.')")
     page.wait_for_function("() => !App.cm.getOption('readOnly')")
     expect(page.locator("#banner")).to_be_hidden()
+
+
+def test_a_proposal_over_unsaved_edits_says_so_and_a_too_large_accept_waits(page, ide, doc):
+    """The proposal is compared with the file on disk: when the file's tab has unsaved changes
+    (held, they wait for the answer), its banner and the proposal say so. An Accept whose text
+    is too large for one message to md-editor (4 MiB) is refused in the page: the proposal stays
+    open and waiting, and can still be answered."""
+    page.evaluate("() => App.cm.replaceRange('Unsaved.\\n', {line: 0, ch: 0})")
+    rid, tab_name = open_diff(ide, doc, PROPOSED)
+    expect(proposal_tab(page)).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator(".proposal-tab .proposal-note")).to_contain_text("without the unsaved changes in its tab")
+    file_tab(page).click()
+    expect(page.locator("#banner")).to_contain_text("unsaved changes here are not in the proposal")
+    page.locator("#banner").get_by_role("button", name="Show the proposed change").click()
+    expect(page.locator(".proposal-tab .CodeMirror-merge")).to_be_visible()
+    page.evaluate(f"() => {right_side(page)}.setValue(('x'.repeat(999) + '\\n').repeat(4500))")
+    page.locator(".proposal-tab").get_by_role("button", name="Accept").click()
+    expect(page.locator("#toast")).to_contain_text("too large to send back to Claude")
+    page.wait_for_timeout(300)
+    assert ide.response(rid) is None, "still waiting"
+    expect(proposal_tab(page)).to_have_count(1)
+    page.locator(".proposal-tab").get_by_role("button", name="Reject").click()
+    assert ide.texts(rid) == ["DIFF_REJECTED", tab_name]
+    file_tab(page).click()
+    expect(page.locator("#banner")).to_be_hidden()
+    assert page.evaluate("() => App.cm.getValue()").startswith("Unsaved.\n# Session")
 
 
 def test_rejecting_or_closing_a_proposed_edit_says_no(page, ide, doc):
