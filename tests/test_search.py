@@ -1,12 +1,18 @@
 """Find in files: /api/search with git grep inside a work tree and a Python walk elsewhere. Both
 engines get the same files and must give the same answers: case, whole word, regex, include
 globs, the 2,000-match cap, invalid regexes, binary files and ROOT-relative paths."""
+import io
 import os
+import socket
+import threading
+import time
+import warnings
 from urllib.parse import urlencode
 
 import pytest
 
 from gitutil import SERVER_ENV, git, make_repo, open_root, write
+from helpers import marked_pids
 
 from md_collab_editor import server as S
 
@@ -129,6 +135,22 @@ def test_empty_and_multiline_queries(srv, ws):
     search(srv, engine, "a\nb", status=400)
 
 
+def test_bad_patterns_and_globs_get_an_answer(srv, ws):
+    """Whatever the query, the page gets a JSON answer: re.compile's OverflowError and
+    RecursionError, a bad [...] range in a glob and a thousand {…} groups used to drop the
+    connection with a traceback."""
+    engine, _ = ws
+    for q in ("a{4294967296}", "(" * 2000 + "a" + ")" * 2000):
+        if engine == "git" and not S.git_pcre() and q.startswith("("):
+            continue  # git -E may take it
+        assert search(srv, engine, q, status=400, regex=True)["error"].startswith("invalid regular expression")
+    if engine == "walk":
+        assert search(srv, engine, "foo", status=400, glob="[z-a]")["error"].startswith("invalid include glob")
+    else:
+        search(srv, engine, "foo", glob="[z-a]")  # git's own globs
+    assert search(srv, engine, "foo", glob="{a}" * 1000)["results"] == []
+
+
 # ---------------------------------------------------------------- engine-specific
 
 def test_git_engine_skips_ignored_and_keeps_paths_root_relative(srv, tmp_path):
@@ -138,6 +160,30 @@ def test_git_engine_skips_ignored_and_keeps_paths_root_relative(srv, tmp_path):
     open_root(srv, repo / "sub")
     res = search(srv, "git", "foo")
     assert sorted(h["path"] for h in res["results"]) == [".hidden/h.txt", "new.txt", "t.txt"]
+
+
+def test_git_engine_searches_tracked_files_that_match_an_ignore_rule(srv, tmp_path):
+    """git grep --untracked leaves out tracked files that an ignore rule matches (force-added
+    ones, or ones a global ignore names): tracked and untracked files are searched apart."""
+    repo = make_repo(tmp_path / "repo", {".gitignore": "build/\n*.log\n", "a.md": "needle\n"})
+    write(repo, {"build/keep.md": "needle\n", "important.log": "needle\n"})
+    git(repo, "add", "-f", "build/keep.md", "important.log")
+    git(repo, "commit", "-q", "-m", "forced")
+    write(repo, {"untracked.md": "needle\n", "x.log": "needle\n", "build/out.md": "needle\n"})
+    open_root(srv, repo)
+    for regex in (False, True):
+        res = search(srv, "git", "needle", regex=regex)
+        assert sorted(h["path"] for h in res["results"]) == ["a.md", "build/keep.md", "important.log", "untracked.md"]
+    res = search(srv, "git", "needle", glob="*.md")
+    assert sorted(h["path"] for h in res["results"]) == ["a.md", "build/keep.md", "untracked.md"]
+
+
+def test_git_engine_skips_files_over_5_mb(srv, tmp_path):
+    repo = make_repo(tmp_path / "repo", {"a.txt": "needle\n"})
+    with open(repo / "big.txt", "wb") as f:  # one huge line, as a minified bundle has
+        f.write(b"needle " * (S.TEXT_MAX // 7 + 1) + b"\n")
+    open_root(srv, repo)
+    assert [h["path"] for h in search(srv, "git", "needle")["results"]] == ["a.txt"]
 
 
 def test_git_engine_falls_back_to_gits_column_for_pcre_only_syntax(srv, tmp_path):
@@ -170,6 +216,66 @@ def test_a_git_ignored_root_is_walked(srv, tmp_path):
     assert srv.get("/api/allfiles")[1] == {"files": ["s.txt"], "truncated": False}
 
 
+# ---------------------------------------------------------------- a regex that never ends
+
+BACKTRACK = r"^\S|(\w+\s?)+$"   # matches at once for git's PCRE; Python's re backtracks for hours
+
+
+@pytest.fixture(scope="module")
+def quick_srv(shared_servers):
+    """A server whose searches give up after 3 s."""
+    return shared_servers.start(env=dict(SERVER_ENV, MDEDIT_SEARCH_TIMEOUT="3"))
+
+
+@pytest.mark.parametrize("engine", ["git", "walk"])
+def test_a_backtracking_regex_does_not_hold_up_the_server(quick_srv, tmp_path, engine):
+    """A regex search runs in a child process: other requests carry on, and the search ends with
+    a 504 at the time limit, its process killed (the fixture checks nothing is left running)."""
+    root = tmp_path / "ws"
+    files = {"prose.md": "word " * 40 + ".\n"}
+    make_repo(root, files) if engine == "git" else write(root, files)
+    open_root(quick_srv, root)
+    out = {}
+    t = threading.Thread(target=lambda: out.update(res=quick_srv.get("/api/search?" + urlencode({"q": BACKTRACK, "regex": "1"}))))
+    start = time.monotonic()
+    t.start()
+    time.sleep(0.5)
+    for _ in range(3):
+        t0 = time.monotonic()
+        assert quick_srv.post("/api/stat", {"paths": ["prose.md"]})[0] == 200
+        assert time.monotonic() - t0 < 1, "the server is stuck behind the search"
+    t.join(20)
+    assert out["res"][0] == 504 and out["res"][1]["error"] == "the search took too long"
+    assert time.monotonic() - start < 10
+    if marked_pids(quick_srv.tag):
+        deadline = time.monotonic() + 5
+        while len(marked_pids(quick_srv.tag)) > 1 and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert len(marked_pids(quick_srv.tag)) == 1, "only the server itself is left"
+
+
+def test_a_search_stops_when_the_page_gives_up_on_it(srv, tmp_path):
+    """search.js drops a search that a newer one replaces: the server notices the closed
+    connection and kills the search's process rather than letting it run for its full minute."""
+    root = tmp_path / "ws"
+    write(root, {"prose.md": "word " * 40 + ".\n"})
+    open_root(srv, root)
+    if not marked_pids(srv.tag):
+        pytest.skip("needs /proc to see the search's process")
+    sock = socket.create_connection(("127.0.0.1", srv.port))
+    sock.sendall(f"GET /api/search?{urlencode({'q': BACKTRACK, 'regex': '1'})} HTTP/1.1\r\nHost: {srv.host}\r\n\r\n".encode())
+    deadline = time.monotonic() + 10
+    while len(marked_pids(srv.tag)) < 2 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(marked_pids(srv.tag)) >= 2, "the search's process started"
+    sock.close()
+    deadline = time.monotonic() + 5
+    while len(marked_pids(srv.tag)) > 1 and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert len(marked_pids(srv.tag)) == 1, "and was killed when the page went away"
+    assert srv.get("/api/search?q=word")[0] == 200
+
+
 # ---------------------------------------------------------------- units
 
 def test_globs():
@@ -186,6 +292,32 @@ def test_globs():
     assert match("**/deep", "sub/deep/c.md") and match("f?.[ch]", "f1.c") and not match("f?.[!ch]", "f1.c")
     with pytest.raises(ValueError):
         S.glob_parts("{" + ",".join("abcdefghij") + "}{" + ",".join("abcdefghij") + "}")
+    assert S.glob_parts("x{a}" * 1000) == [("**/" + "xa" * 1000, False)], "a loop, not a RecursionError"
+    assert S.expand_braces("{a,b}{c,d}") == ["ac", "ad", "bc", "bd"]
+    with warnings.catch_warnings():  # no "possible nested set" FutureWarnings from re
+        warnings.simplefilter("error")
+        for g, yes, no in (("[&&]", "&", "a"), ("[a-]", "-", "b"), ("[[:]", ":", "a"), ("[!--]", "a", "-"),
+                           ("[\\]", "\\", "a"), ("[~~||]", "|", "a")):
+            assert match(g, yes) and not match(g, no), g
+    with pytest.raises(S.re.error):
+        S.glob_re("[z-a]")
+
+
+def test_grep_records_reads_long_lines_in_one_pass():
+    class Stream:   # a pipe that hands over a few KiB at a time
+        def __init__(self, data, n):
+            self.f, self.n = io.BytesIO(data), n
+
+        def read1(self, _):
+            return self.f.read(self.n)
+    out = b"a.txt\x001\x003\x00foo\nsub/b\x0012\x001\x00bar baz\n"
+    for n in range(1, 9):   # every way of splitting the records between reads
+        assert list(S.grep_records(Stream(out, n))) == [(b"a.txt", b"1", b"3", b"foo"), (b"sub/b", b"12", b"1", b"bar baz")]
+    big = b"x\x001\x001\x00" + b"y" * (30 << 20) + b"\nz\x002\x001\x00end\n"
+    t = time.monotonic()
+    recs = list(S.grep_records(Stream(big, 4096)))
+    assert time.monotonic() - t < 5, "linear, not quadratic, in the line's length"
+    assert [(r[0], len(r[3])) for r in recs] == [(b"x", S.LINE_MAX), (b"z", 3)]
 
 
 def test_search_pattern_and_spans():
@@ -194,4 +326,5 @@ def test_search_pattern_and_spans():
     assert S.line_spans(S.search_pattern("o", False, False, False), "foo") == [(1, 2), (2, 3)]
     assert S.line_spans(S.search_pattern("^", True, False, False), "abc") == [(0, 0)]
     assert S.line_spans(S.search_pattern("z", False, False, False), "abc") is None
+    assert len(S.line_spans(S.search_pattern("a", False, False, False), "a" * 10000)) == S.SEARCH_MAX + 1
     assert S.js_len("a\U0001F642b") == 4

@@ -115,6 +115,51 @@ def stat(srv, paths=(), dirs=()):
     return res
 
 
+def test_symlink_loops_get_an_answer(srv, ws, monkeypatch):
+    """Python 3.9-3.12's resolve() raises RuntimeError on a symlink loop, which dropped the
+    connection (or failed the whole /api/stat poll with a 502)."""
+    os.symlink("loop", ws / "loop")
+    os.symlink("b", ws / "a")
+    os.symlink("a", ws / "b")
+    write(ws, {"ok.md": "ok\n"})
+    assert names(tree(srv)) == ["a", "b", "loop", "ok.md"]
+    for path in ("loop", "a"):
+        assert get(srv, "/api/file", path=path)[0] in (400, 404)
+        assert get(srv, "/api/tree", dir=path)[0] in (400, 404)
+        assert srv.get(f"/raw/{path}")[0] in (400, 404)
+        assert srv.put("/api/file", {"path": path, "text": "x"})[0] in (400, 404, 500)
+        assert srv.post("/api/new", {"path": f"{path}/x.md"})[0] in (400, 404, 500)
+    status, res = srv.post("/api/stat", {"paths": ["loop", "ok.md"], "dirs": ["loop", ""]})
+    assert status == 200 and res["versions"]["loop"] == "0" and res["versions"]["ok.md"] != "0"
+    assert res["dirs"]["loop"] == "0"
+    # whatever this Python does with the loop itself
+    monkeypatch.setattr(S, "ROOT", ws)
+    monkeypatch.setattr(S.Path, "resolve", lambda self, strict=False: (_ for _ in ()).throw(RuntimeError("Symlink loop")))
+    with pytest.raises(ValueError, match="symlink loop"):
+        S.safe_path("loop")
+    with pytest.raises(ValueError, match="symlink loop"):
+        S.safe_path("loop/x", follow=False)
+
+
+def test_file_names_that_are_not_utf8(srv, ws):
+    """Such a name is listed with lone surrogates (Python's surrogateescape), and the page sends
+    those back as the original bytes, %-escaped."""
+    with open(os.path.join(os.fsencode(ws), b"lat\xe9.md"), "w") as f:
+        f.write("# Latin-1\n")
+    os.mkdir(os.path.join(os.fsencode(ws), b"dir\xe9"))
+    with open(os.path.join(os.fsencode(ws), b"dir\xe9", b"in.md"), "w") as f:
+        f.write("inside\n")
+    assert names(tree(srv)) == ["dir\udce9", "lat\udce9.md"]
+    status, res = srv.get("/api/file?path=lat%E9.md")
+    assert status == 200 and res["text"] == "# Latin-1\n" and res["path"] == "lat\udce9.md"
+    status, res = srv.get("/api/tree?dir=dir%E9")
+    assert status == 200 and res["entries"][0]["path"] == "dir\udce9/in.md"
+    assert srv.get("/raw/dir%E9/in.md") == (200, b"inside\n")
+    status, res = srv.put("/api/file", {"path": "lat\udce9.md", "text": "saved\n"})
+    assert status == 200
+    assert open(os.path.join(os.fsencode(ws), b"lat\xe9.md")).read() == "saved\n"
+
+
 def test_stat_versions_match_the_file_api(srv, ws, tmp_path):
     write(ws, {"a.md": "# a\n", "d/b.txt": "b"})
     (tmp_path / "outside.txt").write_text("x")
@@ -135,8 +180,17 @@ def test_stat_dir_stamps_change_when_entries_come_and_go(srv, ws):
     second = stat(srv, dirs=["", "d"])["dirs"]
     assert second["d"] != first["d"]
     (ws / "d" / "y.txt").unlink()
+    assert stat(srv, dirs=["d"])["dirs"]["d"] == first["d"]
+    # a file saved in it does not change the folder's rows, so not its stamp either (the page
+    # would list the folder again after every save) ...
     os.utime(ws / "d" / "x.txt", ns=(5, 5))
-    assert stat(srv, dirs=["d"])["dirs"]["d"] not in (first["d"], second["d"])
+    (ws / "d" / "x.txt").write_text("changed")
+    assert stat(srv, dirs=["d"])["dirs"]["d"] == first["d"]
+    # ... except a .gitignore, which decides what is ignored there
+    write(ws, {"d/.gitignore": "x.txt\n"})
+    third = stat(srv, dirs=["d"])["dirs"]["d"]
+    os.utime(ws / "d" / ".gitignore", ns=(5, 5))
+    assert stat(srv, dirs=["d"])["dirs"]["d"] not in (first["d"], third)
     top = stat(srv, dirs=[""])["dirs"][""]
     os.mkdir(ws / ".git")  # never listed, so never counted
     assert stat(srv, dirs=[""])["dirs"][""] == top

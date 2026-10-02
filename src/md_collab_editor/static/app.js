@@ -816,7 +816,7 @@ function closeBrowser() { $('#browser').hidden = true; cm.focus(); }
 async function browseTo(dir) {
   const msg = $('#browser-msg');
   try {
-    browseState = await api('GET', `/api/browse?dir=${encodeURIComponent(dir)}`);
+    browseState = await api('GET', `/api/browse?dir=${UI.encPath(dir)}`);
   } catch (e) {
     msg.textContent = e.message;
     msg.className = 'err';
@@ -935,7 +935,7 @@ async function exportPdf() {
     if (wasDark) { MD.initMermaid(true); renderPreview(); }
     const r = await api('POST', '/api/pdf', { path: cur.path, html });
     setSaveState(`Exported ${r.pdf} (${Math.round(r.bytes / 1024)} KB)`, 'ok');
-    const a = Object.assign(document.createElement('a'), { href: `/api/download?path=${encodeURIComponent(r.pdf)}`, download: r.pdf.split('/').pop() });
+    const a = Object.assign(document.createElement('a'), { href: `/api/download?path=${UI.encPath(r.pdf)}`, download: r.pdf.split('/').pop() });
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -958,12 +958,13 @@ function setView(mode) {
   setTimeout(() => { cm.refresh(); renderPreview(); }, 0);
 }
 $('#toggle-files').onclick = () => Activity.setSidebar(!Activity.sidebarOn());
-Activity.onLayout(() => cm.refresh());
+Activity.onLayout(() => { fitColumns(); cm.refresh(); });
 // A narrow window has room for one overlay: showing this panel hides the side bar (and
 // activity.js does the reverse).
 function showClaudePanel() {
   document.body.classList.remove('no-claude');
   if (matchMedia('(max-width: 800px)').matches && Activity.sidebarOn()) Activity.setSidebar(false, false);
+  fitColumns();
 }
 $('#toggle-claude').onclick = () => {
   if (document.body.classList.contains('no-claude')) showClaudePanel();
@@ -989,7 +990,7 @@ $('#model').onchange = () => store.set('mdedit.model', $('#model').value);
 // unsaved files: autosaved ones are saved now, and the browser asks before leaving
 window.addEventListener('beforeunload', e => {
   if (!Tabs.anyDirty()) return;
-  for (const m of Tabs.models()) if (m.dirty && Tabs.autosave(m.category)) Tabs.save(m);
+  for (const m of Tabs.models()) if (m.dirty && Tabs.autosave(m.category)) Tabs.save(m, false, true);   // not deleted ones
   e.preventDefault();
   e.returnValue = '';
 });
@@ -1027,13 +1028,22 @@ window.App = {
 };
 
 const PANEL_MIN = 280;
+const EDITOR_MIN = 240;   // what the Claude panel and the side bar always leave the editor
 const defaultPanelWidth = () => Math.max(360, Math.min(innerWidth * 0.4, 640));
 function setPanelWidth(w, persist) {
-  w = Math.round(Math.max(PANEL_MIN, Math.min(innerWidth * 0.75, w)));
+  // a narrow window shows the side bar or the panel over the editor, one at a time
+  const side = !matchMedia('(max-width: 800px)').matches && Activity.sidebarOn() ? $('#sidebar').getBoundingClientRect().width : 0;
+  const max = Math.min(innerWidth * 0.75, innerWidth - $('#activity-bar').getBoundingClientRect().width - side - EDITOR_MIN);
+  w = Math.round(Math.max(PANEL_MIN, Math.min(max, w)));
   panel.style.width = w + 'px';
   if (persist) store.set('mdedit.panelWidth', String(w));
 }
 const applyPanelWidth = () => setPanelWidth(+store.get('mdedit.panelWidth', 0) || defaultPanelWidth());
+// the remembered widths, as far as the window has room: the panel's first, then the side bar's
+function fitColumns() {
+  applyPanelWidth();
+  Activity.fit();
+}
 applyPanelWidth();
 window.addEventListener('resize', applyPanelWidth);
 
@@ -1072,6 +1082,7 @@ $('#panel-resize').addEventListener('dblclick', () => {
   setTheme(saved ? saved === 'dark' : matchMedia('(prefers-color-scheme: dark)').matches);
   setView(store.get('mdedit.view', innerWidth < 800 ? 'edit' : 'split'));
   if (innerWidth < 1100) document.body.classList.add('no-claude');   // activity.js decides the side bar
+  fitColumns();
 
   const conf = await api('GET', '/api/config');
   skills = conf.skills;

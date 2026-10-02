@@ -394,7 +394,7 @@ const Search = (() => {
   let focusI = -1;
   let last = null;        // {q, truncated, engine} of the results on screen; null: none
   let collapsedPaths = new Set();
-  let searchT = null, busy = false, again = false, epoch = 0, error = null;
+  let searchT = null, busy = false, again = false, epoch = 0, error = null, ctrl = null;
 
   const handle = Activity.register('search', {
     panelEl: view,
@@ -434,9 +434,12 @@ const Search = (() => {
     clearTimeout(searchT);
     saveSettings();
     const q = qEl.value;
-    if (!q) { epoch++; error = null; box.classList.remove('bad'); setResults(null); return; }
-    if (busy) { again = true; return; }
+    if (!q) { epoch++; ctrl?.abort(); error = null; box.classList.remove('bad'); setResults(null); return; }
+    // a newer search replaces the one under way: dropping its request makes the server stop it
+    // (a regex that backtracks could otherwise run for a minute)
+    if (busy) { again = true; ctrl?.abort(); return; }
     busy = true;
+    ctrl = new AbortController();
     const ep = ++epoch;
     const params = new URLSearchParams({
       q, regex: opts.regex ? '1' : '0', case: opts.case ? '1' : '0', word: opts.word ? '1' : '0', glob: globEl.value.trim(),
@@ -444,7 +447,7 @@ const Search = (() => {
     view.classList.add('busy');
     renderMsg('Searching…');
     let res = null, err = null;
-    try { res = await UI.api('GET', '/api/search?' + params); } catch (e) { err = e; }
+    try { res = await UI.api('GET', '/api/search?' + params, null, { signal: ctrl.signal }); } catch (e) { err = e; }
     busy = false;
     view.classList.remove('busy');
     if (again) { again = false; run(); return; }

@@ -126,7 +126,7 @@ const Explorer = (() => {
         if (epoch === rootEpoch && s.dirs && dir in s.dirs) stamps.set(dir, s.dirs[dir]);
       } catch {}
       try {
-        const r = await UI.api('GET', `/api/tree?dir=${encodeURIComponent(dir)}&all=${showAll ? 1 : 0}`);
+        const r = await UI.api('GET', `/api/tree?dir=${UI.encPath(dir)}&all=${showAll ? 1 : 0}`);
         if (epoch !== rootEpoch || fs.nodes.get(dir) !== node) return;
         changed = setChildren(fs, dir, r.entries || []);
       } catch (e) {
@@ -350,6 +350,13 @@ const Explorer = (() => {
         const from = cur.rename;
         const to = (parentOf(from) ? parentOf(from) + '/' : '') + name;
         if (to !== from) {
+          const held = Tabs.renameBlocked(from, to);
+          if (held) {   // it was deleted on disk; moving something there would lose its unsaved changes
+            delete box.dataset.busy;
+            bad(box, `${held} is open with unsaved changes: save or close it first`);
+            box.focus();
+            return;
+          }
           const r = await UI.api('POST', '/api/rename', { from, to });
           const dest = r.path || to;
           Tabs.renamePath(from, dest);
@@ -492,7 +499,7 @@ const Explorer = (() => {
         { label: 'Collapse all', action: collapseAll },
         '-',
         { label: 'Copy path', action: () => copy(abs('')) },
-        { label: 'Send to Claude terminal', action: () => UI.sendToTerminal('.') },
+        { label: 'Send to Claude terminal', action: () => UI.sendToTerminal('') },
       ], x, y);
       return;
     }
@@ -625,6 +632,7 @@ const Explorer = (() => {
         break;
       case 'F2': if (n) startRename(n.path); break;
       case 'Delete': if (n) remove(n.path); break;
+      case '@': if (n) UI.sendToTerminal(n.path); break;
       case 'ContextMenu': {
         const row = tree.querySelector('.tree-row.focus') || tree;
         const b = row.getBoundingClientRect();

@@ -76,7 +76,7 @@ The terminal needs Linux or macOS, because it runs on a pseudo-terminal. Only th
 
 ## Working with Claude Code in a terminal
 
-Documents are plain files on disk. When Claude Code, or anything else, edits a file that is open in a tab, the editor updates within about a second and briefly flashes the changed text, whether or not that tab is the one on screen. If you had unsaved edits at that moment, a banner asks which version to keep; a file deleted on disk keeps its tab, struck through, until you close it or save it again. Markdown files are saved automatically shortly after you stop typing; other files are saved when you press <kbd>Ctrl</kbd>+<kbd>S</kbd> (see [Editing any file](#editing-any-file)).
+Documents are plain files on disk. When Claude Code, or anything else, edits a file that is open in a tab, the editor updates within about a second and briefly flashes the changed text, whether or not that tab is the one on screen. If you had unsaved edits at that moment, a banner asks which version to keep (and if you undo them, the file on disk is loaded). A file deleted or moved on disk keeps its tab, struck through, until you close it or save it again; it is only written back when you ask (<kbd>Ctrl</kbd>+<kbd>S</kbd>, or *Save to re-create it* in its banner), never by autosave, so Claude's `rm` or `git mv` sticks. Markdown files are saved automatically shortly after you stop typing; other files are saved when you press <kbd>Ctrl</kbd>+<kbd>S</kbd> (see [Editing any file](#editing-any-file)).
 
 ## Reviewing changes
 
@@ -90,7 +90,7 @@ The Explorer shows every file in the open folder as a tree, loading each folder 
 
 - The buttons above the tree make a new file or folder, refresh, collapse every folder and reveal the active file; **Open…** opens another folder and **+ New** makes a markdown file (a name without an extension gets `.md`).
 - Right-click a file or folder for New file, New folder, Rename, Delete (folders are deleted with everything in them, after a confirmation that says how many files that is), Copy relative path, Copy path and Send to Claude terminal.
-- With the tree focused, the arrow keys move and open or close folders, <kbd>Enter</kbd> opens a file, <kbd>Space</kbd> previews it without leaving the tree, <kbd>F2</kbd> renames and <kbd>Delete</kbd> deletes.
+- With the tree focused, the arrow keys move and open or close folders, <kbd>Enter</kbd> opens a file, <kbd>Space</kbd> previews it without leaving the tree, <kbd>F2</kbd> renames, <kbd>Delete</kbd> deletes and <kbd>@</kbd> sends the path to the Claude terminal.
 
 ### Tabs
 
@@ -109,9 +109,10 @@ Any text file can be edited, with syntax highlighting chosen from its name. Only
 **Source Control** in the activity bar lists the files that git sees as changed, each with a letter: **M** modified, **A** added, **D** deleted, **R** renamed, **U** untracked and **C** in conflict. The count is shown on its icon, and the Explorer shows the same letters (and a dot on folders with changes inside). The status bar shows the repository and its branch (`⎇ main`); click it to open the panel. The list keeps up with git by itself (every 2 seconds while the panel is open, every 10 seconds otherwise, and straight after you save), so you can watch what Claude is doing.
 
 - **Uncommitted** compares the working tree with HEAD, untracked files included, like VS Code's Changes list. **Branch** compares it with the commit where the branch left the default branch (`origin/HEAD`, else `main`, else `master`, as `git merge-base` finds it), so you can review everything done across several commits, as in a pull request. On the default branch itself, Branch says so and shows the uncommitted changes.
-- Only files in the open folder are listed; the panel says how many changes elsewhere in the repository it leaves out.
+- Only files in the open folder are listed; the panel says how many changes elsewhere in the repository it leaves out, and how many folders inside it hold a repository of their own (a cloned dependency, or a git worktree), which it doesn't list.
 - Click a file to open its diff in a preview tab, double-click to keep it open, and right-click for Open diff, Open file, Discard changes, Copy relative path, Reveal in Explorer and Send to Claude terminal. The buttons at the top move to the next or previous changed file and refresh the list; the arrow keys and <kbd>Enter</kbd> work in the list too.
 - **Discard changes** (Uncommitted only) asks first, then puts the file back as it is in HEAD, in git's index too; an untracked file is deleted. Unsaved edits to that file in the editor are lost as well. The editor never stages, commits or pushes.
+- md-editor runs git itself, on your machine and outside the sandbox that Claude runs in, while the sandbox can write the repository's `.git` folder. So it turns off everything a repository's configuration could make git run: the fsmonitor hook, hooks, submodules, and clean/smudge filters other than Git LFS's. Files that use another filter (nbstripout, say) may therefore be listed as changed when git itself would not list them. The filters are read from git's configuration just before each command that could run one, so something that kept rewriting `.git/config` could still get one in between.
 
 ### Diffs
 
@@ -132,7 +133,8 @@ Press <kbd>Ctrl</kbd>+<kbd>P</kbd> to go to a file by name. Type some of the let
 <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>F</kbd> opens the **Search** panel, filled in with the selected text when there is some. Results appear as you type, grouped by file, each with its line and the match highlighted. The buttons in the search box match case (**Aa**, <kbd>Alt</kbd>+<kbd>C</kbd>), whole words (**ab**, <kbd>Alt</kbd>+<kbd>W</kbd>) and regular expressions (**.\***, <kbd>Alt</kbd>+<kbd>R</kbd>). The box below limits the search to some files: globs separated by commas, such as `*.py, src/`, where `!` excludes (`!*.min.js`) and a name without a `/` matches in any folder.
 
 - Click a result to open its file in a preview tab with the match selected; the focus stays in the results, so the arrow keys move on through them. Double-click a result, or press <kbd>Enter</kbd>, to open it in the editor (a double-click also keeps the tab open). <kbd>Space</kbd> previews, Left and Right fold and unfold a file, and <kbd>Delete</kbd> dismisses a result. Right-click for Copy relative path, Reveal in Explorer and Send to Claude terminal.
-- In a git repository the search uses `git grep`, so it covers tracked and untracked files but not ignored or binary ones; elsewhere it reads every text file under 5 MB outside hidden folders. At most 2,000 matches are shown, and the panel says when there were more.
+- In a git repository the search uses `git grep`, so it covers tracked files (force-added ones that an ignore rule matches too) and untracked files that git doesn't ignore, but not binary files or files over 5 MB; elsewhere it reads every text file under 5 MB outside hidden folders. At most 2,000 matches are shown, and the panel says when there were more.
+- A search stops after a minute. A regular expression is matched in a separate process, so one that backtracks endlessly (`(\w+\s?)+$` on a long line, say) only costs that minute, and the search is stopped as soon as you change it.
 - The search, its options and the globs are remembered. Click ↻ to search again after files have changed.
 
 ### Send to the Claude terminal
@@ -155,7 +157,7 @@ The editor's right-click menu also has Ask Claude, Cut, Copy, Paste and Select a
 | <kbd>Alt</kbd>+<kbd>F5</kbd>, <kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>F5</kbd> | Next / previous change, in a diff or in a file with change bars |
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | Open another folder or file |
 | <kbd>Ctrl</kbd>+<kbd>J</kbd> | Ask Claude about the selection |
-| Arrows, <kbd>Enter</kbd>, <kbd>Space</kbd>, <kbd>F2</kbd>, <kbd>Delete</kbd> | Move, open, preview, rename and delete in the Explorer |
+| Arrows, <kbd>Enter</kbd>, <kbd>Space</kbd>, <kbd>F2</kbd>, <kbd>Delete</kbd>, <kbd>@</kbd> | Move, open, preview, rename, delete and send to the Claude terminal in the Explorer |
 
 On a Mac, use <kbd>Cmd</kbd> for <kbd>Ctrl</kbd> and <kbd>Option</kbd> for <kbd>Alt</kbd>; replace is <kbd>Cmd</kbd>+<kbd>Option</kbd>+<kbd>F</kbd>.
 
@@ -188,5 +190,6 @@ All code lives in `src/md_collab_editor/`:
 - `static/tabs.js`: editor tabs and open files (saving, autosave, changes on disk)
 - `static/explorer.js`: the Explorer's file tree
 - `static/scm.js`: the Source Control panel, diff tabs (CodeMirror's merge addon), discard, and the change bars in the gutter
+- `static/linediff.js`, `static/scm-worker.js`: line diffs (diff_match_patch), and a worker that works out the change bars off the main thread
 - `static/search.js`: quick open, the Search panel (find in files) and Send to Claude terminal from the editor
 - `static/term.js`: the side-panel terminal (xterm.js)

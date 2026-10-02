@@ -1,7 +1,7 @@
 // Shared front-end helpers for the IDE modules (activity.js, tabs.js, explorer.js, scm.js,
 // search.js) and app.js. Plain script, loaded before them all; exposes `UI`.
 //
-//   UI.api(method, url, body?)        → Promise<json>; throws Error with .status and .data
+//   UI.api(method, url, body?, {signal}?) → Promise<json>; throws Error with .status and .data
 //   UI.store.get(k, d) / .set(k, v)   localStorage that never throws; .json(k, d) / .setJson(k, v)
 //   UI.esc(s)                         HTML-escape
 //   UI.root()                         the open folder (absolute path), '' before /api/config
@@ -22,10 +22,13 @@
 //                                       poll (~1 s while the page is visible) for all watchers;
 //                                       results from before a root change are dropped.
 //     UI.stat.now()                   poll right away; UI.stat.bump() drops in-flight results
+//   UI.encPath(path)                  encodeURIComponent for a path the server listed (also one
+//                                       that is not UTF-8); use it for every ?path= and #hash
 //   UI.rawUrl(path, version?)         /raw/ URL of a ROOT-relative file
 //   UI.isMarkdown(path)               .md / .markdown
 //   UI.basename(path) / UI.dirname(path)
 //   UI.sendToTerminal(path, range?)   types "@path " or "@path#L1-5 " into the Claude terminal
+//                                       (path '': the open folder)
 //                                       (bracketed paste, no Enter), shows and focuses it.
 //                                       range: {from, to} 1-based line numbers. → Promise<bool>
 //                                       (waits up to 5 s for a terminal that is connecting)
@@ -41,10 +44,10 @@ const UI = (() => {
     setJson(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} },
   };
 
-  async function api(method, url, body) {
+  async function api(method, url, body, { signal } = {}) {
     const r = await fetch(url, {
       method, headers: body ? { 'Content-Type': 'application/json' } : {},
-      body: body ? JSON.stringify(body) : undefined,
+      body: body ? JSON.stringify(body) : undefined, signal,
     });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) { const err = new Error(data.error || r.statusText); err.status = r.status; err.data = data; throw err; }
@@ -265,14 +268,30 @@ const UI = (() => {
   const isMarkdown = p => /\.(md|markdown)$/i.test(p || '');
   const basename = p => (p || '').split('/').pop();
   const dirname = p => { const i = (p || '').lastIndexOf('/'); return i < 0 ? '' : p.slice(0, i); };
-  const rawUrl = (p, v) => '/raw/' + p.split('/').map(encodeURIComponent).join('/') + (v ? `?v=${encodeURIComponent(v)}` : '');
+  // A path for a URL. The server lists a file name that is not UTF-8 with lone surrogates
+  // U+DC80-U+DCFF (Python's surrogateescape), on which encodeURIComponent throws: each goes
+  // back as the byte it stands for (%80-%FF), which the server turns into the same name.
+  function encPath(p) {
+    p = String(p);
+    let out = '', from = 0;
+    for (let i = 0; i < p.length; i++) {
+      const c = p.charCodeAt(i);
+      if (c >= 0xdc80 && c <= 0xdcff && !(i > 0 && p.charCodeAt(i - 1) >= 0xd800 && p.charCodeAt(i - 1) <= 0xdbff)) {
+        out += encodeURIComponent(p.slice(from, i)) + '%' + (c - 0xdc00).toString(16).toUpperCase();
+        from = i + 1;
+      }
+    }
+    return out + encodeURIComponent(p.slice(from));
+  }
+  const rawUrl = (p, v) => '/raw/' + p.split('/').map(encPath).join('/') + (v ? `?v=${encodeURIComponent(v)}` : '');
 
   // ---------------------------------------------------------------- send to the Claude terminal
 
   async function sendToTerminal(path, range) {
     const T = window.Term;
-    window.App?.showTerminal?.();
+    // before showing the panel, which in a narrow window hides the side bar the user is in
     if (!T || !T.sendText || T.available?.() === false) { toast('The Claude terminal is not available.', { kind: 'err' }); return false; }
+    window.App?.showTerminal?.();
     // a terminal that was never on screen connects now: give it a moment
     const ended = () => ['exited', 'failed'].includes(T.state?.());
     for (let i = 0; i < 50 && !T.running() && !ended(); i++) await new Promise(r => setTimeout(r, 100));
@@ -280,11 +299,11 @@ const UI = (() => {
       toast(ended() ? 'The Claude session has ended: restart it in the terminal first.' : 'The Claude terminal is not running yet; try again when it has started.', { kind: 'err' });
       return false;
     }
-    const abs = (root.replace(/\/+$/, '') + '/' + path).replace(/\/+$/, '');
+    // path '' is the open folder itself
+    const abs = (root.replace(/\/+$/, '') + (path ? '/' + path : '')).replace(/\/+$/, '');
     const cwd = (T.cwd() || '').replace(/\/+$/, '');
-    let p = abs;
+    let p = abs;   // the terminal's own folder too: Claude Code takes no "@." as a mention
     if (cwd && abs.startsWith(cwd + '/')) p = abs.slice(cwd.length + 1);
-    else if (cwd && abs === cwd) p = '.';
     let ref = '@' + (/\s/.test(p) ? `"${p}"` : p);
     if (range && range.from) ref += range.to && range.to !== range.from ? `#L${range.from}-${range.to}` : `#L${range.from}`;
     if (!T.sendText(ref + ' ', { bracketed: true })) {
@@ -298,7 +317,7 @@ const UI = (() => {
   return {
     api, store, esc, on, emit, ready, root: () => root,
     menu, closeMenu, dialog, confirm, toast, statusItem, stat,
-    isMarkdown, basename, dirname, rawUrl, sendToTerminal,
+    isMarkdown, basename, dirname, encPath, rawUrl, sendToTerminal,
   };
 })();
 window.UI = UI;

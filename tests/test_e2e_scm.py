@@ -415,3 +415,103 @@ def test_gutter_change_bars(page):
     expect(tab(page, "app.py (Working Tree)")).to_have_class(re.compile(r"\bactive\b"))
     expect(page.locator(f"{VIEW} .CodeMirror-merge")).to_be_visible()
     assert merge_values(page)[1] == page.evaluate("() => Tabs.model('src/app.py').doc.getValue()")
+
+
+# ---------------------------------------------------------------- review fixes
+
+LINES = "".join(f"l{i}\n" for i in range(1, 9))
+
+
+def test_a_double_click_on_an_inline_revert_reverts_one_change(browser, srv, tmp_path):
+    """The inline view's rows are rebuilt 300 ms after an edit: a second click before then (a
+    double-click) used the old rows and deleted, or duplicated, lines next to the change."""
+    r = make_repo(tmp_path / "ws", {"README.md": "# Readme\n", "notes.md": LINES, "g.txt": LINES})
+    (r / "notes.md").write_text(LINES.replace("l2\n", "l2\nADD1\nADD2\n"), encoding="utf-8")
+    (r / "g.txt").write_text(LINES.replace("l3\nl4\n", ""), encoding="utf-8")
+    open_root(srv, r)
+    page, errors = open_page(browser, srv)
+    open_scm(page)
+    for path in ("notes.md", "g.txt"):
+        scm_row(page, path).dblclick()
+        expect(tab(page, f"{path} (Working Tree)")).to_have_class(re.compile(r"\bactive\b"))
+        page.locator(f"{VIEW} .diff-head [data-view=inline]").click()
+        btn = page.locator(f"{VIEW} .diff-inline .diff-revert-btn")
+        expect(btn).to_have_count(1)
+        btn.dblclick()
+        page.wait_for_timeout(600)
+        assert page.evaluate(f"() => Tabs.model('{path}').doc.getValue()") == LINES, path
+    page.wait_for_timeout(1500)   # notes.md autosaves
+    assert disk(r, "notes.md") == LINES
+    page.context.close()
+    assert not errors, errors
+
+
+def test_a_deleted_files_diff_counts_its_lines(page, repo):
+    (repo / "README.md").unlink()   # three lines, the last one ending in a newline
+    open_scm(page)
+    expect_rows(page, ["README.md D"] + CHANGED)
+    scm_row(page, "README.md").click()
+    stats = page.locator(f"{VIEW} .diff-stats")
+    expect(stats).to_have_text("+0 −3")
+    page.locator(f"{VIEW} .diff-head [data-view=inline]").click()
+    expect(page.locator(f"{VIEW} .diff-inline .diff-del-line")).to_have_count(3)
+    expect(stats).to_have_text("+0 −3")
+
+
+def test_a_deleted_files_diff_tab_follows_the_file_back(page, repo):
+    open_scm(page)
+    scm_row(page, "src/old.py").dblclick()
+    diff = tab(page, "old.py (Working Tree)")
+    expect(diff).to_have_class(re.compile(r"\bactive\b"))
+    expect(page.locator(f"{VIEW} .diff-head [data-act=open]")).to_be_disabled()
+    git(repo, "checkout", "--", "src/old.py")   # as Claude might, in the terminal
+    expect_rows(page, ["new.txt U", "src/app.py M"])
+    tab(page, "README.md").click()
+    diff.click()
+    expect(page.locator(f"{VIEW} .diff-head [data-act=open]")).to_be_enabled(timeout=5000)
+    assert merge_values(page) == ["old = 1\n", "old = 1\n"]
+    expect(page.locator(f"{VIEW} .diff-stats")).to_have_text("No changes")
+
+
+def test_nested_repositories_are_mentioned_not_listed(page, repo):
+    make_repo(repo / "vendor" / "lib", {"x.txt": "x\n"})
+    open_scm(page)
+    expect(page.locator(".scm-foot")).to_contain_text("1 folder with a git repository of its own", timeout=5000)
+    expect_rows(page, CHANGED)
+
+
+def test_hidden_diffs_and_the_gutter_leave_typing_alone(browser, srv, tmp_path):
+    """A big file with thousands of changed lines: its change bars are worked out off the main
+    thread, and its diff tab, while hidden, does not diff it again after every edit."""
+    base = "".join(f"line {i} = {i}\n" for i in range(10000))
+    now = "".join(f"line {i} = {i}\n" if i % 2 else f"line {i} = changed\n" for i in range(10000))
+    r = make_repo(tmp_path / "ws", {"README.md": "# Readme\n", "heavy.py": base})
+    (r / "heavy.py").write_text(now, encoding="utf-8")
+    open_root(srv, r)
+    page, errors = open_page(browser, srv)
+    open_scm(page)
+    scm_row(page, "heavy.py").dblclick()
+    expect(page.locator(f"{VIEW} .CodeMirror-merge")).to_be_visible(timeout=10000)
+    page.locator(f"{VIEW} .diff-head [data-act=open]").click()   # the file's own tab, the diff hidden
+    expect(page.locator("#doc-name")).to_have_text("heavy.py")
+    expect(page.locator("#editor .CodeMirror-gutter-background.scm-mod").first).to_be_attached(timeout=10000)
+    page.wait_for_timeout(1500)
+    page.evaluate("""() => {
+        window.longTasks = [];
+        new PerformanceObserver(l => { for (const e of l.getEntries()) window.longTasks.push(Math.round(e.duration)); })
+            .observe({type: 'longtask'});
+    }""")
+    page.locator("#editor .CodeMirror").click()
+    for ch in "abc":
+        page.keyboard.type(ch)
+        page.wait_for_timeout(500)
+    page.wait_for_timeout(1500)
+    slow = [d for d in page.evaluate("window.longTasks") if d > 300]
+    assert slow == [], slow
+    expect(page.locator("#editor .CodeMirror-gutter-background.scm-mod").first).to_be_attached()
+    diff = tab(page, "heavy.py (Working Tree)")
+    diff.click()   # shown again: up to date
+    expect(page.locator(f"{VIEW} .CodeMirror-merge")).to_be_visible()
+    page.wait_for_function(f"() => document.querySelector('{VIEW} .CodeMirror-merge-editor .CodeMirror').CodeMirror.getValue() === Tabs.model('heavy.py').doc.getValue()")
+    page.context.close()
+    assert not errors, errors

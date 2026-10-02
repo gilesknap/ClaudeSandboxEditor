@@ -47,6 +47,17 @@ def test_rebinding_host_cannot_read_anything(srv, path):
         assert status == 200
 
 
+@pytest.mark.parametrize("site", ["cross-site", "same-site"])
+def test_other_sites_pages_cannot_use_the_api(srv, site):
+    """Browsers send Sec-Fetch-Site: another site's <img> or <iframe> pointed at the API (a
+    search that runs for a minute, say) or at a file is refused; the page itself may be linked to."""
+    for path in ("/api/search?q=x", "/api/file?path=a.md", "/raw/pic.png", "/api/config"):
+        assert forbidden(*srv.http("GET", path, headers=[("Host", srv.host), ("Sec-Fetch-Site", site)])), path
+    assert srv.http("GET", "/", headers=[("Host", srv.host), ("Sec-Fetch-Site", site)])[0] == 200
+    for ok in ("same-origin", "none"):   # the page's own requests; an address typed in
+        assert srv.http("GET", "/api/config", headers=[("Host", srv.host), ("Sec-Fetch-Site", ok)])[0] == 200
+
+
 def test_missing_or_repeated_host_is_refused(srv):
     assert forbidden(*srv.http("GET", "/api/config", headers=[]))
     two = [("Host", srv.host), ("Host", srv.host)]

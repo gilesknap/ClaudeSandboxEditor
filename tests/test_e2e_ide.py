@@ -453,3 +453,218 @@ def test_ask_claude_cards_stay_with_their_file(browser, shared_servers, tmp_path
     expect(page.locator("#cards .card").first).to_have_class(re.compile(r"\bready\b"), timeout=30000)
     page.context.close()
     assert not errors, errors
+
+
+# ---------------------------------------------------------------- files deleted or moved on disk
+
+def wait_deleted(pg, name):
+    expect(pg.locator("#banner")).to_contain_text(f"{name} has been deleted on disk", timeout=5000)
+
+
+def test_the_deleted_banners_close_asks_about_unsaved_changes(page, repo):
+    row(page, "src").click()
+    row(page, "src/util.js").dblclick()
+    type_at_end(page, "// precious\n")
+    (repo / "src" / "util.js").unlink()
+    wait_deleted(page, "util.js")
+    page.locator("#banner").get_by_role("button", name="Close").click()
+    dialog = page.get_by_role("alertdialog")
+    expect(dialog).to_contain_text("util.js has been deleted on disk. Do you want to save your changes to it?")
+    dialog.get_by_role("button", name="Cancel").click()
+    expect(tab(page, "util.js")).to_have_class(re.compile(r"\bdirty\b"))
+    page.locator("#banner").get_by_role("button", name="Close").click()
+    dialog.get_by_role("button", name="Save", exact=True).click()   # saving makes it again
+    expect(tab(page, "util.js")).to_have_count(0)
+    assert "// precious" in disk(repo, "src/util.js")
+
+
+def test_autosave_never_makes_a_deleted_file_again(page, repo):
+    """Claude's `git mv` or `rm` must stick: an edit of the open file (markdown autosaves) only
+    goes back to disk when asked."""
+    (repo / "README.md").rename(repo / "moved.md")
+    wait_deleted(page, "README.md")
+    type_at_end(page, " typed")
+    expect(page.locator("#save-state")).to_have_text("Unsaved changes")
+    page.wait_for_timeout(2000)   # well past the autosave delay
+    assert not (repo / "README.md").exists()
+    expect(tab(page, "README.md")).to_have_class(re.compile(r"\bdeleted\b"))
+    page.keyboard.press("Control+s")   # asked: it is made again
+    expect(page.locator("#banner")).to_be_hidden()
+    assert disk(repo, "README.md").endswith(" typed")
+
+
+def test_a_save_that_races_a_deletion_says_the_file_was_deleted(browser, srv, repo):
+    page, errors = open_page(browser, srv)
+    page.route("**/api/stat", lambda r: r.abort())   # the poll never sees the deletion
+    row(page, "src").click()
+    row(page, "src/util.js").dblclick()
+    type_at_end(page, "// mine\n")
+    (repo / "src" / "util.js").unlink()
+    page.keyboard.press("Control+s")
+    wait_deleted(page, "util.js")
+    expect(page.locator("#banner")).not_to_contain_text("changed on disk")
+    expect(tab(page, "util.js")).to_have_class(re.compile(r"\bdirty\b"))
+    assert not (repo / "src" / "util.js").exists()
+    page.unroute("**/api/stat")
+    page.wait_for_timeout(1500)
+    wait_deleted(page, "util.js")   # the poll agrees
+    page.context.close()
+    assert [e for e in errors if "409 (Conflict)" not in e and "ERR_FAILED" not in e] == [], errors
+
+
+def test_undoing_back_to_the_saved_text_after_a_conflict_loads_the_disk_version(page, repo):
+    row(page, "src").click()
+    row(page, "src/util.js").dblclick()
+    type_at_end(page, "Z")
+    (repo / "src" / "util.js").write_text("const a = 1;\nclaude = 2;\n", encoding="utf-8")
+    expect(page.locator("#banner")).to_contain_text("changed on disk", timeout=5000)
+    page.locator(".CodeMirror").click()
+    page.keyboard.press("Control+z")
+    expect(page.locator("#banner")).to_be_hidden(timeout=5000)
+    expect(page.locator("#save-state")).to_have_text("Updated from disk")
+    assert page.evaluate("() => Tabs.model('src/util.js').doc.getValue()") == "const a = 1;\nclaude = 2;\n"
+    expect(tab(page, "util.js")).not_to_have_class(re.compile(r"\bdirty\b"))
+
+
+def rename_in_tree(pg, path, name):
+    row(pg, path).click(button="right")
+    pg.locator(".ctx-menu").get_by_role("menuitem", name="Rename…").click()
+    expect(pg.locator("#tree input.tree-input")).to_be_focused()
+    pg.keyboard.press("Control+a")
+    pg.keyboard.type(name)
+    pg.keyboard.press("Enter")
+
+
+def test_renaming_onto_an_open_deleted_file(page, repo):
+    row(page, "src").click()
+    row(page, "src/util.js").dblclick()
+    type_at_end(page, "// unsaved\n")
+    (repo / "src" / "util.js").unlink()
+    wait_deleted(page, "util.js")
+    row(page, "src/app.py").click()   # open too, so its tab and model move with the rename
+    expect(tab(page, "app.py")).to_have_class(re.compile(r"\bactive\b"))
+    # util.js's unsaved changes would be left with no file to save to: refused
+    rename_in_tree(page, "src/app.py", "util.js")
+    expect(page.locator("#toast")).to_contain_text("src/util.js is open with unsaved changes")
+    page.keyboard.press("Escape")
+    assert (repo / "src" / "app.py").exists() and not (repo / "src" / "util.js").exists()
+    # once they are dropped (the tab stays, clean and deleted), the rename goes ahead and the
+    # old tab gives way to the file moved there, which can be saved
+    tab(page, "util.js").click()
+    page.locator(".CodeMirror").click()
+    page.keyboard.press("Control+z")
+    page.keyboard.press("Control+z")
+    expect(tab(page, "util.js")).not_to_have_class(re.compile(r"\bdirty\b"))
+    rename_in_tree(page, "src/app.py", "util.js")
+    expect(row(page, "src/app.py")).to_have_count(0, timeout=5000)
+    assert page.evaluate("() => Tabs.models().map(m => [m.path, m.doc.getValue()])") == [
+        ["README.md", "# Readme\n\nHello world.\n"], ["src/util.js", 'def main():\n    print("hi")\n']]
+    assert tab_names(page) == ["README.md", "util.js"]
+    tab(page, "util.js").click()
+    type_at_end(page, "# more\n")
+    page.keyboard.press("Control+s")
+    expect(tab(page, "util.js")).not_to_have_class(re.compile(r"\bdirty\b"))
+    assert disk(repo, "src/util.js") == 'def main():\n    print("hi")\n# more\n'
+
+
+# ---------------------------------------------------------------- layout and what is remembered
+
+def test_the_url_names_no_file_once_none_is_open(page):
+    page.keyboard.press("Alt+w")
+    expect(page.locator("#doc-name")).to_have_text("No file open")
+    assert page.evaluate("location.hash") == ""
+    page.reload()
+    expect(row(page, "src")).to_be_visible()
+    expect(page.locator("#save-state")).not_to_contain_text("Could not open")
+
+
+def test_the_side_bar_panel_is_remembered(page):
+    page.locator("#activity-bar").get_by_role("tab", name="Source Control").click()
+    expect(page.locator(".scm-list")).to_be_visible()
+    page.reload()
+    expect(page.locator(".scm-list")).to_be_visible()
+    expect(page.locator("#activity-bar").get_by_role("tab", name="Source Control")).to_have_attribute("aria-selected", "true")
+    expect(page.locator(".scm-empty")).to_have_text("No changes.")   # and it asked git as usual
+
+
+def test_the_side_bar_and_claude_panel_leave_room_for_the_editor(page):
+    def layout():
+        return page.evaluate("""() => ({wb: document.getElementById('workbench').getBoundingClientRect().width,
+                                        sw: document.documentElement.scrollWidth, w: innerWidth})""")
+
+    def drag(handle, dx):
+        box = page.locator(handle).bounding_box()
+        x, y = box["x"] + box["width"] / 2, box["y"] + 300
+        page.mouse.move(x, y)
+        page.mouse.down()
+        page.mouse.move(x + dx, y, steps=8)
+        page.mouse.up()
+
+    expect(page.locator("#claude")).to_be_visible()
+    drag("#sidebar-resize", 1200)
+    assert layout()["wb"] >= 239 and layout()["sw"] == layout()["w"]
+    drag("#panel-resize", -1200)
+    assert layout()["wb"] >= 239 and layout()["sw"] == layout()["w"]
+    page.reload()
+    expect(row(page, "src")).to_be_visible()
+    assert layout()["wb"] >= 239 and layout()["sw"] == layout()["w"]
+    page.set_viewport_size({"width": 1000, "height": 900})
+    page.wait_for_timeout(200)
+    assert layout()["wb"] >= 239 and layout()["sw"] == layout()["w"]
+
+
+# ---------------------------------------------------------------- the Explorer and the terminal
+
+def fake_terminal(pg, cwd):
+    """Term stands in for a running terminal: what it is sent lands in window.sent."""
+    pg.evaluate("""cwd => {
+        window.sent = [];
+        Object.assign(Term, {available: () => true, running: () => true, cwd: () => cwd, focus() {},
+                             sendText(t) { window.sent.push(t); return true; }});
+    }""", str(cwd))
+
+
+def test_explorer_sends_paths_to_the_terminal(page, repo):
+    fake_terminal(page, repo.parent)
+    page.locator("#tree").focus()
+    page.keyboard.press("Home")   # docs; the menu shows @ as the shortcut for sending it
+    page.keyboard.press("@")
+    page.wait_for_function("() => window.sent.length === 1")
+    assert page.evaluate("window.sent") == ["@ws/docs "]
+    page.locator("#tree").click(button="right", position={"x": 60, "y": 400})   # the open folder itself
+    page.locator(".ctx-menu").get_by_role("menuitem", name="Send to Claude terminal").click()
+    page.wait_for_function("() => window.sent.length === 2")
+    assert page.evaluate("window.sent[1]") == "@ws "
+    fake_terminal(page, repo)   # the terminal's own folder: by its absolute path (Claude Code
+    page.locator("#tree").click(button="right", position={"x": 60, "y": 400})   # takes no "@.")
+    page.locator(".ctx-menu").get_by_role("menuitem", name="Send to Claude terminal").click()
+    page.wait_for_function("() => window.sent.length === 1")
+    assert page.evaluate("window.sent") == [f"@{repo} "]
+
+
+def test_send_without_a_terminal_keeps_the_side_bar(browser, srv, repo):
+    ctx = browser.new_context(viewport={"width": 700, "height": 800})
+    pg = ctx.new_page()
+    pg.goto(srv.base)
+    expect(pg.locator("#doc-name")).to_have_text("README.md")
+    pg.locator("#activity-bar").get_by_role("tab", name="Explorer").click()
+    row(pg, "src").click(button="right")
+    pg.locator(".ctx-menu").get_by_role("menuitem", name="Send to Claude terminal").click()
+    expect(pg.locator("#toast")).to_have_text("The Claude terminal is not available.")
+    expect(pg.locator("#sidebar")).to_be_visible()
+    expect(pg.locator("#claude")).to_be_hidden()
+    ctx.close()
+
+
+def test_a_file_name_that_is_not_utf8_opens(page, repo):
+    with open(os.path.join(os.fsencode(repo), b"lat\xe9.txt"), "w") as f:
+        f.write("latin-1 name\n")
+    page.wait_for_function("() => [...document.querySelectorAll('#tree .tree-row')].some(r => r.dataset.path.startsWith('lat'))",
+                           timeout=5000)
+    page.evaluate("() => [...document.querySelectorAll('#tree .tree-row')].find(r => r.dataset.path.startsWith('lat')).click()")
+    expect(page.locator("#doc-name")).to_have_text(re.compile(r"^lat.\.txt$"))
+    expect(page.locator(".CodeMirror")).to_contain_text("latin-1 name")
+    type_at_end(page, "more\n")
+    page.keyboard.press("Control+s")
+    expect(page.locator("#save-state")).to_have_text("Saved")
+    assert open(os.path.join(os.fsencode(repo), b"lat\xe9.txt")).read() == "latin-1 name\nmore\n"

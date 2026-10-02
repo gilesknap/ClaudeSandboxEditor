@@ -118,6 +118,7 @@ const SCM = (() => {
       const extra = [];
       if (st.outside) extra.push(`${plural(st.outside, 'change')} outside this folder ${st.outside === 1 ? 'is' : 'are'} hidden.`);
       if (st.truncated) extra.push(`Only the first ${files.length.toLocaleString()} changed files are listed.`);
+      if (st.nested) extra.push(`${plural(st.nested, 'folder')} with a git repository of ${st.nested === 1 ? 'its' : 'their'} own (or a worktree) ${st.nested === 1 ? 'is' : 'are'} not listed.`);
       if (extra.length) { foot.hidden = false; foot.textContent = extra.join(' '); }
     } else { empty.hidden = false; empty.textContent = 'Loading…'; }
     renderList();
@@ -309,7 +310,7 @@ const SCM = (() => {
     error = '';
     files = st ? st.files || [] : [];
     byPath = new Map(files.map(f => [f.path, f]));
-    const sig = JSON.stringify([!!info.repo, info.reason, st && st.base, st && st.outside, st && st.truncated, files]);
+    const sig = JSON.stringify([!!info.repo, info.reason, st && st.base, st && st.outside, st && st.truncated, st && st.nested, files]);
     if (headChanged) headCache = new Map();
     if (sig !== listSig || hadError) {
       listSig = sig;
@@ -371,40 +372,50 @@ const SCM = (() => {
 
   // ---------------------------------------------------------------- line diffs
 
-  // [{origFrom, origTo, editFrom, editTo}]: runs of changed lines (0-based, end exclusive), with
-  // line i of each side being CodeMirror's line i of that text.
-  function lineChunks(a, b) {
-    if (a === b) return [];
-    a += '\n';
-    b += '\n';
-    const dmp = new diff_match_patch();
-    dmp.Diff_Timeout = 1;
-    const x = dmp.diff_linesToChars_(a, b);
-    if (x.lineArray.length > 65000) return coarseChunks(a, b);   // one char per line: 16 bits
-    const chunks = [];
-    let o = 0, e = 0, cur = null;
-    for (const [op, s] of dmp.diff_main(x.chars1, x.chars2, false)) {
-      const n = s.length;
-      if (op === 0) {
-        if (cur) { chunks.push(cur); cur = null; }
-        o += n; e += n;
-        continue;
-      }
-      if (!cur) cur = { origFrom: o, origTo: o, editFrom: e, editTo: e };
-      if (op < 0) { o += n; cur.origTo = o; } else { e += n; cur.editTo = e; }
+  const lineChunks = LineDiff.lineChunks;   // linediff.js
+
+  // the same, in scm-worker.js: the gutter must not stop the editor for a second on a big file
+  let worker = null, workerSeq = 0;
+  const waiting = new Map();
+  function lineChunksAsync(a, b) {
+    if (worker === null) {
+      try {
+        worker = new Worker('scm-worker.js');
+        const dmp = document.querySelector('script[src*="diff_match_patch"]');
+        worker.postMessage({ init: { dmp: dmp.src, linediff: new URL('linediff.js', location.href).href } });
+        worker.onmessage = ({ data }) => { const r = waiting.get(data.id); waiting.delete(data.id); if (r) r(data.chunks); };
+        worker.onerror = e => {   // its scripts did not load: work here instead
+          e.preventDefault();
+          worker = false;
+          for (const r of waiting.values()) r(null);
+          waiting.clear();
+        };
+      } catch { worker = false; }
     }
-    if (cur) chunks.push(cur);
-    return chunks;
+    if (!worker) return Promise.resolve(null);
+    return new Promise(res => {
+      const id = ++workerSeq;
+      waiting.set(id, res);
+      worker.postMessage({ id, a, b });
+    });
   }
 
-  // a very large file: everything between the common first and last lines is one change
-  function coarseChunks(a, b) {
-    const A = a.split('\n'), B = b.split('\n');
-    let p = 0;
-    while (p < A.length && p < B.length && A[p] === B[p]) p++;
-    let q = 0;
-    while (q < A.length - p && q < B.length - p && A[A.length - 1 - q] === B[B.length - 1 - q]) q++;
-    return p === A.length && p === B.length ? [] : [{ origFrom: p, origTo: A.length - q, editFrom: p, editTo: B.length - q }];
+  // a deleted file's lines: all of them removed (no line after a final newline)
+  const deletedChunks = base => {
+    const n = base === '' ? 0 : base.split('\n').length - (base.endsWith('\n') ? 1 : 0);
+    return n ? [{ origFrom: 0, origTo: n, editFrom: 0, editTo: 0 }] : [];
+  };
+
+  // a diff tab's line diff, worked out once for each version of the file and the base
+  // (changeGeneration identifies a version, undo included; called without an argument it has
+  // no side effects)
+  function diffChunks(s) {
+    const gen = s.linked ? s.linked.changeGeneration() : -1;
+    const c = s.chunkCache;
+    if (c && c.gen === gen && c.base === s.base.text) return c.list;
+    const list = s.linked ? lineChunks(s.base.text, s.linked.getValue()) : deletedChunks(s.base.text);
+    s.chunkCache = { gen, base: s.base.text, list };
+    return list;
   }
 
   // Put the base's lines of `chunk` back into `doc` (as the merge addon's revert arrows do).
@@ -422,7 +433,7 @@ const SCM = (() => {
   function headText(path) {
     if (!headCache.has(path)) {
       const cache = headCache;
-      const p = UI.api('GET', `/api/git/show?path=${encodeURIComponent(path)}&base=head`);
+      const p = UI.api('GET', `/api/git/show?path=${UI.encPath(path)}&base=head`);
       p.catch(() => { if (cache.get(path) === p) cache.delete(path); });
       cache.set(path, p);
     }
@@ -447,15 +458,26 @@ const SCM = (() => {
     return cm;
   }
 
-  let gutterT = null;
+  let gutterT = null, gutterBusy = false, gutterAgain = false;
   function scheduleGutter(ms = 300) { clearTimeout(gutterT); gutterT = setTimeout(updateGutter, ms); }
 
   async function updateGutter() {
+    if (gutterBusy) { gutterAgain = true; return; }   // one diff at a time; then the latest text
+    gutterBusy = true;
+    try { await updateGutterNow(); }
+    catch (e) { console.error(e); }
+    finally {
+      gutterBusy = false;
+      if (gutterAgain) { gutterAgain = false; scheduleGutter(0); }
+    }
+  }
+
+  async function updateGutterNow() {
     const cm = mainCm();
     const t = Tabs.active();
     if (!cm || !t || t.type !== 'file') return;
     const m = t.model;
-    if (!isRepo()) { paint(m, null); return; }
+    if (!isRepo()) { await paint(m, null); return; }
     const ep = epoch;
     let base = null;
     try { base = await headText(m.path); } catch {}
@@ -463,19 +485,30 @@ const SCM = (() => {
     let text = null;
     if (base && base.exists && !base.binary && !base.too_large) text = base.text;
     else if (base && !base.exists && ['U', 'A'].includes(byPath.get(m.path)?.status)) text = '';   // new: all added
-    paint(m, text);
+    await paint(m, text);
   }
 
-  function paint(m, baseText) {
+  async function paint(m, baseText) {
     const doc = m.doc;
-    const g = gut.get(m) || { marks: [], chunks: [] };
+    const g = gut.get(m) || { marks: [], chunks: [], gen: null, base: null };
     gut.set(m, g);
+    const gen = doc.changeGeneration();
+    if (g.gen === gen && g.base === baseText) return;   // the bars (on the Doc) are still right
+    let chunks = [];
+    if (baseText != null) {
+      const text = doc.getValue();
+      chunks = await lineChunksAsync(baseText, text);
+      if (doc.changeGeneration() !== gen) return;   // edited meanwhile: the 'change' handler goes again
+      if (!chunks) chunks = lineChunks(baseText, text);
+    }
+    g.gen = gen;
+    g.base = baseText;
     const cm = Tabs.cm();
     const run = fn => (cm && cm.getDoc() === doc ? cm.operation(fn) : fn());
     run(() => {
       for (const [h, cls] of g.marks) doc.removeLineClass(h, 'gutter', cls);
       g.marks = [];
-      g.chunks = baseText == null ? [] : lineChunks(baseText, doc.getValue());
+      g.chunks = chunks;
       const last = doc.lastLine();
       const mark = (line, cls) => g.marks.push([doc.addLineClass(line, 'gutter', cls), cls]);
       for (const c of g.chunks) {
@@ -527,7 +560,7 @@ const SCM = (() => {
       model = await Tabs.acquire(d.path);
       if (!model) {
         try {
-          const f = await UI.api('GET', `/api/file?path=${encodeURIComponent(d.path)}`);
+          const f = await UI.api('GET', `/api/file?path=${UI.encPath(d.path)}`);
           kind = f.kind === 'too_large' ? 'too_large' : f.kind === 'text' ? 'deleted' : 'binary';
         } catch { kind = 'deleted'; }
       }
@@ -553,7 +586,8 @@ const SCM = (() => {
       label: m === 'branch' ? (st && st.base && st.base.mode === 'branch' ? st.base.label : (info && info.default_branch) || 'the default branch') : 'HEAD',
     };
     let t = findDiff(diffId(d));
-    if (t && f && (t.spec.scm.kind === 'deleted') !== (f.status === 'D')) {   // gone, or back again
+    // made again for a file that is gone, or back again (restored, so no longer in the list)
+    if (t && (f ? (t.spec.scm.kind === 'deleted') !== (f.status === 'D') : t.spec.scm.kind === 'deleted')) {
       if (!(await Tabs.close(t))) return t;
       t = null;
     }
@@ -623,8 +657,7 @@ const SCM = (() => {
 
   async function loadBase(s) {
     const d = s.d;
-    const q = new URLSearchParams({ path: d.path, base: d.mode });
-    if (d.old) q.set('old_path', d.old);
+    const q = `path=${UI.encPath(d.path)}&base=${d.mode}${d.old ? `&old_path=${UI.encPath(d.old)}` : ''}`;
     const sha = baseSha(d.mode);
     s.loading = true;
     let r, spec;
@@ -655,6 +688,7 @@ const SCM = (() => {
       try { s.mv.editor().swapDoc(new CodeMirror.Doc('')); } catch {}
       s.mv = null;
     }
+    s.parked = false;
     s.inl = null;
     s.built = false;
     s.msg = false;
@@ -694,7 +728,10 @@ const SCM = (() => {
     s.el.inline.hidden = split;
     if (split) {
       if (!s.mv) buildMerge(s);
-      else refreshMerge(s);
+      else {
+        if (s.parked) { s.parked = false; s.mv.editor().swapDoc(s.linked); }   // the addon diffs it again
+        refreshMerge(s);
+      }
     } else if (!s.inl || s.inlineStale) buildInline(s);
     else s.inl.cm.refresh();
     updateStats(s);
@@ -755,13 +792,14 @@ const SCM = (() => {
     const base = s.base.text;
     const a = base.split('\n');
     if (!s.linked) {   // deleted: every line went
-      return { rows: a.map((text, i) => ({ t: 'del', text, o: i })), hunks: [{ row: 0, chunk: null }] };
+      const n = deletedChunks(base).reduce((k, c) => k + c.origTo, 0);
+      return { rows: a.slice(0, n).map((text, i) => ({ t: 'del', text, o: i })), hunks: [{ row: 0, chunk: null }] };
     }
     const work = s.linked.getValue();
     const b = work.split('\n');
     const rows = [], hunks = [];
     let o = 0, e = 0;
-    for (const c of lineChunks(base, work)) {
+    for (const c of diffChunks(s)) {
       while (e < c.editFrom) rows.push({ t: 'ctx', text: b[e], o: o++, e: e++ });
       hunks.push({ row: rows.length, chunk: c });
       for (let i = c.origFrom; i < c.origTo; i++) rows.push({ t: 'del', text: a[i], o: i });
@@ -793,6 +831,9 @@ const SCM = (() => {
       cm.getWrapperElement().classList.toggle('cm-code', !md(s));
       cm.on('gutterClick', (c, line, gutter) => {
         if (gutter !== 'diff-revert' || !s.linked) return;
+        // the rows are of the file as it was when they were drawn: after an edit (the first
+        // click of a double-click, say) they are drawn again first, and this click is dropped
+        if (s.inl.gen !== s.linked.changeGeneration()) { buildInline(s); return; }
         const h = s.inl.hunks.find(x => x.row === line);
         if (h && h.chunk) revertChunk(s.linked, s.base.text, h.chunk);
       });
@@ -801,7 +842,7 @@ const SCM = (() => {
       keep = { top: cm.getScrollInfo().top, cursor: cm.getCursor() };
       cm.setValue(text);
     }
-    s.inl = { cm, hunks };
+    s.inl = { cm, hunks, gen: s.linked ? s.linked.changeGeneration() : null };
     cm.operation(() => {
       rows.forEach((r, i) => {
         if (r.t === 'ctx') return;
@@ -825,11 +866,12 @@ const SCM = (() => {
   function modelChanged(m) {
     for (const s of diffs) {
       if (s.tab.model !== m || !s.built || s.msg) continue;
+      s.inlineStale = true;
+      if (Tabs.active() !== s.tab) continue;   // a hidden tab catches up when it is shown
       clearTimeout(s.inlineT);
       s.inlineT = setTimeout(() => {
-        if (s.tab.closed) return;
-        s.inlineStale = true;
-        if (s.view === 'inline' && Tabs.active() === s.tab) buildInline(s);
+        if (s.tab.closed || Tabs.active() !== s.tab) return;
+        if (s.view === 'inline') buildInline(s);
         else updateStats(s);
       }, 300);
     }
@@ -837,8 +879,7 @@ const SCM = (() => {
 
   function updateStats(s) {
     if (!s.built || s.msg || !s.base || s.base.text == null) { s.el.stats.textContent = ''; return; }
-    const chunks = s.linked ? lineChunks(s.base.text, s.linked.getValue())
-      : [{ origFrom: 0, origTo: s.base.text.split('\n').length, editFrom: 0, editTo: 0 }];
+    const chunks = diffChunks(s);
     let add = 0, del = 0;
     for (const c of chunks) { add += c.editTo - c.editFrom; del += c.origTo - c.origFrom; }
     s.el.stats.innerHTML = chunks.length
@@ -941,6 +982,7 @@ const SCM = (() => {
       return (s.mv.leftChunks() || []).find(c => (c.editTo > c.editFrom ? line >= c.editFrom && line < c.editTo : line === c.editFrom));
     }
     if (s.inl && cm === s.inl.cm && s.linked) {
+      if (s.inl.gen !== s.linked.changeGeneration()) return null;   // rows not redrawn yet
       const h = s.inl.hunks.find((x, i) => line >= x.row && line < (s.inl.hunks[i + 1] ? s.inl.hunks[i + 1].row : Infinity)
         && s.inlRows.slice(x.row, line + 1).every(r => r.t !== 'ctx'));
       return h ? h.chunk : null;
@@ -953,9 +995,16 @@ const SCM = (() => {
     e.preventDefault();
     if (!cm.somethingSelected()) cm.setCursor(cm.coordsChar({ left: e.clientX, top: e.clientY }, 'window'));
     const chunk = chunkAt(s, cm);
+    const gen = s.linked && s.linked.changeGeneration();
     const sel = cm.getSelection();
     UI.menu([
-      chunk ? { label: 'Revert this change', action: () => revertChunk(s.linked, s.base.text, chunk) } : null,
+      chunk ? {
+        label: 'Revert this change',
+        action: () => {
+          if (s.linked.changeGeneration() !== gen) { UI.toast('The file changed while the menu was open: try again.'); return; }
+          revertChunk(s.linked, s.base.text, chunk);
+        },
+      } : null,
       { label: 'Open file at this line', disabled: s.kind === 'deleted', action: () => openFileAt(s) },
       '-',
       sel ? { label: 'Copy', action: () => copy(sel) } : null,
@@ -969,9 +1018,31 @@ const SCM = (() => {
     if (!s.built) build(s);
     else showView(s);
     updateRows();
+    if (s.kind === 'deleted') reviveIfBack(s);
   }
 
-  function hideDiff() { updateRows(); }
+  // a deleted file's diff whose file is back (git checkout -- path in the terminal): made again
+  async function reviveIfBack(s) {
+    if (s.reviving) return;
+    s.reviving = true;
+    let back = false;
+    try { back = (await UI.api('POST', '/api/stat', { paths: [s.d.path] })).versions[s.d.path] !== '0'; } catch {}
+    s.reviving = false;
+    if (back && !s.tab.closed && Tabs.active() === s.tab && !(byPath.get(s.d.path)?.status === 'D')) {
+      openDiff(s.d.path, { preview: s.tab.preview, focus: true, mode: s.d.mode });
+    }
+  }
+
+  // A hidden merge view would still follow every edit of its file (a character diff 250 ms
+  // after each): its editor gets an empty doc until the tab is shown again.
+  function hideDiff(tab) {
+    const s = tab.spec.scm;
+    if (s.mv && s.linked && !s.parked) {
+      s.parked = true;
+      s.mv.editor().swapDoc(new CodeMirror.Doc(''));
+    }
+    updateRows();
+  }
 
   function disposeDiff(tab) {
     const s = tab.spec.scm;

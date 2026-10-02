@@ -41,10 +41,13 @@
 //   Tabs.linkedDoc(model) → Doc        a doc linked to the model's (shared history), for a
 //                                      second editor; call model.doc.unlinkDoc(it) when done
 //   Tabs.loadMode(path) → Promise<modeSpec>  make sure the file's CodeMirror mode is loaded
-//   Tabs.save(model?, force?) → Promise<bool>   (default: the active model / custom tab)
+//   Tabs.save(model?, force?, auto?) → Promise<bool>   (default: the active model / custom tab);
+//                                      auto: an autosave, which skips a file deleted on disk
 //   Tabs.saveAll(); Tabs.anyDirty() → bool
 //   Tabs.reveal(model, {line, ch, sel, focus})   select / scroll, if the model's tab is active
 //   Tabs.renamePath(from, to)          follow a rename on disk (files and folders)
+//   Tabs.renameBlocked(from, to) → path | null  an open file with unsaved changes that the
+//                                      rename would put another file in place of
 //   Tabs.pathDeleted(path)             a file / folder was deleted by us: close clean tabs
 //   Tabs.reload(model) → Promise<bool> load the file from disk again, dropping unsaved changes
 //                                      (scm.js, after a discard)
@@ -157,7 +160,7 @@ const Tabs = (() => {
   function getFile(path) {
     if (models.has(path)) return Promise.resolve({ model: models.get(path) });
     if (loading.has(path)) return loading.get(path);
-    const p = UI.api('GET', `/api/file?path=${encodeURIComponent(path)}`)
+    const p = UI.api('GET', `/api/file?path=${UI.encPath(path)}`)
       .then(f => {
         if (models.has(path)) return { model: models.get(path) };
         if (!f.kind || f.kind === 'text') return { model: makeModel(path, f) };
@@ -227,19 +230,29 @@ const Tabs = (() => {
     setDirty(m, !m.doc.isClean(m.cleanGen));
     if (m.dirty) {
       if (active && active.model === m && active.preview) pin(active);   // edited here: keep it
-      const auto = autosave(m.category);
+      // a file deleted (or moved) on disk is only written again when asked: Ctrl+S, the banner
+      const auto = autosave(m.category) && !m.deleted;
       setState(m, auto ? 'Editing…' : 'Unsaved changes');
       if (auto) scheduleSave(m);
-    } else if (!m.saving) setState(m, 'Saved');
+    } else if (!m.saving) {
+      if (m.seenVersion && m.seenVersion !== '0') {
+        // undone back to the text the disk's change was a conflict with: a clean file simply
+        // takes the disk's version, as it would have then
+        const v = m.seenVersion;
+        m.seenVersion = null;
+        checkModel(m, v);
+      } else setState(m, 'Saved');
+    }
     emit('change', m, change);
   }
 
   function scheduleSave(m) {
     clearTimeout(m.saveT);
-    m.saveT = setTimeout(() => save(m), SAVE_DELAY);
+    m.saveT = setTimeout(() => save(m, false, true), SAVE_DELAY);
   }
 
-  async function save(m, force = false) {
+  // auto: an autosave, which never writes a file that was deleted on disk back
+  async function save(m, force = false, auto = false) {
     if (m === undefined) {
       const t = active;
       if (t && t.type === 'custom' && t.spec.save) return t.spec.save(t);
@@ -249,8 +262,9 @@ const Tabs = (() => {
     clearTimeout(m.saveT);
     if (m.saving) {   // one write at a time: wait for the one under way, then go again
       await m.saving;
-      return save(m, force);
+      return save(m, force, auto);
     }
+    if (auto && m.deleted) return false;
     if (!m.dirty && !force && !m.deleted) return true;
     const gen = m.doc.changeGeneration(true);
     const text = m.doc.getValue();
@@ -273,6 +287,7 @@ const Tabs = (() => {
       emit('saved', m);
     } catch (e) {
       if (m.path !== path && models.get(m.path) === m) retry = true;   // renamed meanwhile: not a conflict
+      else if (e.status === 409 && String(e.data && e.data.version) === '0') markDeleted(m);   // before the poll saw it
       else if (e.status === 409) {
         setState(m, 'Conflict', 'err');
         conflict(m, e.data.text, e.data.version);
@@ -281,7 +296,7 @@ const Tabs = (() => {
       m.saving = null;
       done();
     }
-    return retry ? save(m, force) : ok;
+    return retry ? save(m, force, auto) : ok;
   }
 
   function saveAll() { return Promise.all([...models.values()].filter(m => m.dirty).map(m => save(m))); }
@@ -321,7 +336,7 @@ const Tabs = (() => {
     if (!m || models.get(m.path) !== m) return false;
     clearTimeout(m.saveT);
     let f;
-    try { f = await UI.api('GET', `/api/file?path=${encodeURIComponent(m.path)}`); }
+    try { f = await UI.api('GET', `/api/file?path=${UI.encPath(m.path)}`); }
     catch (e) { if (e.status === 404 && models.get(m.path) === m) checkModel(m, '0'); return false; }
     if (models.get(m.path) !== m || (f.kind && f.kind !== 'text')) return false;
     applyRemote(m, f.text, f.version);
@@ -339,24 +354,37 @@ const Tabs = (() => {
 
   // ---------------------------------------------------------------- on-disk changes (polled)
 
+  // the file is gone from disk (deleted, or moved by something other than this page): the tab
+  // stays, struck through, and nothing writes the file again unless asked to
+  function markDeleted(m) {
+    clearTimeout(m.saveT);
+    m.deleted = true;
+    m.seenVersion = '0';
+    setBanner(m, {
+      msg: `${UI.basename(m.path)} has been deleted on disk.`,
+      actions: [['Save to re-create it', () => save(m, true)],
+                ['Close', () => closeModel(m)]],
+    });
+    if (m.dirty) setState(m, 'Deleted on disk', 'err');
+    renderStrip();
+    emit('disk-change', m, { deleted: true });
+  }
+
+  // close every tab of a model; the last one asks about unsaved changes as its × does
+  async function closeModel(m) {
+    for (const t of tabs.filter(t => t.model === m)) if (!(await close(t))) return false;
+    return true;
+  }
+
   async function checkModel(m, v) {
     if (m.saving || m.checking || v === m.version || v === m.seenVersion) return;
     if (v === '0') {
-      if (m.deleted) return;
-      m.deleted = true;
-      m.seenVersion = v;
-      setBanner(m, {
-        msg: `${UI.basename(m.path)} has been deleted on disk.`,
-        actions: [['Save to re-create it', () => save(m, true)],
-                  ['Close', () => { for (const t of tabs.filter(t => t.model === m)) close(t, { force: true }); }]],
-      });
-      renderStrip();
-      emit('disk-change', m, { deleted: true });
+      if (!m.deleted) markDeleted(m);
       return;
     }
     m.checking = true;
     let f;
-    try { f = await UI.api('GET', `/api/file?path=${encodeURIComponent(m.path)}`); }
+    try { f = await UI.api('GET', `/api/file?path=${UI.encPath(m.path)}`); }
     catch { f = null; }
     finally { m.checking = false; }
     if (!f || models.get(m.path) !== m || m.saving || f.version === m.version) return;
@@ -590,12 +618,15 @@ const Tabs = (() => {
     const m = tab.model;
     const last = m && tabs.filter(t => t.model === m).length === 1 && m.refs <= 1;
     if (!force && m && m.dirty && last) {
-      if (autosave(m.category) && await save(m)) { /* saved: close quietly */ }
+      if (autosave(m.category) && !m.deleted && await save(m, false, true)) { /* saved: close quietly */ }
       else {
         if (active !== tab) activate(tab);
+        const name = UI.basename(m.path);
         const choice = await UI.dialog({
-          title: `Do you want to save the changes you made to ${UI.basename(m.path)}?`,
-          message: 'Your changes will be lost if you don\'t save them.',
+          title: m.deleted ? `${name} has been deleted on disk. Do you want to save your changes to it?`
+            : `Do you want to save the changes you made to ${name}?`,
+          message: m.deleted ? 'Saving creates the file again. Your changes will be lost if you don\'t save them.'
+            : 'Your changes will be lost if you don\'t save them.',
           buttons: [{ label: 'Save', value: 'save', primary: true }, { label: 'Don\'t save', value: 'discard' }, { label: 'Cancel', value: 'cancel' }],
           cancel: 'cancel',
         });
@@ -617,6 +648,8 @@ const Tabs = (() => {
 
   function showEmpty() {
     active = null;
+    // no file on screen: a reload must not open the one the URL named (in another folder, say)
+    if (location.hash) history.replaceState(null, '', location.pathname + location.search);
     if (cm && cm.getDoc() !== blank) cm.swapDoc(blank);
     main.dataset.kind = 'empty';
     renderHead();
@@ -648,7 +681,7 @@ const Tabs = (() => {
     mru = mru.filter(t => t !== tab).concat(tab);
     // the URL names the file on screen, which app.js opens after a reload: none for a custom tab
     // (a diff), which the remembered tabs bring back by themselves
-    const hash = tab.type === 'custom' || !tab.path ? '' : `#${encodeURIComponent(tab.path)}`;
+    const hash = tab.type === 'custom' || !tab.path ? '' : `#${UI.encPath(tab.path)}`;
     if (location.hash !== hash) history.replaceState(null, '', hash || location.pathname + location.search);
     if (tab.type === 'file') {
       const m = tab.model;
@@ -814,8 +847,27 @@ const Tabs = (() => {
   const under = (p, base) => p === base || p.startsWith(base + '/');
   const moved = (p, from, to) => to + p.slice(from.length);
 
+  // an open file with unsaved changes at a path a rename would move something onto (one deleted
+  // on disk, so git or the server allow the move): the rename must wait until it is saved or closed
+  function renameBlocked(from, to) {
+    for (const m of models.values()) {
+      if (!under(m.path, from)) continue;
+      const o = models.get(moved(m.path, from, to));
+      if (o && o !== m && !under(o.path, from) && o.dirty) return o.path;
+    }
+    return null;
+  }
+
   function renamePath(from, to) {
     UI.stat.bump();   // polls already under way still name the old paths
+    // what is open at the paths things move onto (files deleted on disk, or the move would have
+    // failed) closes: it would be left with the name of the file moved there, and no way to save
+    // (Explorer asks for unsaved changes there to be dealt with first: renameBlocked)
+    const dests = new Set([...models.keys(), ...tabs.map(t => t.path)].filter(p => p && under(p, from)).map(p => moved(p, from, to)));
+    for (const t of tabs.slice()) {
+      const p = t.model ? t.model.path : t.type !== 'custom' ? t.path : null;
+      if (p && !under(p, from) && dests.has(p)) remove(t);
+    }
     for (const m of [...models.values()]) {
       if (!under(m.path, from)) continue;
       models.delete(m.path);
@@ -848,7 +900,7 @@ const Tabs = (() => {
     if (active && active.type === 'file') {
       applyEditorOptions(active.model);
       main.dataset.kind = active.model.category === 'md' ? 'md' : 'text';
-      history.replaceState(null, '', `#${encodeURIComponent(active.path)}`);
+      history.replaceState(null, '', `#${UI.encPath(active.path)}`);
     }
     renderStrip();
     renderHead();
@@ -975,7 +1027,7 @@ const Tabs = (() => {
     model: p => models.get(p), models: () => [...models.values()],
     acquire, release,
     linkedDoc: m => m.doc.linkedDoc({ sharedHist: true, mode: m.doc.modeOption }),
-    loadMode, save, saveAll, anyDirty, renamePath, pathDeleted, reload,
+    loadMode, save, saveAll, anyDirty, renamePath, renameBlocked, pathDeleted, reload,
     confirmLeave, closeAll, restore, registerType, setStatus, autosave,
     on, cm: () => cm, categoryOf,
   };

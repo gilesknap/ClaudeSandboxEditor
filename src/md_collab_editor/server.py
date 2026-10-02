@@ -37,9 +37,11 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -141,15 +143,20 @@ def safe_path(rel: str, follow=True) -> Path:
     creating, renaming and deleting); the folder holding it must still be inside ROOT."""
     if not isinstance(rel, str) or "\0" in rel:
         raise ValueError("bad path")
-    if follow:
-        p = (ROOT / rel).resolve()
-        if p != ROOT and ROOT not in p.parents:
-            raise ValueError("path escapes the root folder")
-        return p
-    lex = Path(os.path.normpath(ROOT / rel))
-    if lex == ROOT:
-        return ROOT
-    parent = lex.parent.resolve()
+    try:
+        if follow:
+            p = (ROOT / rel).resolve()
+            if p != ROOT and ROOT not in p.parents:
+                raise ValueError("path escapes the root folder")
+            if os.path.islink(p):  # 3.13 hands back a link it could not resolve: a loop
+                raise RuntimeError
+            return p
+        lex = Path(os.path.normpath(ROOT / rel))
+        if lex == ROOT:
+            return ROOT
+        parent = lex.parent.resolve()
+    except RuntimeError:  # Python 3.9-3.12 raise this for a symlink loop (3.13 resolves what it can)
+        raise ValueError(f"symlink loop: {rel}")
     if parent != ROOT and ROOT not in parent.parents:
         raise ValueError("path escapes the root folder")
     return parent / lex.name
@@ -240,6 +247,7 @@ ALLFILES_MAX = 50_000
 SEARCH_MAX = 2000        # matches
 SEARCH_TIMEOUT = 60      # seconds for one search (git grep is killed; the walk gives up)
 PREVIEW = 300            # characters of a matching line in a search result
+LINE_MAX = 1 << 20       # bytes of a line that git grep found that a search looks at
 STATUS_MAX = 5000        # changed files in one /api/git/status answer
 
 LANGS = {
@@ -392,9 +400,12 @@ def api_tree(q):
                 continue
             entries.append({"name": e.name, "path": f"{base}/{e.name}" if base else e.name, "dir": is_dir,
                             "size": size, "hidden": hidden, "ignored": False})
-    ignored = git_ignored([e["path"] for e in entries])
+    # git knows the files where they really are: a folder reached through a symlink is
+    # asked about at its target
+    real = d.relative_to(ROOT).as_posix() if d != ROOT else ""
+    ignored = git_ignored([f"{real}/{e['name']}" if real else e["name"] for e in entries], real)
     for e in entries:
-        e["ignored"] = e["path"] in ignored
+        e["ignored"] = (f"{real}/{e['name']}" if real else e["name"]) in ignored
     if not show_all:
         entries = [e for e in entries if not e["ignored"]]
     entries.sort(key=lambda e: (not e["dir"], e["name"].lower(), e["name"]))
@@ -402,7 +413,9 @@ def api_tree(q):
 
 
 def dir_stamp(rel):
-    """A short hash of a folder's direct entries (name, is folder, mtime), or "0" if it is gone."""
+    """A short hash of a folder's direct entries (name, is folder), or "0" if it is gone: what
+    its rows in the tree show, so saving a file in it does not make the page list it again. A
+    .gitignore's mtime is in it too, since that file decides which entries are ignored."""
     try:
         items = []
         with os.scandir(safe_path(rel)) as it:
@@ -410,7 +423,8 @@ def dir_stamp(rel):
                 if e.name == ".git":
                     continue
                 try:
-                    items.append((e.name, e.is_dir(), e.stat(follow_symlinks=False).st_mtime_ns))
+                    items.append((e.name, e.is_dir(), e.stat(follow_symlinks=False).st_mtime_ns
+                                  if e.name == ".gitignore" else 0))
                 except OSError:
                     items.append((e.name, False, 0))
     except (ValueError, OSError):
@@ -550,13 +564,17 @@ def split_globs(spec):
 
 
 def expand_braces(g, limit=64):
-    m = re.search(r"\{([^{}]*)\}", g)
-    if not m:
-        return [g]
-    out = []
-    for alt in m.group(1).split(","):
-        out += expand_braces(g[:m.start()] + alt + g[m.end():], limit)
-        if len(out) > limit:
+    """{a,b} alternatives, innermost first; a loop rather than recursion, so a glob of a thousand
+    {…} groups is just slow to refuse rather than a RecursionError."""
+    out, todo = [], [g]
+    while todo:
+        s = todo.pop()
+        m = re.search(r"\{([^{}]*)\}", s)
+        if not m:
+            out.append(s)
+        else:
+            todo += [s[:m.start()] + alt + s[m.end():] for alt in reversed(m.group(1).split(","))]
+        if len(out) + len(todo) > limit:
             raise ValueError("too many {…} alternatives in the include globs")
     return out
 
@@ -611,10 +629,15 @@ def glob_re(g):
                 out.append(re.escape(c))
                 i += 1
             else:
-                body = g[i + 1:j]
-                if body[:1] in ("!", "^"):
-                    body = "^" + body[1:]
-                out.append("[" + body.replace("\\", "\\\\") + "]")
+                body, neg = g[i + 1:j], g[i + 1:i + 2] in ("!", "^")
+                if neg:
+                    body = body[1:]
+                # every character literal (escaped: no nested sets, &&, ~~ or || for re to warn
+                # about), except a - between two others, which makes a range
+                cls = "".join("-" if c == "-" and 0 < k < len(body) - 1 and body[k - 1] != "-"
+                              else c if c.isalnum() or ord(c) > 127 else "\\" + c
+                              for k, c in enumerate(body))
+                out.append("[" + ("^" if neg else "") + cls + "]")
                 i = j + 1
         else:
             out.append(re.escape(c))
@@ -646,14 +669,17 @@ def search_pattern(q, regex, case, word):
     return re.compile(pat, 0 if case else re.IGNORECASE)
 
 
-def line_spans(pat, line):
-    """Where pat matches in line: its non-empty matches, else its first empty one, else None."""
+def line_spans(pat, line, limit=SEARCH_MAX + 1):
+    """Where pat matches in line: its non-empty matches (at most `limit`), else its first empty
+    one, else None."""
     if pat is None:
         return None
     spans, empty = [], None
     for m in pat.finditer(line):
         if m.end() > m.start():
             spans.append(m.span())
+            if len(spans) >= limit:
+                break
         elif empty is None:
             empty = m.span()
     return spans or ([empty] if empty is not None else None)
@@ -672,64 +698,114 @@ def search_hit(path, n, line, s, e):
             "text": line[off:off + PREVIEW], "offset": js_len(line[:off])}
 
 
-def grep_records(stream):
-    """(path, line number, column, text) byte strings from `git grep -n --column -z` output."""
-    buf = b""
+def grep_records(stream, line_max=LINE_MAX):
+    """(path, line number, column, text) byte strings from `git grep -n --column -z` output, in
+    one pass over it (a minified file's single line can be megabytes); text past line_max bytes
+    of a line is dropped."""
+    head, text, nuls = bytearray(), bytearray(), 0
     while True:
         chunk = stream.read1(65536)
         if not chunk:
             return
-        buf += chunk
-        pos = 0
-        while True:
-            i1 = buf.find(b"\0", pos)
-            i2 = buf.find(b"\0", i1 + 1) if i1 >= 0 else -1
-            i3 = buf.find(b"\0", i2 + 1) if i2 >= 0 else -1
-            nl = buf.find(b"\n", i3 + 1) if i3 >= 0 else -1
-            if nl < 0:
+        i, n = 0, len(chunk)
+        while i < n:
+            if nuls < 3:  # path\0line\0column\0
+                j = chunk.find(b"\0", i)
+                if j < 0:
+                    head += chunk[i:]
+                    break
+                head += chunk[i:j + 1]
+                nuls += 1
+                i = j + 1
+                continue
+            j = chunk.find(b"\n", i)
+            end = n if j < 0 else j
+            if len(text) < line_max:
+                text += chunk[i:min(end, i + line_max - len(text))]
+            if j < 0:
                 break
-            yield buf[pos:i1], buf[i1 + 1:i2], buf[i2 + 1:i3], buf[i3 + 1:nl]
-            pos = nl + 1
-        buf = buf[pos:]
+            path, line, col, _ = bytes(head).split(b"\0")
+            yield path, line, col, bytes(text)
+            head.clear()
+            text.clear()
+            nuls = 0
+            i = j + 1
 
 
-def grep_git(query, regex, case, word, globs, pat):
-    """Search with git grep (tracked and untracked files, not ignored or binary ones); match
-    positions come from `pat`, or from git's column when Python's regex flavour disagrees."""
-    args = ["grep", "-n", "-I", "--column", "-z", "--untracked", "--no-color"]
-    if not case:
-        args.append("-i")
-    if word:
-        args.append("-w")
-    args.append(("-P" if git_pcre() else "-E") if regex else "-F")
-    args += ["-e", query, "--"] + git_pathspecs(globs)
+class Watchdog(threading.Thread):
+    """Calls kill() once the deadline passes (why = "timeout") or the client of `conn`, a request's
+    socket, has gone away (why = "gone": a newer search replaced it)."""
+
+    def __init__(self, kill, deadline, conn=None):
+        super().__init__(daemon=True)
+        self.kill, self.deadline, self.conn = kill, deadline, conn
+        self.why = None
+        self.done = threading.Event()
+
+    def run(self):
+        while not self.done.wait(0.2):
+            if time.monotonic() > self.deadline:
+                self.why = "timeout"
+            elif self.conn is not None and client_gone(self.conn):
+                self.why = "gone"
+            else:
+                continue
+            try:
+                self.kill()
+            except OSError:
+                pass
+            return
+
+    def stop(self):
+        self.done.set()
+
+    def check(self):
+        """Raise the ApiError for why the search was stopped, if it was."""
+        if self.why == "timeout":
+            raise ApiError(504, "the search took too long")
+        if self.why == "gone":
+            raise ApiError(499, "the search was cancelled")
+
+
+def client_gone(conn):
+    """Whether the other end of this socket has closed it (an aborted fetch)."""
+    try:
+        if not select.select([conn], [], [], 0)[0]:
+            return False
+        return conn.recv(1, socket.MSG_PEEK) == b""
+    except BlockingIOError:
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def grep_run(args, deadline, skip_big):
+    """Records of one `git grep` run (killed at the deadline or when the client goes away)."""
     err = tempfile.TemporaryFile()
     proc = subprocess.Popen(["git"] + GIT_OPTS + args, cwd=str(ROOT), stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=err, env=git_env())
-    timer = threading.Timer(SEARCH_TIMEOUT, proc.kill)
-    timer.start()
+    dog = Watchdog(proc.kill, deadline, getattr(REQUEST, "conn", None))
+    dog.start()
     try:
-        for path_b, line_b, col_b, text_b in grep_records(proc.stdout):
-            path = os.fsdecode(path_b)
-            if text_b.endswith(b"\r"):
-                text_b = text_b[:-1]
-            line = text_b.decode("utf-8", "replace")
-            spans = line_spans(pat, line)
-            if spans is None:
-                c = len(text_b[:max(0, int(col_b) - 1)].decode("utf-8", "replace"))
-                spans = [(c, c)]
-            for s, e in spans:
-                yield search_hit(path, int(line_b), line, s, e)
+        last, skip = None, False
+        for rec in grep_records(proc.stdout):
+            if rec[0] != last:  # over 5 MB: the editor would not open it anyway, as the walk skips it
+                last = rec[0]
+                try:
+                    skip = skip_big and os.stat(os.path.join(ROOT, os.fsdecode(last))).st_size > TEXT_MAX
+                except OSError:
+                    skip = False
+            if not skip:
+                yield rec
         rc = proc.wait()
+        dog.check()
         if rc not in (0, 1):
-            if not timer.is_alive():
-                raise ApiError(504, "the search took too long")
             err.seek(0)
             msg = err.read().decode("utf-8", "replace").strip()
-            msg = re.sub(r"^(fatal|error): ", "", msg.splitlines()[-1] if msg else f"git grep failed ({rc})")
-            raise ApiError(400, f"invalid regular expression: {msg}") if regex else ApiError(500, msg)
+            raise GrepError(re.sub(r"^(fatal|error): ", "", msg.splitlines()[-1] if msg else f"git grep failed ({rc})"))
     finally:
-        timer.cancel()
+        dog.stop()
+        dog.join()  # before the process is reaped and its pid can be reused
         if proc.poll() is None:
             proc.kill()
         proc.wait()
@@ -737,13 +813,53 @@ def grep_git(query, regex, case, word, globs, pat):
         err.close()
 
 
-def grep_walk(pat, globs, regex):
+class GrepError(Exception):
+    """git grep refused the search (as git words it)."""
+
+
+def grep_git(query, regex, case, word, globs, pat, deadline, pcre=None):
+    """Search with git grep: tracked files (all of them: git grep --untracked would also leave out
+    tracked files that match an ignore rule), then untracked files that are not ignored; never
+    binary files or ones over 5 MB. Match positions come from `pat`, or from git's column when
+    Python's regex flavour disagrees."""
+    args = ["grep", "-n", "-I", "--column", "-z", "--no-color"]
+    if not case:
+        args.append("-i")
+    if word:
+        args.append("-w")
+    if regex and pcre is None:
+        pcre = git_pcre()
+    args.append(("-P" if pcre else "-E") if regex else "-F")
+    specs = git_pathspecs(globs)
+    runs = [args + ["-e", query, "--"] + specs]
+    r = git(["ls-files", "-z", "--others", "--exclude-standard", "--"] + specs, ROOT)
+    untracked = [n for n in r.stdout.split(b"\0") if n and not n.endswith(b"/")] if r.returncode == 0 else []
+    for k in range(0, len(untracked), 500):  # literal pathspecs, a command line at a time
+        runs.append(args + ["--untracked", "-e", query, "--"]
+                    + [":(literal)" + os.fsdecode(n) for n in untracked[k:k + 500]])
+    try:
+        for run in runs:
+            for path_b, line_b, col_b, text_b in grep_run(run, deadline, True):
+                path = os.fsdecode(path_b)
+                if text_b.endswith(b"\r"):
+                    text_b = text_b[:-1]
+                line = text_b.decode("utf-8", "replace")
+                spans = line_spans(pat, line)
+                if spans is None:
+                    c = len(text_b[:max(0, int(col_b) - 1)].decode("utf-8", "replace"))
+                    spans = [(c, c)]
+                for s, e in spans:
+                    yield search_hit(path, int(line_b), line, s, e)
+    except GrepError as exc:
+        raise ApiError(400, f"invalid regular expression: {exc}") if regex else ApiError(500, str(exc))
+
+
+def grep_walk(pat, globs, regex, deadline):
     """Search by walking ROOT (no hidden folders or SKIP_DIRS, no symlinks, binary or big files).
     A plain-text search first tries each whole file; a regex ($, \\A, lookarounds) might match a
     whole file differently from its lines, so it goes line by line."""
     inc = [glob_re(g) for g, neg in globs if not neg]
     exc = [glob_re(g) for g, neg in globs if neg]
-    deadline = time.monotonic() + SEARCH_TIMEOUT
     for rel in walk_files():
         if time.monotonic() > deadline:
             raise ApiError(504, "the search took too long")
@@ -764,6 +880,106 @@ def grep_walk(pat, globs, regex):
                 yield search_hit(rel, n, line, s, e)
 
 
+def search_gen(job, deadline):
+    """The hits of a search job ({engine, q, regex, case, word, globs, pcre?}), in this process."""
+    try:
+        pat = search_pattern(job["q"], job["regex"], job["case"], job["word"])
+    except (re.error, OverflowError, RecursionError):
+        pat = None  # api_search has already refused this for the walk; git's PCRE may still take it
+    if job["engine"] == "git":
+        return grep_git(job["q"], job["regex"], job["case"], job["word"], job["globs"], pat, deadline,
+                        job.get("pcre"))
+    return grep_walk(pat, job["globs"], job["regex"], deadline)
+
+
+# Python's re has no time limit, and a regex that backtracks (`(a+)+$`) can run for hours while
+# holding the GIL, which would stop every other request: so a regular-expression search runs in
+# a child process, killed at the time limit or as soon as its client goes away.
+SEARCHES = set()           # running search processes, ended when md-editor exits
+SEARCH_LOCK = threading.Lock()
+SEARCH_CHILD = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                "from md_collab_editor.server import search_child_main; search_child_main()")
+
+
+def kill_search(proc):
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)  # with its git grep
+        else:
+            proc.kill()
+    except OSError:
+        pass
+
+
+def search_child(job, deadline):
+    """The hits of a search job, found by a child process (`python -I`: nothing in the folder
+    being searched can be imported by it)."""
+    err = tempfile.TemporaryFile()
+    proc = subprocess.Popen([sys.executable, "-I", "-c", SEARCH_CHILD, str(HERE.parent)], cwd=str(HERE),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err,
+                            start_new_session=os.name == "posix")
+    with SEARCH_LOCK:
+        SEARCHES.add(proc)
+    dog = Watchdog(lambda: kill_search(proc), deadline, getattr(REQUEST, "conn", None))
+    dog.start()
+    try:
+        job = dict(job, root=str(ROOT), timeout=max(1.0, deadline - time.monotonic()))
+        try:
+            proc.stdin.write(json.dumps(job).encode())
+            proc.stdin.close()
+        except OSError:
+            pass
+        for line in proc.stdout:
+            msg = json.loads(line)
+            if "error" in msg:
+                raise ApiError(msg.get("status") or 500, msg["error"])
+            if msg.get("end"):
+                return
+            yield msg
+        proc.wait()
+        dog.check()
+        err.seek(0)
+        tail = err.read().decode("utf-8", "replace").strip().splitlines()
+        raise ApiError(500, "the search failed" + (f": {tail[-1]}" if tail else ""))
+    finally:
+        dog.stop()
+        dog.join()  # before the process is reaped and its pid can be reused
+        kill_search(proc)
+        proc.wait()
+        proc.stdout.close()
+        err.close()
+        with SEARCH_LOCK:
+            SEARCHES.discard(proc)
+
+
+def search_child_main():
+    """The child process of search_child: a job as JSON on stdin; one JSON hit per line on
+    stdout, then {"end": true} or {"error", "status"}."""
+    global ROOT
+    job = json.loads(sys.stdin.buffer.read())
+    ROOT = Path(job["root"])
+    if hasattr(signal, "alarm"):  # in case md-editor is gone: SIGALRM's default action ends it
+        signal.alarm(int(job["timeout"]) + 10)
+    out = sys.stdout.buffer
+    try:
+        for hit in search_gen(job, time.monotonic() + job["timeout"]):
+            out.write(json.dumps(hit).encode() + b"\n")
+        out.write(b'{"end": true}\n')
+    except ApiError as exc:
+        out.write(json.dumps({"error": str(exc), "status": exc.status}).encode() + b"\n")
+    except BrokenPipeError:
+        return
+    out.flush()
+
+
+def end_searches():
+    """At exit: kill the searches still running."""
+    with SEARCH_LOCK:
+        procs = list(SEARCHES)
+    for proc in procs:
+        kill_search(proc)
+
+
 def api_search(q):
     """GET /api/search: find in files, git grep in a work tree, else a walk with Python's re."""
     query = q.get("q", "")
@@ -774,13 +990,24 @@ def api_search(q):
     engine = "git" if ws_git() is not None else "walk"
     if not query:
         return {"results": [], "truncated": False, "engine": engine}
+    if engine == "walk":
+        try:
+            for g, _ in globs:
+                glob_re(g)
+        except re.error as exc:
+            raise ApiError(400, f"invalid include glob: {exc}")
     try:
-        pat = search_pattern(query, regex, case, word)
-    except re.error as exc:
+        search_pattern(query, regex, case, word)
+    except (re.error, OverflowError, RecursionError) as exc:
         if engine == "walk":
             raise ApiError(400, f"invalid regular expression: {exc}")
-        pat = None  # git's PCRE may still take it
-    hits = grep_git(query, regex, case, word, globs, pat) if engine == "git" else grep_walk(pat, globs, regex)
+        # git's PCRE may still take it
+    job = {"engine": engine, "q": query, "regex": regex, "case": case, "word": word, "globs": globs}
+    if engine == "git" and regex:
+        job["pcre"] = git_pcre()
+    deadline = time.monotonic() + env_seconds("MDEDIT_SEARCH_TIMEOUT", SEARCH_TIMEOUT)
+    # a plain-text pattern can't backtrack (re.escape, at most with word-boundary checks)
+    hits = search_child(job, deadline) if regex else search_gen(job, deadline)
     results, truncated = [], False
     try:
         for h in hits:
@@ -789,7 +1016,7 @@ def api_search(q):
                 break
             results.append(h)
     finally:
-        hits.close()  # stops git grep
+        hits.close()  # stops git grep, or the child process
     return {"results": results, "truncated": truncated, "engine": engine}
 
 
@@ -799,9 +1026,18 @@ def api_search(q):
 # after `--` (literal pathspecs where they name files), the search pattern after -e, and the
 # only revisions are HEAD and refs and SHAs that git itself gave us.
 
-# repository settings that would change the output parsed here
+# Repository settings that would change the output parsed here, and ones that name commands for
+# git to run: md-editor runs git on this machine, outside the sandbox that the terminal's Claude
+# runs in, and that sandbox can write the repository's .git/config and .git/hooks. So no
+# fsmonitor hook (git status, ls-files and check-ignore would run it), no hooks (git restore runs
+# post-checkout), no submodules; clean/smudge filters: see filter_opts.
 GIT_OPTS = ["-c", "color.ui=false", "-c", "core.quotePath=false", "-c", "diff.relative=false",
-            "-c", "grep.fullName=false"]
+            "-c", "grep.fullName=false", "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
+            "-c", "submodule.recurse=false"]
+FILTER_CMDS = ("status", "diff", "restore", "checkout", "rm")  # the ones that run filter drivers
+# Git LFS's own filter commands (as `git lfs install` writes them) are left alone
+LFS_FILTER = {"clean": ("git-lfs clean -- %f",), "smudge": ("git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"),
+              "process": ("git-lfs filter-process", "git-lfs filter-process --skip")}
 GIT_ENV_DROP = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_COMMON_DIR",
                 "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX", "GIT_LITERAL_PATHSPECS",
                 "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS")
@@ -820,11 +1056,37 @@ def git_env(literal=False):
     return env
 
 
+def filter_opts(cwd):
+    """-c options that switch off every clean/smudge filter driver in git's configuration, except
+    Git LFS's: the commands in FILTER_CMDS would otherwise run whatever a driver names for files
+    that .gitattributes gives it. Reading the configuration runs nothing. (Something that keeps
+    rewriting .git/config could still slip a driver in between this and the command itself.)"""
+    r = subprocess.run(["git"] + GIT_OPTS + ["config", "-z", "--get-regexp", r"^filter\."], cwd=str(cwd),
+                       capture_output=True, stdin=subprocess.DEVNULL, env=git_env(), timeout=60)
+    drivers = {}
+    for item in r.stdout.split(b"\0") if r.returncode == 0 else ():
+        key, _, value = os.fsdecode(item).partition("\n")
+        name, _, var = key[len("filter."):].rpartition(".")
+        if key.startswith("filter.") and name and var in ("clean", "smudge", "process"):
+            safe = value.strip() in LFS_FILTER[var] if name == "lfs" else False
+            drivers[name] = drivers.get(name, True) and safe
+    opts = []
+    for name, safe in drivers.items():
+        if safe:
+            continue
+        if "=" in name:  # -c can't name it (its key ends at the first =)
+            raise OSError(f"git's configuration has a filter driver named {name!r}, which md-editor won't run git with")
+        for var, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")):
+            opts += ["-c", f"filter.{name}.{var}={value}"]
+    return opts
+
+
 def git(args, cwd, input=None, literal=False, timeout=60):
     """Run git with bytes in and out; a failing git is the caller's to judge from returncode.
     Raises OSError if git cannot run at all."""
     kw = {"input": input} if input is not None else {"stdin": subprocess.DEVNULL}
-    return subprocess.run(["git"] + GIT_OPTS + list(args), cwd=str(cwd), capture_output=True,
+    extra = filter_opts(cwd) if args and args[0] in FILTER_CMDS else []
+    return subprocess.run(["git"] + GIT_OPTS + extra + list(args), cwd=str(cwd), capture_output=True,
                           env=git_env(literal), timeout=timeout, **kw)
 
 
@@ -865,18 +1127,42 @@ def ws_git():
     return repo["top"] if repo["top"] is not None and not repo["ignored"] else None
 
 
-def git_ignored(paths):
-    """Which of these ROOT-relative paths git ignores: one check-ignore call."""
+def check_ignore(paths, index):
+    """The paths among these that check-ignore reports; None if it fails."""
+    # check-ignore takes no literal pathspecs; after ./ a leading : is not pathspec magic
+    r = git(["check-ignore", "-z", "--stdin"] + ([] if index else ["--no-index"]), ROOT,
+            input=b"".join(b"./" + os.fsencode(p) + b"\0" for p in paths))
+    if r.returncode not in (0, 1):  # e.g. a path inside a nested repository
+        return None
+    return {os.fsdecode(p[2:] if p.startswith(b"./") else p) for p in r.stdout.split(b"\0") if p}
+
+
+def git_ignored(paths, folder=""):
+    """Which of these ROOT-relative paths (the entries of `folder`, a real path: no symlinks on
+    the way, which git refuses) git ignores. A tracked file is never ignored, nor is a folder
+    with tracked files in it. With the index, check-ignore takes time in proportion to the
+    number of paths times the size of the index, so it first asks without the index (quick),
+    then sorts out the few it names with the index, or with the tracked files under `folder`."""
     if not paths or ws_git() is None:
         return set()
-    # check-ignore takes no literal pathspecs; after ./ a leading : is not pathspec magic
     try:
-        r = git(["check-ignore", "-z", "--stdin"], ROOT, input=b"".join(b"./" + os.fsencode(p) + b"\0" for p in paths))
+        cand = check_ignore(paths, False)
+        if not cand:
+            return set()
+        if len(cand) <= 64:
+            return check_ignore(sorted(cand), True) or set()
+        r = git(["ls-files", "-z", "--cached", "--", folder or "."], ROOT, literal=True)
+        if r.returncode != 0:
+            return set()
     except (OSError, subprocess.SubprocessError):
         return set()
-    if r.returncode not in (0, 1):  # e.g. a path beyond a symlink
-        return set()
-    return {os.fsdecode(p[2:] if p.startswith(b"./") else p) for p in r.stdout.split(b"\0") if p}
+    tracked = set()
+    for f in r.stdout.split(b"\0"):  # each tracked file, and the folders it is in
+        f = os.fsdecode(f)
+        while f and f not in tracked:
+            tracked.add(f)
+            f = posixpath.dirname(f)
+    return cand - tracked
 
 
 def git_pcre():
@@ -1062,7 +1348,7 @@ def api_git_status(q):
             return p
         return p[len(rr) + 1:] if p.startswith(rr + "/") else None
 
-    files, outside = {}, 0
+    files, outside, nested = {}, 0, 0
 
     def add(path, status, old=None):
         prev = files.get(path)
@@ -1075,6 +1361,10 @@ def api_git_status(q):
             files[path]["old_path"] = old
 
     for status, p, old in entries:
+        if p.endswith("/"):  # an untracked folder: a repository of its own (or a worktree) inside this one
+            if inside(p.rstrip("/")) is not None:
+                nested += 1
+            continue
         rp = inside(p)
         if status == "R":
             ro = inside(old)
@@ -1091,7 +1381,7 @@ def api_git_status(q):
         else:
             add(rp, status)
     listed = sorted(files.values(), key=lambda f: f["path"])
-    out = {"repo": True, "base": base, "files": listed[:STATUS_MAX], "outside": outside}
+    out = {"repo": True, "base": base, "files": listed[:STATUS_MAX], "outside": outside, "nested": nested}
     if len(listed) > STATUS_MAX:
         out["truncated"] = True
     return out
@@ -1112,11 +1402,15 @@ def api_git_show(q):
     path = top_rel(q.get("old_path") or q["path"], repo)
     if not base["sha"]:
         return {"exists": False, "binary": False}
-    r = git(["cat-file", "blob", f"{base['sha']}:{path}"], repo["top"])
+    spec = f"{base['sha']}:{path}"
+    r = git(["cat-file", "-s", spec], repo["top"])  # the size first: no need to read a big one
     if r.returncode != 0:
         return {"exists": False, "binary": False}
-    if len(r.stdout) > TEXT_MAX:
+    if int(r.stdout.strip() or 0) > TEXT_MAX:
         return {"exists": True, "binary": False, "too_large": True}
+    r = git(["cat-file", "blob", spec], repo["top"])
+    if r.returncode != 0:
+        return {"exists": False, "binary": False}
     text = decode_text(r.stdout)
     return {"exists": True, "binary": True} if text is None else {"exists": True, "binary": False, "text": text}
 
@@ -2231,6 +2525,7 @@ class WSProtocolError(Exception):
 # PUT and WebSocket request, so other websites are refused. Any port is fine, so port
 # forwarding (8765 → 8766, say) still works.
 LOCAL_HOSTS = ("127.0.0.1", "localhost", "[::1]")
+REQUEST = threading.local()  # .conn: the socket of the API request this thread is answering
 QUIET_POLLS = ("/api/stat", "/api/git/status", "/api/git/info")  # not logged when they succeed
 HOST_RE = re.compile(r"(\[[0-9A-Fa-f:.]+\]|[^\[\]:/@\s]+)(?::[0-9]{1,5})?")
 
@@ -2248,6 +2543,12 @@ class Handler(SimpleHTTPRequestHandler):
         m = HOST_RE.fullmatch(host)
         if not m or m.group(1).lower() not in LOCAL_HOSTS:
             return f"Host {host[:100]!r} is not this machine"
+        # Browsers say who made a request: another site's page (an <img> or <iframe> pointed at
+        # a search that runs for a minute, say) gets nothing from the API or the folder's files.
+        # Our own page's requests are same-origin, and a typed address is "none".
+        site = self.headers.get("Sec-Fetch-Site")
+        if site in ("cross-site", "same-site") and urlparse(self.path).path.startswith(("/api/", "/raw/")):
+            return f"a {site} request"
         origins = self.headers.get_all("Origin") or []
         if len(origins) > 1:
             return "more than one Origin header"
@@ -2314,6 +2615,7 @@ class Handler(SimpleHTTPRequestHandler):
     def answer(self, fn, arg):
         """Reply with fn(arg) as JSON, or {"error": message}: ApiError has its own status, bad
         input is 400 and a failing file operation 500."""
+        REQUEST.conn = self.connection  # a long search stops when its client goes away
         try:
             if not isinstance(arg, dict):
                 raise ValueError("expected a JSON object")
@@ -2329,7 +2631,15 @@ class Handler(SimpleHTTPRequestHandler):
         except OSError as exc:
             msg = f"{exc.strerror}: {exc.filename}" if exc.strerror and exc.filename else str(exc)
             res, status = {"error": msg}, 404 if isinstance(exc, FileNotFoundError) else 500
-        return self.send_json(res, status)
+        except Exception as exc:  # a bug: still answer, rather than drop the connection
+            traceback.print_exc()
+            res, status = {"error": f"internal error: {type(exc).__name__}: {exc}"}, 500
+        finally:
+            REQUEST.conn = None
+        try:
+            return self.send_json(res, status)
+        except (BrokenPipeError, ConnectionResetError):  # e.g. a search the page gave up on
+            pass
 
     def do_HEAD(self):
         if not self.guard():
@@ -2339,7 +2649,8 @@ class Handler(SimpleHTTPRequestHandler):
         u = urlparse(self.path)
         if self.guard(need_origin=u.path == "/api/term"):
             return
-        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        # surrogateescape: a file name that is not UTF-8 comes back as the bytes it is on disk
+        q = {k: v[0] for k, v in parse_qs(u.query, errors="surrogateescape").items()}
         try:
             if u.path == "/api/config":
                 return self.send_json({"root": str(ROOT), "initial": INITIAL, "skills": list_skills(),
@@ -2367,7 +2678,7 @@ class Handler(SimpleHTTPRequestHandler):
             if u.path == "/api/events":
                 return self.events()
             if u.path.startswith("/raw/"):
-                return self.send_raw(unquote(u.path[len("/raw/"):]))
+                return self.send_raw(unquote(u.path[len("/raw/"):], errors="surrogateescape"))
         except (ValueError, KeyError) as exc:
             return self.send_json({"error": str(exc)}, 400)
         return super().do_GET()
@@ -2663,6 +2974,7 @@ def main():
             signal.signal(sig, _interrupt)
     atexit.register(TERM.kill)
     atexit.register(end_asks)
+    atexit.register(end_searches)
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     try:
@@ -2672,6 +2984,7 @@ def main():
     finally:
         TERM.kill()
         end_asks()
+        end_searches()
         server.server_close()
 
 

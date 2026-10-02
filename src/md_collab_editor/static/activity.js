@@ -13,6 +13,8 @@
 //   Activity.setSidebar(on, persist = true)  show / hide the sidebar (keeps the current panel);
 //                           in a narrow window showing it hides the Claude panel
 //   Activity.current()      id of the current panel (even while collapsed)
+//   Activity.fit()          re-apply the remembered width, within what the window and the
+//                           Claude panel leave (app.js, when the Claude panel opens or resizes)
 //   Activity.visible(id)    is that panel on screen
 //   Activity.get(id)        handle or undefined
 //   Activity.onLayout(fn)   fn() after the sidebar is shown, hidden or resized (app.js refits)
@@ -23,7 +25,9 @@ const Activity = (() => {
   const views = document.getElementById('side-views');
   const entries = new Map();
   const layoutFns = new Set();
+  // the chosen panel; until it is registered (scm.js and search.js come later) the first one shows
   let current = UI.store.get('mdedit.activity', 'explorer');
+  const shown = () => (entries.has(current) ? current : entries.keys().next().value);
   if (UI.store.get('mdedit.files', '1') === '0' || innerWidth < 800) document.body.classList.add('no-sidebar');
 
   const sidebarOn = () => !document.body.classList.contains('no-sidebar');
@@ -70,22 +74,28 @@ const Activity = (() => {
     }
     // keep the buttons in order
     [...entries.values()].sort((a, b) => a.order - b.order).forEach(x => bar.append(x.button));
+    const was = shownId;
     apply();
+    // the panel was already on screen as a placeholder: it gets its real onShow, once the
+    // script registering it has set itself up
+    if (opts.onShow && was === id && shownId === id) {
+      queueMicrotask(() => { if (shownId === id) { try { e.opts.onShow?.(); } catch (err) { console.error(err); } } });
+    }
     return e.handle;
   }
 
-  function visible(id) { return sidebarOn() && current === id; }
+  function visible(id) { return sidebarOn() && shown() === id; }
 
   let shownId = null;   // the panel whose onShow ran last (null while the sidebar is collapsed)
   function apply() {
-    if (!entries.has(current)) current = entries.keys().next().value;
+    const cur = shown();
     for (const e of entries.values()) {
-      const on = e.id === current;
+      const on = e.id === cur;
       e.panel.hidden = !on;
       e.button.classList.toggle('on', on && sidebarOn());
       e.button.setAttribute('aria-selected', on && sidebarOn() ? 'true' : 'false');
     }
-    const now = sidebarOn() ? current : null;
+    const now = sidebarOn() ? cur : null;
     if (now !== shownId) {
       const was = entries.get(shownId);
       shownId = now;
@@ -112,17 +122,25 @@ const Activity = (() => {
   }
 
   function toggle(id) {
-    id = id || current;
-    if (sidebarOn() && current === id) setSidebar(false);
+    id = id || shown();
+    if (sidebarOn() && shown() === id) setSidebar(false);
     else show(id);
   }
 
   // ---------------------------------------------------------------- resizable width
 
   const MIN = 170;
+  const EDITOR_MIN = 240;   // what the side bar and the Claude panel always leave the editor
   const defaultWidth = () => 260;
+  const narrow = () => matchMedia('(max-width: 800px)').matches;   // both are overlays there
+  // the width the side bar may take: some of the window, and never the editor's share
+  function maxWidth() {
+    const claude = document.getElementById('claude');
+    const other = !narrow() && claude && !document.body.classList.contains('no-claude') ? claude.getBoundingClientRect().width : 0;
+    return Math.min(innerWidth * 0.6, innerWidth - bar.getBoundingClientRect().width - other - EDITOR_MIN);
+  }
   function setWidth(w, persist) {
-    w = Math.round(Math.max(MIN, Math.min(innerWidth * 0.6, w)));
+    w = Math.round(Math.max(MIN, Math.min(maxWidth(), w)));
     sidebar.style.width = w + 'px';
     if (persist) UI.store.set('mdedit.sidebarWidth', String(w));
   }
@@ -171,9 +189,10 @@ const Activity = (() => {
 
   return {
     register, show, toggle, setSidebar, visible,
-    current: () => current,
+    current: shown,
     get: id => entries.get(id)?.handle,
     sidebarOn,
+    fit: applyWidth,
     onLayout(fn) { layoutFns.add(fn); return () => layoutFns.delete(fn); },
     ICONS,
   };
