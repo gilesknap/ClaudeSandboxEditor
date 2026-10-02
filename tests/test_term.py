@@ -276,6 +276,31 @@ def test_protocol_errors_close_with_the_right_code(srv):
         main.close()
 
 
+def test_nothing_follows_the_echo_of_a_clients_close(srv):
+    """A browser that closes its socket while output is flowing gets our close frame and then
+    nothing: a data frame after a close fails the connection in Chromium ("Data frame received
+    after close"), and the session's output is broadcast from another thread until the
+    handler has detached the client."""
+    main = running(srv)
+    try:
+        main.cmd("while :; do echo " + "x" * 60 + "; done")
+        assert main.wait_out("x" * 60 + "\r\n" + "x" * 60)
+        for i in range(15):
+            c = srv.ws()
+            assert c.code == 101, c.status_line
+            assert c.wait(lambda: any(f.op == 2 for f in c.frames), 5), "output is flowing"
+            time.sleep(0.02)
+            c.send_frame(8, struct.pack("!H", 1000))
+            assert c.wait(c.close_frames, 5), i
+            assert c.wait_eof(5), i
+            ops = [f.op for f in c.frames]
+            assert ops[ops.index(8) + 1:] == [], (i, ops[ops.index(8):][:10])
+            c.abort()
+    finally:
+        main.send_bin(b"\x03")
+        main.close()
+
+
 def test_oversized_message_is_drained_after_the_close(srv):
     """After a 1009 the server reads on (and discards) what the browser is still sending, so
     the connection ends with our close frame and a FIN, not a reset that could lose it."""

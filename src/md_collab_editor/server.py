@@ -2050,15 +2050,20 @@ class TermSession:
         if rec is None:
             return False
         with rec.wlock:  # not under self.lock: a blocked write must not stall the output
-            view = memoryview(data)
-            while view and not rec.closed and not rec.retired and alive():
-                try:
-                    view = view[os.write(rec.fd, view):]
-                except BlockingIOError:  # the agent is not reading: wait for room
-                    wait_fd(rec.fd, write=True, timeout=0.5)
-                except OSError:
-                    return False
-            return not view
+            return self._type(rec, data, alive)
+
+    @staticmethod
+    def _type(rec, data, alive):
+        """write()'s typing, with rec.wlock held."""
+        view = memoryview(data)
+        while view and not rec.closed and not rec.retired and alive():
+            try:
+                view = view[os.write(rec.fd, view):]
+            except BlockingIOError:  # the agent is not reading: wait for room
+                wait_fd(rec.fd, write=True, timeout=0.5)
+            except OSError:
+                return False
+        return not view
 
     def resize(self, cols, rows, nudge=False):
         """Size the PTY (the kernel sends the agent SIGWINCH when that changes it); the first
@@ -2255,14 +2260,22 @@ class TermSession:
             # typed, the reference carries the lines; a whole file is named either way, as the
             # empty selection over the link only hints at it
             text = typed_ref(t[0], self.cwd, line_span(start, end)) + " " + text
-        if not self.write(paste_bytes(text), alive, rec):
+        with self.lock:
+            live = self.cur is rec
+        if not live:
             return {"ok": False, "error": "The Claude session did not take the question."}
-        time.sleep(IDE_ENTER_DELAY)  # Enter on its own, after the paste
-        why = self._answer_pending(bridge)  # Claude asked something meanwhile
-        if why:
-            return {"ok": False, "error": "The question was typed but not sent. " + why}
-        if not self.write(b"\r", alive, rec):
-            return {"ok": False, "error": "The Claude session did not take the question."}
+        # the agent's input is held from the paste to its Enter, so no other browser's typing
+        # (or another ask) lands in the question and is sent with it; the Enter still goes on
+        # its own, IDE_ENTER_DELAY after the paste
+        with rec.wlock:
+            if not self._type(rec, paste_bytes(text), alive):
+                return {"ok": False, "error": "The Claude session did not take the question."}
+            time.sleep(IDE_ENTER_DELAY)
+            why = self._answer_pending(bridge)  # Claude asked something meanwhile
+            if why:
+                return {"ok": False, "error": "The question was typed but not sent. " + why}
+            if not self._type(rec, b"\r", alive):
+                return {"ok": False, "error": "The Claude session did not take the question."}
         return {"ok": True, "via": via}
 
     def mention(self, msg, alive=lambda: True):
@@ -2359,23 +2372,26 @@ class WSClient:
 
     def send_frame(self, frame):
         with self.send_lock:
-            if not self.alive:
-                return False
-            try:
-                # one deadline for the whole frame: a send() that times out after sending part
-                # of it would otherwise start the clock again
-                view, deadline = memoryview(frame), time.monotonic() + WS_SEND_TIMEOUT
-                while view:
-                    if time.monotonic() > deadline:
-                        raise TimeoutError("send timed out")
-                    try:
-                        view = view[self.sock.send(view):]
-                    except BlockingIOError:  # SO_SNDTIMEO passed with no room: wait on
-                        pass
-                return True
-            except (OSError, ValueError):  # includes TimeoutError
-                self._drop_locked()
-                return False
+            return self._send_locked(frame)
+
+    def _send_locked(self, frame):
+        if not self.alive:
+            return False
+        try:
+            # one deadline for the whole frame: a send() that times out after sending part
+            # of it would otherwise start the clock again
+            view, deadline = memoryview(frame), time.monotonic() + WS_SEND_TIMEOUT
+            while view:
+                if time.monotonic() > deadline:
+                    raise TimeoutError("send timed out")
+                try:
+                    view = view[self.sock.send(view):]
+                except BlockingIOError:  # SO_SNDTIMEO passed with no room: wait on
+                    pass
+            return True
+        except (OSError, ValueError):  # includes TimeoutError
+            self._drop_locked()
+            return False
 
     def _drop_locked(self):
         """Stop using the socket; shutting it also ends the handler's blocked read."""
@@ -2409,9 +2425,15 @@ class WSClient:
             if not self.send_frame(ws_frame(OP_PING)):
                 return
 
-    def close(self, code=None):
-        self.send_frame(ws_frame(OP_CLOSE, b"" if code is None else struct.pack("!H", code)))
+    def close(self, code=None, payload=None):
+        """Send a close frame, with our `code` or (echoing the client's) its `payload`, and
+        nothing after it: no data frame may follow a close (RFC 6455 5.5.1; Chromium fails the
+        connection), and output is broadcast from other threads until the handler detaches
+        the client, so the frame and marking the client dead are one critical section."""
+        if payload is None:
+            payload = b"" if code is None else struct.pack("!H", code)
         with self.send_lock:
+            self._send_locked(ws_frame(OP_CLOSE, payload))
             self.alive = False
 
 
@@ -2485,7 +2507,7 @@ class WSReader:
             if op == OP_CLOSE:
                 if n == 1:  # a status code takes two bytes
                     raise WSProtocolError(1002)
-                client.send_frame(ws_frame(OP_CLOSE, payload[:2]))  # echo the status code
+                client.close(payload=payload[:2])  # echo the status code
                 return
             if op == OP_PING:
                 client.send_frame(ws_frame(OP_PONG, payload))

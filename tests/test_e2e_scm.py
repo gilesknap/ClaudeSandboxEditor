@@ -521,6 +521,7 @@ def test_a_deleted_files_diff_tab_follows_the_file_back(page, repo):
     tab(page, "README.md").click()
     diff.click()
     expect(page.locator(f"{VIEW} .diff-head [data-act=open]")).to_be_enabled(timeout=5000)
+    expect(page.locator(f"{VIEW} .CodeMirror-merge")).to_be_visible()   # built once its base has come
     assert merge_values(page) == ["old = 1\n", "old = 1\n"]
     expect(page.locator(f"{VIEW} .diff-stats")).to_have_text("No changes")
 

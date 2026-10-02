@@ -629,7 +629,9 @@ def test_ask_over_the_link_sends_the_selection_then_pings_then_types(md_editor, 
                     "end": {"line": 3, "character": 0}})
     assert wait_browser(term, "sent", lambda m: m["what"] == "mention") == \
         {"type": "sent", "what": "mention", "ok": True, "via": "ide"}
-    assert claude.notes("at_mentioned")[-1] == {"filePath": str(root / "target.md"), "lineStart": 1, "lineEnd": 2}
+    # (the reply comes on the browser's socket, the mention on Claude's: either may be first)
+    at = claude.wait(lambda m: m.get("method") == "at_mentioned" and m["params"].get("lineStart") == 1)
+    assert at and at["params"] == {"filePath": str(root / "target.md"), "lineStart": 1, "lineEnd": 2}
     term.send_json({"type": "mention", "path": "target.md"})
     assert claude.wait(lambda m: m.get("method") == "at_mentioned" and "lineStart" not in m["params"])
     # the session's own folder is typed (Claude Code takes no "@.")
@@ -645,7 +647,7 @@ def test_ask_over_the_link_sends_the_selection_then_pings_then_types(md_editor, 
                     "end": {"line": 1, "character": 0}})
     want = b'\x1b[200~@"my notes/n.md"#L1 \x1b[201~'
     assert typed(agent_log, want) == want
-    assert len(claude.notes("at_mentioned")) == n
+    assert not claude.ws.wait(lambda: len(claude.notes("at_mentioned")) > n, 0.5)
     # Claude does not answer the ping: the question goes typed, with the reference
     agent_log.write_bytes(b"")
     claude.ping_delay = 5
@@ -729,6 +731,27 @@ def test_without_the_link_asks_and_mentions_are_typed(md_editor, tmp_path, agent
     assert m["ok"] is False and "answer it there first" in m["error"]
     time.sleep(0.2)
     assert agent_log.read_bytes() == b""
+    term.close()
+
+
+def test_typing_from_another_browser_waits_for_an_asks_enter(md_editor, tmp_path, agent_log, root):
+    """The Enter goes a moment after the paste; what another browser types meanwhile waits until
+    it has gone, rather than landing in the question and being sent with it."""
+    srv = start(md_editor, tmp_path, agent_log, args=["--ide-link", "off"])
+    term, _, _ = session(srv)
+    other = srv.ws()
+    other.wait_status()
+    paste = b"\x1b[200~Hello?\x1b[201~"
+    agent_log.write_bytes(b"")
+    term.send_json({"type": "ask", "text": "Hello?", "seq": 1})
+    deadline = time.monotonic() + 10
+    while agent_log.read_bytes() != paste and time.monotonic() < deadline:
+        time.sleep(0.002)
+    assert agent_log.read_bytes() == paste
+    other.send_bin(b"later")   # before the Enter (IDE_ENTER_DELAY after the paste)
+    assert wait_browser(term, "sent", lambda m: m.get("seq") == 1)["ok"] is True
+    assert typed(agent_log, paste + b"\rlater") == paste + b"\rlater"
+    other.close()
     term.close()
 
 
