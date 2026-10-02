@@ -611,3 +611,42 @@ def test_launcher_needs_a_pty(monkeypatch):
     assert not a["available"] and "No PTY support" in a["reason"]
     monkeypatch.setattr(S, "ASK_CMD", ["claude"])
     assert S.ask_info()["mode"] == "native" and "PTY" not in S.ask_info()["reason"]
+
+
+# ---------------------------------------------------------------- files other than markdown
+
+CODE = "def f(x):\n    return x + 1\n\n\ndef g():\n    pass\n"
+
+
+def sys_digest(prompt):
+    return hashlib.sha256(prompt.encode()).hexdigest()[:10]
+
+
+def test_code_files_get_a_prompt_for_their_file_type(launcher):
+    sel = "    return x + 1\n"
+    start = CODE.index(sel)
+    status, res = ask(launcher, doc=CODE, path="pkg/m.py", start=start, end=start + len(sel))
+    assert status == 200 and res["forked"], res
+    base, card = launcher.bases()[-1], launcher.calls()[-1]
+    assert base["prompt"].startswith(f'<document path="pkg/m.py" type="Python">\n{CODE}\n</document>')
+    assert "This is the file the user is editing." in base["prompt"]
+    assert card["prompt"].endswith("Reply with the replacement text only, with no code fence around it.\n</request>")
+    assert base["sys"] == card["sys"] == sys_digest(S.system_prompt("pkg/m.py")) != sys_digest(S.SYSTEM_PROMPT)
+    ask(launcher)
+    assert launcher.calls()[-1]["sys"] == sys_digest(S.SYSTEM_PROMPT), "markdown keeps its own prompt"
+
+
+def test_system_prompts_name_the_file_type():
+    assert S.system_prompt(None) == S.system_prompt("") == S.system_prompt("docs/A.MD") == S.SYSTEM_PROMPT
+    py = S.system_prompt("x.py")
+    assert "(file type: Python)" in py and "valid Python" in py and "code fence" in py and "markdown editor" not in py
+    assert "(file type: plain text)" in S.system_prompt("LICENSE") and "must be text that" in S.system_prompt("a.txt")
+    assert "(file type: Dockerfile)" in S.system_prompt("build/Dockerfile")
+    assert S.doc_tag("a.md", "x") == '<document path="a.md">\nx\n</document>'
+    assert S.doc_tag("run.sh", "x").startswith('<document path="run.sh" type="Shell">')
+
+
+def test_unfence_keeps_the_indentation_of_code():
+    assert S.unfence("\n\n    return x + 2\n\n", "    return x + 1\n", code=True) == "    return x + 2\n"
+    assert S.unfence("```python\n    return x + 2\n```\n", "    return x + 1", code=True) == "    return x + 2"
+    assert S.unfence("  text\n", "orig\n") == "text", "markdown as before"

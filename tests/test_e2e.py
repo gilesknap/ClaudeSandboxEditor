@@ -113,11 +113,10 @@ SLOW_SOCKET = """(() => {   // the page's WebSockets take 1.5 s to start connect
     constructor(url) {
       this.readyState = 0;
       this.binaryType = 'blob';
-      window.__wsStarted = performance.now();
       setTimeout(() => {
         const r = this._r = new Real(url);
         r.binaryType = this.binaryType;
-        r.onopen = e => { this.readyState = 1; if (this.onopen) this.onopen(e); };
+        r.onopen = e => { this.readyState = 1; window.slowSocketOpened = true; if (this.onopen) this.onopen(e); };
         r.onmessage = e => { if (this.onmessage) this.onmessage(e); };
         r.onerror = e => { if (this.onerror) this.onerror(e); };
         r.onclose = e => { this.readyState = 3; if (this.onclose) this.onclose(e); };
@@ -142,8 +141,8 @@ def test_keys_typed_while_connecting_are_kept(browser, srv):
         pg.on("pageerror", lambda e: errors.append(str(e)))
         pg.goto(srv.base + "#a.md")
         pg.locator("#term .xterm").click()
-        assert pg.evaluate("() => performance.now() - window.__wsStarted") < 1500, \
-            "typed before the socket opened"
+        # not a time limit: the page itself can take longer than the shim's delay to load
+        assert not pg.evaluate("() => !!window.slowSocketOpened"), "typed before the socket opened"
         pg.keyboard.type("echo early-$((40+3))\n")
         wait_term_line(pg, "early-43")
     finally:
@@ -182,13 +181,48 @@ def test_keys_typed_while_disconnected_are_dropped(browser, srv):
         ctx.close()
 
 
+def test_text_sent_while_connecting_is_kept(browser, srv):
+    """Term.sendText (Send to Claude terminal) waits in the same queue as typed keys."""
+    ctx = browser.new_context(viewport={"width": 1400, "height": 900})
+    try:
+        ctx.add_init_script(SLOW_SOCKET)
+        pg = ctx.new_page()
+        pg.goto(srv.base + "#a.md")
+        expect(pg.locator("#term .xterm")).to_be_visible()
+        assert pg.evaluate("() => !window.slowSocketOpened && Term.sendText('echo sent-$((40+4))\\r')")
+        wait_term_line(pg, "sent-44")
+    finally:
+        ctx.close()
+
+
+def wait_prompts_after(page, pattern, count=1, timeout=10000):
+    """Wait until a terminal row matches `pattern` in full and `count` rows below it are bash
+    prompts with nothing typed after them."""
+    page.wait_for_function(
+        """([re, count]) => {
+             const rows = [...document.querySelectorAll('#term .xterm-rows > div')]
+               .map(d => d.textContent.replace(/\\u00a0/g, ' ').trimEnd());
+             const i = rows.findLastIndex(r => new RegExp(re).test(r));
+             return i >= 0 && rows.slice(i + 1).filter(r => /[#$]$/.test(r)).length >= count;
+           }""",
+        arg=[f"^{pattern}$", count], timeout=timeout)
+
+
 def test_editor_shortcuts_stay_out_of_the_terminal(page):
+    # Each key waits for bash to show it was handled: a ^C that comes while bash is busy (as
+    # in a burst of keys sent together) can be lost, and so can keys typed straight after one.
     page.locator("#term").click()
-    page.keyboard.press("Control+o")
-    page.keyboard.press("Control+j")
-    page.keyboard.press("Control+c")
+    page.keyboard.type("echo one")
+    page.keyboard.press("Control+j")   # newline: runs the line
+    wait_prompts_after(page, "one")
+    page.keyboard.press("Control+o")   # operate-and-get-next: runs the (empty) line
+    wait_prompts_after(page, "one", count=2)
+    page.keyboard.type("echo three")
+    wait_term_line(page, r".*[#$] echo three")
+    page.keyboard.press("Control+c")   # drops the line
+    wait_prompts_after(page, r".*[#$] echo three\^C")
     page.keyboard.type("echo keys-$((6*7))\n")
-    wait_term_line(page, "keys-42")   # the keys above have been handled by now
+    wait_term_line(page, "keys-42")
     expect(page.locator("#browser")).to_be_hidden()
     expect(page.locator("#askbar")).to_be_hidden()
     page.locator(".CodeMirror").click()
