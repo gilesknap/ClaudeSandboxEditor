@@ -1,27 +1,28 @@
 #!/usr/bin/env python3
 """MD Collaborative Editor: a local GitHub-style markdown editor with Claude in the loop.
 
-Serves the editor UI, reads and writes .md files under a root folder, pushes
+Serves the editor UI, reads and writes .md files under a root folder, and pushes
 on-disk changes to the browser (so edits made by Claude Code in a terminal show
-up live), and answers "ask Claude" requests by running `claude -p` headless,
-inside claude-sandbox by default. The side panel also has a terminal running an
-interactive Claude Code session (`uvx claude-sandbox@latest` in the open folder
-by default) on a PTY, streamed to the browser over a WebSocket.
+up live). The side panel has a terminal running an interactive Claude Code
+session (`uvx claude-sandbox@latest` in the open folder by default) on a PTY,
+streamed to the browser over a WebSocket, and md-editor is that session's IDE:
+Claude Code connects back to it, sees the editor's selection, and shows its
+proposed edits in md-editor as diffs to accept or reject.
 
     md-editor                     # edit the current folder
     md-editor ~/notes             # edit a folder
     md-editor ~/proj/README.md    # edit one file (its folder becomes the root)
     md-editor --agent claude      # terminal runs plain Claude Code (no sandbox)
     md-editor --agent none        # no terminal
-    md-editor --ask-agent claude  # Ask Claude runs plain `claude -p` (no sandbox)
+    md-editor --ide-link off      # the session does not connect back to md-editor
 """
 
 import argparse
 import atexit
 import base64
-import collections
-import difflib
+import errno
 import hashlib
+import hmac
 import json
 import itertools
 import math
@@ -29,11 +30,13 @@ import mimetypes
 import os
 import posixpath
 import re
+import secrets
 import select
 import shlex
 import shutil
 import signal
 import socket
+import socketserver
 import stat
 import struct
 import subprocess
@@ -42,9 +45,8 @@ import tempfile
 import threading
 import time
 import traceback
-import uuid
 import webbrowser
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
@@ -67,10 +69,7 @@ CHROME_BIN = next((b for b in (os.environ.get("MDEDIT_CHROME"), "google-chrome",
                                "chromium", "chromium-browser") if b and shutil.which(b)), None)
 DEFAULT_AGENT = "uvx claude-sandbox@latest"
 AGENT_CMD = shlex.split(DEFAULT_AGENT)  # argv for the side-panel terminal, or None when turned off
-DEFAULT_ASK_AGENT = "uvx claude-sandbox@latest"
-# argv for Ask Claude, or None when turned off: `claude` itself (native mode) or a
-# claude-sandbox-compatible launcher that runs it in its container (launcher mode)
-ASK_CMD = shlex.split(DEFAULT_ASK_AGENT)
+IDE_LINK = "auto"  # --ide-link: auto, off, or native/launcher to choose the link's mode
 
 PDF_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
@@ -96,45 +95,6 @@ body {{ margin: 0; background: #fff; }}
 </style></head>
 <body><article class="markdown-body">{body}</article></body></html>
 """
-
-SYSTEM_PROMPT = """You are a writing assistant embedded in a markdown editor. The markdown \
-document the user is editing is supplied first, inside <document> tags. Each request \
-about it comes in a <request> block and stands on its own. A request names part of the \
-document, the <selection>, by quoting it with its line numbers and the text just before \
-and after it (<context_before>, <context_after>), or says that the whole document is \
-selected. If the document has changed since it was supplied, the request starts with a \
-<document_update> holding a unified diff to the current version: work from that version.
-
-Rules:
-- Reply with the result ONLY: no preamble, no explanation, no closing remarks, \
-no surrounding quotes, no code fence around the whole reply.
-- In "replace" mode your reply replaces the selection verbatim, so it must be \
-valid markdown that fits seamlessly where the selection was. Keep the existing \
-markdown structure (headings, lists, links, emphasis, math, code) unless asked \
-to change it. Do not include text from outside the selection.
-- In "comment" mode reply with concise feedback in markdown; the document is not changed.
-- British English spelling unless the document clearly uses another convention.
-- If asked to use a skill, invoke it with the Skill tool before writing."""
-
-# for any file that is not markdown; {lang} is e.g. "Python" or "plain text", {valid} "valid Python"
-CODE_SYSTEM_PROMPT = """You are a coding and writing assistant embedded in a text editor. The file \
-the user is editing (file type: {lang}) is supplied first, inside <document> tags. Each request about it comes \
-in a <request> block and stands on its own. A request names part of the file, the <selection>, by \
-quoting it with its line numbers and the text just before and after it (<context_before>, \
-<context_after>), or says that the whole file is selected. If the file has changed since it was \
-supplied, the request starts with a <document_update> holding a unified diff to the current \
-version: work from that version.
-
-Rules:
-- Reply with the result ONLY: no preamble, no explanation, no closing remarks, no surrounding \
-quotes, and no markdown code fence (```) around the reply.
-- In "replace" mode your reply replaces the selection verbatim, so it must be {valid} that fits \
-seamlessly where the selection was. Keep the file's indentation (tabs or spaces, and the \
-selection's own leading indentation), formatting, naming and comment style, and keep the code \
-working. Do not include text from outside the selection.
-- In "comment" mode reply with concise feedback in markdown; the file is not changed.
-- British English spelling in prose and comments unless the file clearly uses another convention.
-- If asked to use a skill, invoke it with the Skill tool before writing."""
 
 
 # ---------------------------------------------------------------- files
@@ -251,6 +211,13 @@ SEARCH_TIMEOUT = 60      # seconds for one search (git grep is killed; the walk 
 PREVIEW = 300            # characters of a matching line in a search result
 LINE_MAX = 1 << 20       # bytes of a line that git grep found that a search looks at
 STATUS_MAX = 5000        # changed files in one /api/git/status answer
+# the IDE link's socket in the session's folder (see IdeBridge): never listed, searched or opened
+IDE_SOCK_RE = re.compile(r"\.md-editor-ide-[0-9]+\.sock")
+
+
+def ide_socket(path):
+    """Whether a file name (or the last part of a path) is an IDE link socket's."""
+    return IDE_SOCK_RE.fullmatch(posixpath.basename(path)) is not None
 
 LANGS = {
     ".md": "Markdown", ".markdown": "Markdown", ".mdx": "MDX", ".rst": "reStructuredText", ".txt": "plain text",
@@ -391,7 +358,7 @@ def file_info(q):
 
 def api_tree(q):
     """GET /api/tree: one folder's entries, folders first; hidden (dotfiles, SKIP_DIRS) and
-    git-ignored ones only with all=1, flagged. .git never appears."""
+    git-ignored ones only with all=1, flagged. .git and IDE link sockets never appear."""
     rel = q.get("dir", "")
     d = safe_path(rel)
     if not d.is_dir():
@@ -400,7 +367,7 @@ def api_tree(q):
     entries = []
     with os.scandir(d) as it:
         for e in it:
-            if e.name == ".git":
+            if e.name == ".git" or ide_socket(e.name):
                 continue
             try:
                 is_dir = e.is_dir()
@@ -439,7 +406,7 @@ def dir_stamp(rel, top=None, memo=None):
         d = safe_path(rel)
         with os.scandir(d) as it:
             for e in it:
-                if e.name == ".git":
+                if e.name == ".git" or ide_socket(e.name):  # as api_tree
                     continue
                 try:
                     items.append((e.name, e.is_dir(), e.stat(follow_symlinks=False).st_mtime_ns
@@ -574,12 +541,13 @@ def api_delete(req):
 
 def walk_files():
     """ROOT-relative paths of the files under ROOT in a sorted walk that skips hidden folders and
-    SKIP_DIRS and does not follow symlinked folders."""
+    SKIP_DIRS (and IDE link sockets) and does not follow symlinked folders."""
     for dirpath, dirnames, filenames in os.walk(ROOT):
         dirnames[:] = sorted(d for d in dirnames if not d.startswith(".") and d not in SKIP_DIRS)
         rel = Path(dirpath).relative_to(ROOT).as_posix()
         for f in sorted(filenames):
-            yield f if rel == "." else f"{rel}/{f}"
+            if not ide_socket(f):
+                yield f if rel == "." else f"{rel}/{f}"
 
 
 def api_allfiles(q):
@@ -590,7 +558,7 @@ def api_allfiles(q):
         if r.returncode == 0:
             names = dict.fromkeys(os.fsdecode(n) for n in r.stdout.split(b"\0") if n)  # unmerged: once
             # drops tracked files deleted from the work tree, and submodules
-            files = sorted(n for n in names if os.path.isfile(os.path.join(ROOT, n)))
+            files = sorted(n for n in names if os.path.isfile(os.path.join(ROOT, n)) and not ide_socket(n))
     if files is None:
         files = sorted(itertools.islice(walk_files(), ALLFILES_MAX + 1))
     return {"files": files[:ALLFILES_MAX], "truncated": len(files) > ALLFILES_MAX}
@@ -881,7 +849,8 @@ def grep_git(query, regex, case, word, globs, pat, deadline, pcre=None):
     specs = git_pathspecs(globs)
     runs = [args + ["-e", query, "--"] + specs]
     r = git(["ls-files", "-z", "--others", "--exclude-standard", "--"] + specs, ROOT)
-    untracked = [n for n in r.stdout.split(b"\0") if n and not n.endswith(b"/")] if r.returncode == 0 else []
+    untracked = [n for n in r.stdout.split(b"\0")
+                 if n and not n.endswith(b"/") and not ide_socket(os.fsdecode(n))] if r.returncode == 0 else []
     for k in range(0, len(untracked), 500):  # literal pathspecs, a command line at a time
         runs.append(args + ["--untracked", "-e", query, "--"]
                     + [":(literal)" + os.fsdecode(n) for n in untracked[k:k + 500]])
@@ -1520,6 +1489,8 @@ def api_git_status(q):
             if inside(p.rstrip("/")) is not None:
                 nested += 1
             continue
+        if status == "U" and ide_socket(p):  # git skips sockets, but should one ever be listed
+            continue
         rp = inside(p)
         if status == "R":
             ro = inside(old)
@@ -1622,7 +1593,7 @@ def env_seconds(name, default):
 
 
 def parse_command(value):
-    """--agent / --ask-agent value → argv list, or None when the feature is turned off."""
+    """--agent value → argv list, or None when the terminal is turned off."""
     if value is None or value.strip().lower() in ("", "none"):
         return None
     return shlex.split(value) or None
@@ -1640,10 +1611,13 @@ def missing_hint(exe, flag):
 
 # What a Claude Code session sets for the commands it runs: md-editor started from one must
 # not hand them on, or its agents look nested (CLAUDE_CODE_CHILD_SESSION turns off saving
-# the terminal's transcript, so /resume can't find it). A PTY has its own size.
+# the terminal's transcript, so /resume can't find it). A PTY has its own size. An IDE's
+# terminal (VS Code's) sets CLAUDE_CODE_SSE_PORT, which would connect the session to that
+# IDE: the IDE link sets its own.
 CHILD_ENV_DROP = ("CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID",
                   "CLAUDE_CODE_SESSION_ATTENDED", "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_MESSAGING_SOCKET",
-                  "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "COLUMNS", "LINES")
+                  "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_EXECPATH", "CLAUDE_PID", "CLAUDE_CODE_SSE_PORT",
+                  "COLUMNS", "LINES")
 
 
 def child_env(**extra):
@@ -1730,505 +1704,6 @@ def spawn_pty(argv, cwd, env, cols=80, rows=24):
     os.set_inheritable(master, False)
     os.set_blocking(master, False)
     return proc, master
-
-
-def read_pty(proc, fd, timeout, limit=8 << 20):
-    """Everything a PTY child writes (the last `limit` bytes) until every holder of the PTY
-    is gone, or until the child has exited and the PTY stayed quiet for a second; then
-    close fd and end the child's process group. Past `timeout` seconds, kill the group and
-    raise TimeoutExpired."""
-    out = bytearray()
-    deadline = time.monotonic() + timeout
-    quiet = None
-    try:
-        while True:
-            try:
-                data = os.read(fd, 65536)
-            except BlockingIOError:
-                now = time.monotonic()
-                if now >= deadline:
-                    raise subprocess.TimeoutExpired(proc.args, timeout, output=bytes(out))
-                if proc.poll() is not None:  # exited; a straggler may still hold the PTY open
-                    if quiet is None:
-                        quiet = now
-                    elif now - quiet > 1:
-                        break
-                wait_fd(fd, timeout=min(0.25, deadline - now))
-                continue
-            except OSError:  # EIO once every slave fd is closed
-                break
-            if not data:
-                break
-            quiet = None
-            out += data
-            if len(out) > limit:
-                del out[:len(out) - limit]
-    finally:
-        os.close(fd)
-        terminate_group(proc)
-    return bytes(out)
-
-
-# ---------------------------------------------------------------- claude
-#
-# Each card forks a "base" session that already holds the document, so the document is
-# sent once per version: a card sends only its request (plus a diff when the document has
-# changed a little), and Retry / Refine fork the card's own session. If a fork fails, the
-# card falls back to one stateless call carrying the whole document.
-
-ASK_TIMEOUT = env_seconds("MDEDIT_ASK_TIMEOUT", 600)  # seconds per claude call
-# Bytes of prompt in launcher mode, which passes it to claude as an argument. The binding
-# limit is not that argument: claude-sandbox's wrapper hands its whole jailed command line
-# (bwrap's arguments, claude's and the prompt, each quoted by bash's printf %q, which can
-# make the prompt longer) to `script -c` as ONE string, and Linux caps one at 128 KiB. A
-# 97 kB prompt leaves about 28 kB to spare; past the cap the launcher fails with "Argument
-# list too long", which run_launcher reports as a request that is too large.
-ASK_ARG_MAX = 100_000
-ASK_CONTEXT = 300      # characters of context either side of a selection
-ASK_BASES_MAX, ASK_CARDS_MAX = 32, 256
-ASK_CARDS_CHARS = 4_000_000  # characters of document text the remembered cards may hold
-# claude reports a --resume of a session it does not have with this, on stderr
-SESSION_MISSING = "No conversation found with session ID:"
-# where launcher mode runs claude, in the container: claude-sandbox's wrapper always binds
-# ~/.cache into its jail, whatever folder it is set to make writable (`workspace-root`)
-LAUNCHER_ASK_DIR = '"$HOME"/.cache/md-editor/ask'
-ASK_LOCK = threading.Lock()              # guards the five below
-ASK_BASES = collections.OrderedDict()   # key → {"session", "doc"}: a session holding the document
-ASK_CARDS = collections.OrderedDict()   # card session id → {"key", "doc"}: the document it was asked about
-ASK_KEY_LOCKS = {}                       # key → [Lock, callers], so concurrent cards wait for a single base
-ASK_RUNNING = {}                         # call id → [its Popen (None until started), its prompt file or None]
-ASK_CLOSING = False                      # md-editor is exiting: start no more claude calls
-ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[\]PX^_][^\x07\x1b]*(?:\x07|\x1b\\)?|[ -/]*[0-~])")
-CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f]")  # JSON never holds these raw (it may hold DEL)
-
-
-def ask_mode():
-    return "native" if os.path.basename(ASK_CMD[0]) == "claude" else "launcher"
-
-
-def ask_info():
-    """Whether Ask Claude can run here, for /api/config and /api/ask."""
-    info = {"available": False, "cmd": shlex.join(ASK_CMD) if ASK_CMD else None, "mode": None, "reason": ""}
-    if not ASK_CMD:
-        info["reason"] = "Ask Claude is turned off (--ask-agent none or MDEDIT_ASK_AGENT=none)."
-        return info
-    info["mode"] = ask_mode()
-    if info["mode"] == "launcher" and not HAVE_PTY:
-        info["reason"] = ("No PTY support on this platform; Ask Claude through claude-sandbox needs "
-                          "Linux or macOS.")
-    elif not shutil.which(ASK_CMD[0]):
-        info["reason"] = f"{ASK_CMD[0]} not found on the PATH: {missing_hint(ASK_CMD[0], '--ask-agent')}."
-    else:
-        info["available"] = True
-    return info
-
-
-def file_type(path):
-    """How the prompts name a file's type ("Python", "plain text"); None for markdown."""
-    return None if is_markdown(path) else language_of(path) or "plain text"
-
-
-def system_prompt(path=None):
-    """The system prompt for a file: the markdown one, or one for code and other text that names
-    the file type (from the name alone, so it is the same for every call about the file)."""
-    lang = file_type(path)
-    if lang is None:
-        return SYSTEM_PROMPT
-    return CODE_SYSTEM_PROMPT.format(lang=lang, valid="text" if lang == "plain text" else f"valid {lang}")
-
-
-def claude_args(model, persist=True, resume=None, path=None):
-    args = ["-p", "--output-format", "json"]
-    if not persist:
-        args.append("--no-session-persistence")
-    if resume:  # fork, so the parent session never changes
-        args += ["--resume", resume, "--fork-session"]
-    args += ["--append-system-prompt", system_prompt(path)]
-    if model:
-        args += ["--model", model]
-    return args + ["--tools", "Skill,Read", "--allowedTools", "Skill,Read"]
-
-
-def parse_result(text):
-    """The `--output-format json` result in claude's output: the last line holding a JSON
-    object of type "result" (failing that, any with "result" or "is_error")."""
-    fallback = None
-    for line in reversed(text.splitlines()):
-        i = line.find("{")
-        if i < 0:
-            continue
-        try:
-            data = json.JSONDecoder().raw_decode(line, i)[0]
-        except ValueError:
-            continue
-        if not isinstance(data, dict):
-            continue
-        if data.get("type") == "result":
-            return data
-        if fallback is None and ("result" in data or "is_error" in data):
-            fallback = data
-    return fallback
-
-
-def native_ask_dir():
-    """The folder native `claude -p` runs in, ~/.cache/md-editor/ask: always the same, so
-    --resume finds the sessions made there (and they stay out of ROOT's /resume list), and
-    the user's own, so no one else can plant a CLAUDE.md or .claude/settings.json in it."""
-    base = os.environ.get("XDG_CACHE_HOME") or ""
-    if not os.path.isabs(base):
-        base = os.path.join(os.path.expanduser("~"), ".cache")
-    d = os.path.join(base, "md-editor", "ask")
-    try:
-        os.makedirs(d, mode=0o700, exist_ok=True)
-        st = os.lstat(d)
-        if not stat.S_ISDIR(st.st_mode) or (hasattr(os, "getuid") and st.st_uid != os.getuid()):
-            raise RuntimeError(f"Ask Claude runs claude in {d}, which must be a folder of your own.")
-        if st.st_mode & 0o077:
-            os.chmod(d, 0o700)
-    except OSError as exc:
-        raise RuntimeError(f"Ask Claude cannot use {d}: {exc.strerror or exc}")
-    return d
-
-
-def ask_begin(prompt_file=None):
-    """Note a claude call about to start, so that end_asks() ends it; returns its id."""
-    call = uuid.uuid4().hex
-    with ASK_LOCK:
-        if ASK_CLOSING:
-            raise RuntimeError("md-editor is shutting down")
-        ASK_RUNNING[call] = [None, prompt_file]
-    return call
-
-
-def ask_started(call, proc):
-    """Note the call's process. False when md-editor has begun to exit, and end_asks() may
-    have missed it: the caller ends it."""
-    with ASK_LOCK:
-        ASK_RUNNING[call][0] = proc
-        return not ASK_CLOSING
-
-
-def ask_done(call):
-    with ASK_LOCK:
-        ASK_RUNNING.pop(call, None)
-
-
-def run_native(args, prompt):
-    """`claude -p` on pipes, in native_ask_dir(), which holds no project CLAUDE.md, and in a
-    process group of its own, which end_asks() ends if md-editor exits first. Returns its
-    output."""
-    exe = shutil.which(ASK_CMD[0]) or ASK_CMD[0]
-    cwd = native_ask_dir()
-    call = ask_begin()
-    try:
-        try:
-            proc = subprocess.Popen([exe] + ASK_CMD[1:] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, encoding="utf-8", errors="replace", cwd=cwd,
-                                    env=child_env(), start_new_session=True)
-        except OSError as exc:
-            raise RuntimeError(f"Could not run {exe}: {exc}")
-        with proc:  # closes the pipes and reaps it
-            if not ask_started(call, proc):
-                terminate_group(proc)
-                raise RuntimeError("md-editor is shutting down")
-            try:
-                out, err = proc.communicate(prompt, timeout=ASK_TIMEOUT)
-            except BaseException:  # the timeout, mostly: end it, as subprocess.run would
-                terminate_group(proc)
-                raise
-    finally:
-        ask_done(call)
-    if parse_result(out) is None:
-        raise RuntimeError((err or out or "no output from claude").strip()[:2000])
-    return out
-
-
-def run_launcher(args, prompt):
-    """`claude -p` in the launcher's container (`<launcher> shell -c SCRIPT`, run in ROOT).
-    The launcher uses `podman exec -it`, so it needs a terminal: it gets a fresh PTY. The
-    prompt goes through a file in ROOT, which the container mounts at the same path. In
-    there `claude` is claude-sandbox's wrapper, which runs Claude Code in its jail on a
-    PTY of its own; -p ignores a terminal stdin, so the prompt is passed as an argument.
-    Returns the output, ANSI-stripped."""
-    data = prompt.encode("utf-8")
-    if len(data) > ASK_ARG_MAX:
-        raise RuntimeError(f"This request ({len(data) // 1000} kB with the document or selected text) is too "
-                           f"large to pass to Claude Code in claude-sandbox, which takes about "
-                           f"{ASK_ARG_MAX // 1000} kB at most.")
-    root = ROOT
-    pf = root / f".md-editor-ask-{uuid.uuid4().hex}.txt"
-    call = ask_begin(pf)
-    try:
-        fd = os.open(pf, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except OSError as exc:
-        ask_done(call)
-        raise RuntimeError(f"Ask Claude via claude-sandbox needs to write a temporary file in {root}, "
-                           f"but cannot: {exc.strerror or exc}")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-        # the fixed folder keeps these sessions out of ROOT's /resume list and lets --resume find them
-        script = (f"mkdir -p {LAUNCHER_ASK_DIR} && cd {LAUNCHER_ASK_DIR} && "
-                  f"prompt=$(cat {shlex.quote(str(pf))}) && exec claude "
-                  + " ".join(shlex.quote(a) for a in args) + ' -- "$prompt"')
-        # the `shell` verb otherwise runs the shell md-editor was started from (zsh, fish, ...)
-        env = child_env(TERM="dumb", NO_COLOR="1", CLAUDE_SANDBOX_SHELL="sh")
-        env.pop("COLORTERM", None)
-        try:
-            proc, master = spawn_pty(ASK_CMD + ["shell", "-c", script], str(root), env, 200, 50)
-        except (OSError, subprocess.SubprocessError) as exc:
-            raise RuntimeError(f"Could not start {shlex.join(ASK_CMD)}: {exc}")
-        if not ask_started(call, proc):
-            os.close(master)
-            terminate_group(proc)
-            raise RuntimeError("md-editor is shutting down")
-        raw = read_pty(proc, master, ASK_TIMEOUT)
-    except OSError as exc:
-        raise RuntimeError(f"Ask Claude via claude-sandbox failed: {exc}")
-    finally:
-        ask_done(call)
-        try:
-            pf.unlink()
-        except OSError:
-            pass
-    text = CTRL_RE.sub("", ANSI_RE.sub("", raw.decode("utf-8", "replace")).replace("\r", ""))
-    if parse_result(text) is None:
-        tail = text.strip()[-2000:] or f"no output from {shlex.join(ASK_CMD)}"
-        if "Argument list too long" in tail:
-            tail = "The request is too large to pass to Claude Code in claude-sandbox.\n\n" + tail
-        raise RuntimeError(tail)
-    return text
-
-
-def end_asks():
-    """At exit: end the claude calls still running, whose threads die with the server, and
-    delete their prompt files (a launcher may outlive the PTY hang-up)."""
-    global ASK_CLOSING
-    with ASK_LOCK:
-        ASK_CLOSING = True
-        running = [tuple(v) for v in ASK_RUNNING.values()]
-    for proc, pf in running:
-        if proc is not None:
-            terminate_group(proc)
-        if pf is not None:
-            try:
-                pf.unlink()
-            except OSError:
-                pass
-
-
-def run_claude(args, prompt):
-    """One `claude -p` call, natively or through the launcher; returns its JSON result."""
-    out = run_native(args, prompt) if ask_mode() == "native" else run_launcher(args, prompt)
-    data = parse_result(out)
-    if data.get("is_error"):
-        raise RuntimeError(str(data.get("result") or data)[:2000])
-    return data
-
-
-def doc_tag(path, doc):
-    lang = file_type(path)
-    kind = f' type="{lang}"' if lang else ""
-    return f'<document path="{path}"{kind}>\n{doc}\n</document>'
-
-
-def doc_diff(old, new, path):
-    """Unified diff old → new for a <document_update>: '' when they match, None when it is
-    too big to be worth sending instead of the whole document."""
-    if old == new:
-        return ""
-    limit = min(0.3 * len(new), 40000)
-    out, n = [], 0
-    for line in difflib.unified_diff(old.splitlines(True), new.splitlines(True), f"a/{path}", f"b/{path}", n=3):
-        if not line.endswith("\n"):
-            line += "\n"
-        n += len(line)
-        if n > limit:
-            return None
-        out.append(line)
-    return "".join(out)
-
-
-def build_request(req, update=""):
-    """One card's <request>; `update` is a diff from the document the session holds."""
-    doc = req.get("doc", "")
-    s, e = int(req.get("start", 0)), int(req.get("end", 0))
-    whole = s == 0 and e >= len(doc)
-    mode = req.get("mode", "replace")
-    parts = []
-    if update:
-        parts.append("<document_update>The document has changed since the version above. Unified diff "
-                     f"from that version to the current one:\n<diff>\n{update}</diff></document_update>")
-    if whole:
-        parts.append("<selection>The whole document is selected.</selection>")
-    else:
-        first = doc.count("\n", 0, s) + 1
-        last = first + doc.count("\n", s, max(s, e - 1))
-        parts += [f'<selection lines="{first}-{last}">\n{doc[s:e]}\n</selection>',
-                  f"<context_before>{doc[max(0, s - ASK_CONTEXT):s]}</context_before>",
-                  f"<context_after>{doc[e:e + ASK_CONTEXT]}</context_after>"]
-    parts += [f"<mode>{mode}</mode>", f"<instruction>\n{req.get('instruction', '').strip()}\n</instruction>"]
-    if req.get("previous"):
-        parts.append(f"<previous_attempt>\n{req['previous']}\n</previous_attempt>\n"
-                     "The user was not satisfied with the previous attempt; the instruction "
-                     "above is their feedback on it.")
-    if mode != "replace":
-        parts.append("Reply with your comments only.")
-    elif is_markdown(req.get("path")):
-        parts.append("Reply with the replacement text only.")
-    else:
-        parts.append("Reply with the replacement text only, with no code fence around it.")
-    return f'<request path="{req.get("path") or ""}">\n' + "\n\n".join(parts) + "\n</request>"
-
-
-def ask_key(req):
-    return (shlex.join(ASK_CMD), str(ROOT), req.get("path") or "", req.get("model") or "")
-
-
-def base_session(key, doc):
-    """The base session for key: one holding `doc`, or a version close enough to send a
-    diff, made if need be. Returns (session id, diff to send)."""
-    with ASK_LOCK:  # the key's lock lives while any caller holds or waits for it
-        entry = ASK_KEY_LOCKS.setdefault(key, [threading.Lock(), 0])
-        entry[1] += 1
-    try:
-        with entry[0]:
-            return _base_session_locked(key, doc)
-    finally:
-        with ASK_LOCK:
-            entry[1] -= 1
-            if not entry[1]:
-                del ASK_KEY_LOCKS[key]
-
-
-def _base_session_locked(key, doc):
-    path, model = key[2], key[3]
-    with ASK_LOCK:
-        base = ASK_BASES.get(key)
-    if base is not None:
-        diff = doc_diff(base["doc"], doc, path)
-        if diff is not None:
-            with ASK_LOCK:
-                if key in ASK_BASES:
-                    ASK_BASES.move_to_end(key)
-            return base["session"], diff
-    t0 = time.time()
-    what = "document" if is_markdown(path) else "file"
-    msg = (doc_tag(path, doc) + f"\n\nThis is the {what} the user is editing. Each later message "
-           "is one independent request about it. Reply with just OK.")
-    data = run_claude(claude_args(model, path=path), msg)
-    sid = data.get("session_id")
-    if not sid:
-        raise RuntimeError("claude gave no session id")
-    u = data.get("usage") or {}
-    print(f"[ask] base session {sid} for {path} ({len(doc)} chars) in {time.time() - t0:.1f}s; input tokens: "
-          f"{u.get('input_tokens')} new, {u.get('cache_read_input_tokens')} cached, "
-          f"{u.get('cache_creation_input_tokens')} written to the cache", flush=True)
-    with ASK_LOCK:
-        ASK_BASES[key] = {"session": sid, "doc": doc}
-        ASK_BASES.move_to_end(key)
-        while len(ASK_BASES) > ASK_BASES_MAX:
-            ASK_BASES.popitem(last=False)
-    return sid, ""
-
-
-def forget_session(sid):
-    with ASK_LOCK:
-        ASK_CARDS.pop(sid, None)
-        for k in [k for k, b in ASK_BASES.items() if b["session"] == sid]:
-            del ASK_BASES[k]
-
-
-def ask_forked(req, key):
-    """Ask in a fork of the card's last session (Retry / Refine), else of the base session;
-    returns claude's JSON result. RuntimeError means the forked route failed."""
-    doc, path = req.get("doc", ""), key[2]
-    parent = diff = None
-    card = req.get("session")
-    if card:
-        with ASK_LOCK:
-            known = ASK_CARDS.get(card)
-        if known and known["key"] == key:
-            diff = doc_diff(known["doc"], doc, path)
-            parent = card if diff is not None else None
-    if parent is None:
-        parent, diff = base_session(key, doc)
-    try:
-        data = run_claude(claude_args(key[3], resume=parent, path=path), build_request(req, diff))
-    except RuntimeError as exc:
-        # forget the parent only when claude no longer has it: a failure of the launcher, a
-        # request too large to pass, or a passing API error leaves it good for the next card
-        if SESSION_MISSING + " " + parent in " ".join(str(exc).split()):
-            forget_session(parent)
-        raise
-    sid = data.get("session_id")
-    if sid:
-        remember_card(sid, key, doc)
-    return data
-
-
-def remember_card(sid, key, doc):
-    """Note the document version card session `sid` was asked about, for its Retry / Refine.
-    The oldest cards are forgotten (their Retry forks the base instead) past ASK_CARDS_MAX
-    of them, or past ASK_CARDS_CHARS characters of document text, keeping the newest."""
-    with ASK_LOCK:
-        base = ASK_BASES.get(key)
-        if base is not None and base["doc"] == doc:
-            doc = base["doc"]  # the same version: share the base's copy
-        ASK_CARDS[sid] = {"key": key, "doc": doc}
-        chars = sum(len(c["doc"]) for c in ASK_CARDS.values())
-        while len(ASK_CARDS) > 1 and (len(ASK_CARDS) > ASK_CARDS_MAX or chars > ASK_CARDS_CHARS):
-            chars -= len(ASK_CARDS.popitem(last=False)[1]["doc"])
-
-
-def unfence(text: str, original: str, code=False) -> str:
-    """The reply without a code fence around it (unless the selection had one). For code
-    (code=True) the first line keeps its indentation, and a selection's final newline stays."""
-    t = text.strip()
-    if t.startswith("```") and t.endswith("```") and not original.lstrip().startswith("```"):
-        lines = t.splitlines()
-        if len(lines) >= 2:
-            t = "\n".join(lines[1:-1])
-    elif code:
-        t = re.sub(r"\A(?:[ \t]*\n)+", "", text.replace("\r\n", "\n")).rstrip()
-    if code and original.endswith("\n") and t and not t.endswith("\n"):
-        t += "\n"
-    return t
-
-
-def ask_claude(req):
-    t0 = time.time()
-    key = ask_key(req)
-    doc = req.get("doc", "")
-    try:
-        data, forked = ask_forked(req, key), True
-    except RuntimeError as exc:
-        why = " ".join(str(exc).split())[:300]
-        print(f"[ask] fork failed, stateless: {why}", flush=True)
-        msg = doc_tag(key[2], doc) + "\n\n" + build_request(req)
-        data, forked = run_claude(claude_args(key[3], persist=False, path=key[2]), msg), False
-    u = data.get("usage") or {}
-    print(f"[ask] {'forked' if forked else 'stateless'} reply in {time.time() - t0:.1f}s; input tokens: "
-          f"{u.get('input_tokens')} new, {u.get('cache_read_input_tokens')} cached, "
-          f"{u.get('cache_creation_input_tokens')} written to the cache", flush=True)
-    original = doc[int(req.get("start", 0)):int(req.get("end", 0))]
-    return {
-        "result": unfence(data.get("result", ""), original, code=not is_markdown(key[2])),
-        "seconds": round(time.time() - t0, 1),
-        "cost": data.get("total_cost_usd"),
-        "session": data.get("session_id") if forked else None,  # Retry / Refine send it back
-        "forked": forked,
-    }
-
-
-def prepare_ask(req):
-    """Make the base session for a document before its first card needs it."""
-    try:
-        base_session(ask_key(req), req.get("doc", ""))
-    except RuntimeError as exc:
-        print(f"[ask] prepare failed: {' '.join(str(exc).split())[:300]}", flush=True)
-        raise
-    return {"ok": True}
 
 
 # ---------------------------------------------------------------- pdf
@@ -2357,6 +1832,8 @@ class _Proc:
         self.wlock = threading.Lock()  # serialises writes; the reader takes it to close fd
         self.closed = False            # fd closed or about to be: stop using it
         self.retired = False           # replaced or killed: drop its output, announce no exit
+        self.started = time.monotonic()
+        self.last_out = None           # when it last wrote anything
 
 
 class TermSession:
@@ -2373,6 +1850,9 @@ class TermSession:
     and the replay restores them first. The replay then sets the rest in their order,
     so the browser ends in the modes the agent last set, and draws the alternate screen's
     output there only if that is where it went.
+
+    Each spawned agent gets an IdeBridge (`bridge`, None when the IDE link is off), which
+    shares `lock`; it goes when the agent exits or is replaced.
     """
 
     def __init__(self):
@@ -2390,12 +1870,23 @@ class TermSession:
         self.scrollback = bytearray()
         self.replay_modes = {}   # DEC private modes in force where the scrollback begins
         self.closing = False
+        self.bridge = None       # the live session's IdeBridge, if it has one
+        self.ide_reason = None   # why it has none
 
     # -- clients (call with self.lock held unless noted)
 
     def status(self):
+        """The session's state, and its IDE link's: `ide` is off, waiting (for Claude Code to
+        connect) or connected, `ide_reason` says why it is off (when that is not just that no
+        session is running), and `diffs` lists the proposed edits still waiting for the user."""
+        b = self.bridge
         return {"type": "status", "id": self.id, "state": self.state, "cmd": agent_display() or "",
-                "cwd": self.cwd, "code": self.code, "message": self.message}
+                "cwd": self.cwd, "code": self.code, "message": self.message,
+                "ide": b.state if b else "off", "ide_reason": None if b else self.ide_reason,
+                "diffs": list(b.diffs) if b else []}
+
+    def _broadcast_json(self, obj):
+        self._broadcast(ws_frame(OP_TEXT, json.dumps(obj).encode()))
 
     def _broadcast(self, frame):
         for c in [c for c in self.clients if not c.send_frame(frame)]:
@@ -2412,6 +1903,9 @@ class TermSession:
             if ok and (self.scrollback or self.state in ("running", "exited")):
                 replay = mode_prefix(self.replay_modes) + bytes(self.scrollback)
                 ok = client.send_frame(ws_frame(OP_BIN, replay))
+            # the proposed edits still waiting for an answer, for a page that was reloaded
+            for msg in self.bridge.diff_messages() if ok and self.bridge else ():
+                ok = ok and client.send_frame(ws_frame(OP_TEXT, json.dumps(msg).encode()))
             if ok:
                 self.clients.add(client)
         return ok
@@ -2444,9 +1938,26 @@ class TermSession:
         self.scrollback = bytearray()
         self.replay_modes = {}
         cols, rows = self.size
+        # the IDE link listens and writes its lock file before the agent starts: Claude Code
+        # looks for it only for 30 s
+        args, env, self.bridge, self.ide_reason = [], agent_env(), None, None
+        mode = ide_mode() if IDE_LINK != "off" else None
+        if IDE_LINK == "off":
+            self.ide_reason = "The IDE link is turned off (--ide-link off)."
+        elif mode is None:
+            self.ide_reason = (f"{agent_display()} is neither Claude Code nor claude-sandbox; "
+                               "--ide-link native or launcher links it anyway.")
+        else:
+            try:
+                self.bridge = IdeBridge(self, self.cwd, mode)
+                args, env = self.bridge.args, dict(env, **self.bridge.env)
+            except IdeUnavailable as exc:
+                self.ide_reason = str(exc)
+                print(f"[ide] no IDE link: {exc}", flush=True)
         try:
-            proc, master = spawn_pty(AGENT_CMD, self.cwd, agent_env(), cols, rows)
+            proc, master = spawn_pty(AGENT_CMD + args, self.cwd, env, cols, rows)
         except (OSError, subprocess.SubprocessError) as exc:
+            self._close_bridge()
             self.cur, self.state = None, "failed"
             self.message = f"Could not start {agent_display()}: {exc}"
             print(f"[term] {self.message}", flush=True)
@@ -2467,7 +1978,13 @@ class TermSession:
         rec, self.cur = self.cur, None
         if rec is not None:
             rec.retired = True
+        self._close_bridge()
         return rec
+
+    def _close_bridge(self):
+        b, self.bridge = self.bridge, None
+        if b is not None:
+            b.close()
 
     def _read_loop(self, rec):
         quiet = None  # since when the agent has been gone and the PTY silent
@@ -2476,7 +1993,8 @@ class TermSession:
             try:
                 data = os.read(rec.fd, 65536)
             except BlockingIOError:
-                if rec.proc.poll() is not None:  # as in read_pty: a second of quiet ends it
+                # exited: a second of quiet ends it (a straggler may still hold the PTY open)
+                if rec.proc.poll() is not None:
                     now = time.monotonic()
                     if quiet is None:
                         quiet = now
@@ -2493,6 +2011,7 @@ class TermSession:
             if rec.retired:
                 continue
             with self.lock:
+                rec.last_out = time.monotonic()
                 if self.cur is rec:
                     self._append(data)
                     self._broadcast(ws_frame(OP_BIN, data))
@@ -2506,16 +2025,21 @@ class TermSession:
         with self.lock:
             if self.cur is rec and not rec.retired:
                 self.cur, self.state, self.code = None, "exited", code
+                self._close_bridge()
                 self._broadcast_status()
 
-    def write(self, data, alive=lambda: True):
-        """Type `data` into the agent. While it is not reading, wait (holding wlock, so other
-        writes queue behind) until it does, the session ends or is replaced, or `alive()`
-        turns false: the browser that sent it has gone (see WSClient.keepalive)."""
+    def write(self, data, alive=lambda: True, rec=None):
+        """Type `data` into the agent (`rec`, if given, and only while it is the live one).
+        While it is not reading, wait (holding wlock, so other writes queue behind) until it
+        does, the session ends or is replaced, or `alive()` turns false: the browser that sent
+        it has gone (see WSClient.keepalive). True if all of it was written."""
         with self.lock:
-            rec = self.cur
+            if rec is None:
+                rec = self.cur
+            elif rec is not self.cur:
+                return False
         if rec is None:
-            return
+            return False
         with rec.wlock:  # not under self.lock: a blocked write must not stall the output
             view = memoryview(data)
             while view and not rec.closed and not rec.retired and alive():
@@ -2524,7 +2048,8 @@ class TermSession:
                 except BlockingIOError:  # the agent is not reading: wait for room
                     wait_fd(rec.fd, write=True, timeout=0.5)
                 except OSError:
-                    return
+                    return False
+            return not view
 
     def resize(self, cols, rows, nudge=False):
         """Size the PTY (the kernel sends the agent SIGWINCH when that changes it); the first
@@ -2581,6 +2106,177 @@ class TermSession:
             old = self._retire_locked()
         if old is not None:
             terminate_group(old.proc)
+
+    # -- the editor talking to the session (messages from a browser; see IdeBridge)
+
+    def _target(self, msg):
+        """The file or folder a browser message names (`path`, ROOT-relative) as (its absolute
+        path, its real path), or None."""
+        rel = msg.get("path")
+        if not isinstance(rel, str) or "\0" in rel:
+            return None
+        try:
+            lex = os.path.normpath(os.path.join(str(ROOT), lex_rel(rel)))
+            return lex, os.path.realpath(lex)
+        except (ValueError, OSError):
+            return None
+
+    def _ide(self):
+        """The live session's process and IdeBridge (None when the link is off), or a reason
+        why the editor cannot reach the session."""
+        with self.lock:
+            if self.cur is None or self.state != "running":
+                return None, None, "The Claude session is not running."
+            return self.cur, self.bridge, None
+
+    def selection(self, msg):
+        """{"type": "selection", path, start, end, text}: the editor's selection, for Claude
+        Code (selection_changed) when it is in a file inside the session's folder. Lines and
+        characters count from 0, characters in UTF-16 code units (CodeMirror's ch). Anywhere
+        else (another folder opened since the session started, a link out of it), Claude is
+        told to forget the last one, which it would attach to the next prompt."""
+        with self.lock:
+            bridge = self.bridge
+        if bridge is None:
+            return
+        t = self._target(msg)
+        if t is None or not os.path.isfile(t[1]) or not inside(t[1], bridge.cwd):
+            bridge.clear_selection()
+            return
+        start, end = ide_range(msg)
+        text = msg.get("text")
+        bridge.select(t[1], start, end, text if isinstance(text, str) else "")
+
+    def prompt_state(self):
+        """What the agent last drew of Claude Code's prompt: "input" (its input box), "choice" (a
+        menu, such as a permission prompt or the folder-trust question, where Enter picks the
+        marked answer), or None (nothing yet: starting, or not Claude Code). Claude Code marks
+        both with ❯, and the last one it drew is the one on screen."""
+        with self.lock:
+            sb = self.scrollback
+            i = sb.rfind(PROMPT_GLYPH)
+            if i < 0:
+                return None
+            return "choice" if CHOICE_RE.match(sb, i + len(PROMPT_GLYPH)) else "input"
+
+    def _answer_pending(self, bridge):
+        """Why an ask must not press Enter now, or None: Claude is waiting for the user to answer
+        it, and Enter would answer it (choosing "Yes")."""
+        if bridge is not None:
+            with self.lock:
+                files = [d["file"] for d in bridge.diffs.values()]
+            if files:
+                return (f"Claude is waiting for your answer to its proposed change to {os.path.basename(files[0])}: "
+                        "accept or reject it first.")
+        if self.prompt_state() == "choice":
+            return "Claude Code is asking you something in the terminal: answer it there first."
+        return None
+
+    def _wait_ready(self, rec, alive, waiting):
+        """An ask in a session that has only just started waits until Claude Code can take it:
+        it keeps text typed before its prompt is drawn, but drops the Enter. Ready once it has
+        drawn its prompt (or a menu, which the ask then refuses to answer) or, for an agent that
+        is not Claude Code, its output has been quiet for START_QUIET; never more than START_WAIT
+        after the agent started. `waiting()` is called once if it has waited a second. False if
+        the session ended or was replaced, or the browser went, meanwhile."""
+        told, since = False, time.monotonic()
+        while True:
+            with self.lock:
+                if self.cur is not rec:
+                    return False
+                last = rec.last_out
+            now = time.monotonic()
+            if now - rec.started >= START_WAIT or self.prompt_state() is not None:
+                return True
+            if last is not None and now - last >= START_QUIET:
+                return True
+            if not alive():
+                return False
+            if not told and now - since >= 1:
+                told = True
+                waiting()
+            time.sleep(0.05)
+
+    def ask(self, msg, alive=lambda: True, waiting=lambda: None):
+        """{"type": "ask", text, path?, start?, end?}: type the question into the session and
+        press Enter. With the IDE link up, Claude is first sent the selection (a file and no
+        range: the file alone), then a ping, whose answer means it has handled the selection
+        (it answers in order); otherwise the question starts with an @-mention of the lines.
+        A question about a whole file starts with an @-mention of it either way. Nothing is
+        typed while Claude waits for an answer (Enter would give it), and a session that is
+        still starting is waited for (`waiting()` is called then).
+        Returns the answer for the browser: {ok, via: "ide" | "typed"} or {ok: false, error}."""
+        text = msg.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return {"ok": False, "error": "There is no question to send."}
+        rec, bridge, why = self._ide()
+        if why:
+            return {"ok": False, "error": why}
+        if not self._wait_ready(rec, alive, waiting):
+            return {"ok": False, "error": "The Claude session ended before it could take the question."}
+        why = self._answer_pending(bridge)
+        if why:
+            return {"ok": False, "error": why}
+        t = self._target(msg) if msg.get("path") else None
+        start, end = ide_range(msg)
+        via = "typed"
+        if bridge is not None and bridge.is_connected():
+            ok = t is not None and os.path.isfile(t[1]) and inside(t[1], bridge.cwd)
+            sel = bridge.selection_text(t[1], start, end) if ok else None
+            if sel is not None:
+                bridge.select(t[1], start, end, sel)
+                if bridge.ping():
+                    time.sleep(IDE_SETTLE)  # Claude stores the selection a moment after handling it
+                    via = "ide"
+            elif bridge.clear_selection():  # a file elsewhere: Claude must not attach the last selection
+                bridge.ping()
+        if t is not None and (via == "typed" or start == end):
+            # typed, the reference carries the lines; a whole file is named either way, as the
+            # empty selection over the link only hints at it
+            text = typed_ref(t[0], self.cwd, line_span(start, end)) + " " + text
+        if not self.write(paste_bytes(text), alive, rec):
+            return {"ok": False, "error": "The Claude session did not take the question."}
+        time.sleep(IDE_ENTER_DELAY)  # Enter on its own, after the paste
+        why = self._answer_pending(bridge)  # Claude asked something meanwhile
+        if why:
+            return {"ok": False, "error": "The question was typed but not sent. " + why}
+        if not self.write(b"\r", alive, rec):
+            return {"ok": False, "error": "The Claude session did not take the question."}
+        return {"ok": True, "via": via}
+
+    def mention(self, msg, alive=lambda: True):
+        """{"type": "mention", path, start?, end?}: put an @-mention of a file (and lines) or
+        folder into Claude's prompt, without pressing Enter. With the IDE link up Claude Code
+        inserts it (at_mentioned), with the path relative to its folder; otherwise it is typed."""
+        rec, bridge, why = self._ide()
+        if why:
+            return {"ok": False, "error": why}
+        t = self._target(msg)
+        if t is None:
+            return {"ok": False, "error": "There is no such file."}
+        start, end = ide_range(msg)
+        span = line_span(start, end)
+        # typed: the session's folder itself (Claude Code takes no "@." as a mention), and a path
+        # with whitespace, which Claude Code inserts unquoted, so its mention would end there
+        if bridge is not None and inside(t[0], bridge.cwd) and t[0] != bridge.cwd \
+                and not re.search(r"\s", t[0][len(bridge.cwd):]):
+            params = {"filePath": t[0]}
+            if span:
+                params.update(lineStart=span[0] - 1, lineEnd=span[1] - 1)
+            if bridge.notify("at_mentioned", params):
+                return {"ok": True, "via": "ide"}
+        if not self.write(paste_bytes(typed_ref(t[0], self.cwd, span) + " "), alive, rec):
+            return {"ok": False, "error": "The Claude session did not take the text."}
+        return {"ok": True, "via": "typed"}
+
+    def diff_decision(self, client, msg):
+        """{"type": "diff-decision", id, accept, contents?}: the user's answer to a proposed
+        edit. A diff that is no longer waiting is closed in that browser."""
+        with self.lock:
+            bridge = self.bridge
+        did = msg.get("id")
+        if bridge is None or not bridge.decide(did, msg.get("accept") is True, msg.get("contents")):
+            client.send_frame(ws_frame(OP_TEXT, json.dumps({"type": "diff-close", "id": did}).encode()))
 
 
 TERM = TermSession()
@@ -2703,6 +2399,1098 @@ class WSProtocolError(Exception):
         self.code = code
 
 
+class WSReader:
+    """The reading side of a server WebSocket, for a request handler (its rfile and
+    connection) whose client has upgraded: /api/term's browsers and the IDE link's Claude."""
+
+    def ws_drain(self):
+        """After a close frame for a protocol error: send FIN, then read and discard what the
+        client is still sending (say the rest of an oversized message) until it closes, for
+        up to WS_DRAIN. Closing with unread data would reset the connection, which can lose
+        the close frame, so the client would see 1006 instead of our code."""
+        seconds, left = WS_DRAIN
+        deadline = time.monotonic() + seconds
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+            while left > 0:
+                wait = deadline - time.monotonic()
+                if wait <= 0:
+                    break
+                self.connection.settimeout(wait)
+                chunk = self.connection.recv(min(left, 65536))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        except OSError:  # includes the timeout
+            pass
+
+    def ws_read(self, n, client=None):
+        """n bytes from the client, else EOFError. Each 64 KiB of a long payload counts as
+        hearing from the client (`client.last_seen`): it cannot answer a ping mid-frame."""
+        data = bytearray()
+        while len(data) < n:
+            chunk = self.rfile.read(min(n - len(data), 1 << 16))
+            if not chunk:
+                raise EOFError
+            data += chunk
+            if client is not None:
+                client.last_seen = time.monotonic()
+        return bytes(data)
+
+    def ws_serve(self, client, max_message, on_message):
+        """Read frames until the client closes: answer its pings, echo its close, and pass each
+        message (its fragments joined) to on_message(opcode, payload). Raises WSProtocolError
+        (with the close code to send) for a frame the protocol forbids or a message over
+        max_message bytes, and EOFError or OSError when the connection drops."""
+        parts, part_op, part_len = None, None, 0
+        while True:
+            b0, b1 = self.ws_read(2)
+            client.last_seen = time.monotonic()
+            fin, op, n = b0 & 0x80, b0 & 0x0F, b1 & 0x7F
+            if b0 & 0x70 or not b1 & 0x80:  # no extensions negotiated; clients must mask
+                raise WSProtocolError(1002)
+            if n == 126:
+                n = struct.unpack("!H", self.ws_read(2))[0]
+            elif n == 127:
+                n = struct.unpack("!Q", self.ws_read(8))[0]
+            if op >= 0x8:
+                if not fin or n > 125:
+                    raise WSProtocolError(1002)
+            elif (part_len if op == OP_CONT else 0) + n > max_message:
+                raise WSProtocolError(1009)
+            key = self.ws_read(4)
+            payload = ws_unmask(self.ws_read(n, client), key)
+            if op == OP_CLOSE:
+                if n == 1:  # a status code takes two bytes
+                    raise WSProtocolError(1002)
+                client.send_frame(ws_frame(OP_CLOSE, payload[:2]))  # echo the status code
+                return
+            if op == OP_PING:
+                client.send_frame(ws_frame(OP_PONG, payload))
+            elif op == OP_PONG:
+                pass
+            elif op == OP_CONT:
+                if parts is None:
+                    raise WSProtocolError(1002)
+                parts.append(payload)
+                part_len += n
+                if fin:
+                    msg, msg_op = b"".join(parts), part_op
+                    parts, part_op, part_len = None, None, 0
+                    on_message(msg_op, msg)
+            elif op in (OP_TEXT, OP_BIN):
+                if parts is not None:
+                    raise WSProtocolError(1002)
+                if fin:
+                    on_message(op, payload)
+                else:
+                    parts, part_op, part_len = [payload], op, n
+            else:
+                raise WSProtocolError(1002)
+
+
+# ---------------------------------------------------------------- ide link
+#
+# md-editor is the IDE of the terminal's Claude Code session, as VS Code is with Claude Code's
+# extension. Claude Code finds a lock file, `<port>.lock` in its config folder's ide/, holding a
+# token; connects to ws://127.0.0.1:<port> with that token; and speaks MCP (JSON-RPC 2.0, one
+# message per text frame) to it. md-editor tells Claude the editor's selection
+# (`selection_changed`), which is attached to the next prompt, and puts @-mentions into its
+# prompt (`at_mentioned`); when Claude would ask in the terminal before an edit, it also shows
+# the edit in md-editor (`openDiff`) and the user accepts or rejects it there. No message can
+# submit a prompt, so an ask is typed into the terminal.
+#
+# Each spawned session gets an IdeBridge: a token, a listener and a lock file, gone with it.
+# - Native mode (the agent is `claude` itself): a TCP listener on 127.0.0.1, its port in the
+#   agent's environment (CLAUDE_CODE_SSE_PORT, which makes Claude connect to that lock's IDE),
+#   the lock in ${CLAUDE_CONFIG_DIR:-~/.claude}/ide with md-editor's pid.
+# - Launcher mode (any other agent: claude-sandbox): Claude runs in a jail with a loopback of
+#   its own and none of md-editor's environment. md-editor listens on a Unix socket in the
+#   session's folder, which the jail mounts at the same path, and writes the lock into the
+#   jail's ~/.claude/ide (claude-sandbox's shared config folder on this side) with "pid": 1,
+#   which is alive in the jail's pid namespace, so Claude's stale-lock sweep keeps it. It
+#   appends `--settings` to the agent's arguments, which the launcher hands on to Claude:
+#   CLAUDE_CODE_SSE_PORT, and a SessionStart hook that starts socat in the jail to relay its
+#   127.0.0.1:<port> to the socket.
+#
+# Only Claude can use the link: it needs the token, and a browser cannot send the token's
+# header. Whoever connects can only show the user diffs and get text back: the link never
+# writes a file (on Accept, Claude writes its edit itself), runs anything, or reads a file
+# outside the session's folder.
+
+try:
+    from . import __version__
+except ImportError:  # run as a script
+    __version__ = "dev"
+
+IDE_MAX_MESSAGE = 16 << 20   # bytes in one message: openDiff carries whole files
+IDE_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05", "2024-10-07")  # MCP versions
+IDE_PORTS = (20000, 60000)   # launcher mode's port in the jail, picked at random from these
+SUN_PATH_MAX = 107           # bytes in a Unix socket's path
+IDE_PING_TIMEOUT = 2         # seconds an ask waits for Claude to answer its ping
+IDE_SETTLE = 0.05            # seconds for Claude to store the selection once it has answered
+IDE_ENTER_DELAY = 0.1        # seconds between pasting a question and pressing Enter
+IDE_LOCK_CHECK = 5           # seconds between checks that the lock file is still there
+IDE_RESEND = 0.5             # seconds after ide_connected that the selection is sent again
+IDE_DIFFS_MAX = 16           # proposed edits waiting for the user at once
+IDE_CONNS_MAX = 8            # connections to the listener at once (Claude needs one)
+IDE_HANDSHAKE = env_seconds("MDEDIT_IDE_HANDSHAKE", 10)  # seconds a connection has to send its upgrade
+# Proposed edits are numbered `<this process's salt>-<n>`: a page that outlives an md-editor (it
+# reconnects to the next one on the same port) must never take a new proposal for an old one.
+DIFF_SALT = secrets.token_hex(4)
+DIFF_IDS = itertools.count(1)
+# An ask that comes while the agent is starting waits until Claude Code can take it (Claude Code
+# keeps text typed before its prompt is up, but drops the Enter): until it draws its prompt, or
+# its output has been quiet for START_QUIET, for at most START_WAIT after it was spawned.
+START_WAIT = 20
+START_QUIET = env_seconds("MDEDIT_START_QUIET", 2)
+PROMPT_GLYPH = "❯".encode()  # Claude Code's prompt, and the cursor of its menus
+# what follows the glyph when it marks a menu's choice ("❯ 1. Yes"); its input box has a no-break
+# space after it ("❯\u00a0"), so what the user types there ("1. …") is not taken for a menu
+CHOICE_RE = re.compile(rb"(?:\x1b\[[0-?]*[ -/]*[@-~]|[ \t\r\n])*[0-9]+\.\s")
+# text typed into the agent as one bracketed paste must not hold ESC (ESC[201~ would end the
+# paste early and the rest would run as keystrokes) or other control characters
+PASTE_DROP_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+# what Claude Code shows the model (as "## ide")
+IDE_INSTRUCTIONS = """\
+You are attached to md-editor, a local GitHub-style markdown editor (rendered preview, file tree, \
+source control) that the user has open beside this terminal. When the user has text selected \
+there, the selection is attached to their prompt; questions they send from the editor's ask bar \
+arrive as ordinary prompts. Files are plain files on disk: the editor shows your edits as soon \
+as they are written, and saves the user's edits to disk.
+- When editing markdown, keep its structure (headings, lists, links, emphasis, maths, code, \
+tables) unless asked to change it, and keep code valid in the file's language.
+- Use British English spelling unless the document clearly uses another convention.
+- If asked to use a skill, invoke it with the Skill tool first."""
+
+IDE_TOOLS = [
+    {"name": "openDiff",
+     "description": "Show a proposed change to a file in md-editor as a diff, and wait for the user to accept or "
+                    "reject it",
+     "inputSchema": {"type": "object", "properties": {
+         "old_file_path": {"type": "string", "description": "The file's absolute path"},
+         "new_file_path": {"type": "string", "description": "The same path"},
+         "new_file_contents": {"type": "string", "description": "The whole file as proposed"},
+         "tab_name": {"type": "string", "description": "The diff's title"}},
+         "required": ["old_file_path", "new_file_contents", "tab_name"]}},
+    {"name": "close_tab", "description": "Close a diff opened with openDiff",
+     "inputSchema": {"type": "object", "properties": {"tab_name": {"type": "string"}}, "required": ["tab_name"]}},
+    {"name": "closeAllDiffTabs", "description": "Close every diff opened with openDiff",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "getDiagnostics",
+     "description": "Diagnostics for a file URI, or all open files. md-editor reports none, so the result is "
+                    "always an empty list.",
+     "inputSchema": {"type": "object", "properties": {"uri": {"type": "string"}}}},
+]
+
+
+class IdeUnavailable(Exception):
+    """Why a session gets no IDE link."""
+
+
+IDE_LAUNCHERS = ("claude-sandbox", "claude-container")   # `uvx claude-sandbox@latest`, or the script
+
+
+def ide_mode():
+    """native: the agent is Claude Code itself; launcher: it runs Claude Code in claude-sandbox;
+    None: neither, so no link (appending --settings would break, say, `--agent bash`).
+    --ide-link native|launcher chooses for an agent md-editor does not recognise."""
+    if IDE_LINK in ("native", "launcher"):
+        return IDE_LINK
+    if os.path.basename(AGENT_CMD[0]) == "claude":
+        return "native"
+    if any(os.path.basename(a).split("@")[0] in IDE_LAUNCHERS for a in AGENT_CMD):
+        return "launcher"
+    return None
+
+
+def ide_lock_dir(mode):
+    """Where Claude Code looks for lock files: natively its config folder's ide/; in launcher
+    mode the jail's ~/.claude/ide, which claude-sandbox shares from its config folder here."""
+    if mode == "native":
+        return os.path.join(os.path.expanduser(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"), "ide")
+    shared = os.environ.get("CLAUDE_SANDBOX_SHARED_CONFIG") or "~/.config/terminal-config"
+    return os.path.join(os.path.expanduser(shared), ".claude", "ide")
+
+
+# In launcher mode the lock folder is the jail's ~/.claude/ide, which the sandboxed agent can
+# write: lock files are made, read and deleted by name in a folder opened without following a
+# symlink (open_lock_dir), so a link planted there cannot point md-editor at other files.
+
+def open_lock_dir(d):
+    """Make lock folder d (0700) if need be and open it; IdeUnavailable if it is a symlink or
+    not a folder."""
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        return os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise IdeUnavailable(f"Cannot use {d} for the IDE link's lock file: {exc.strerror or exc}.")
+
+
+def write_lock(name, data, dir_fd):
+    """Write lock file `name` (mode 0600) whole, and never over an existing one (FileExistsError):
+    it is linked into place, so Claude never reads it half written."""
+    tmp = f".{name}.{secrets.token_hex(4)}.tmp"  # not *.lock: Claude reads only those
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        try:
+            os.link(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        except FileExistsError:
+            raise
+        except OSError:  # a file system without hard links
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+    finally:
+        remove_file(tmp, dir_fd)
+
+
+def remove_file(path, dir_fd=None):
+    try:
+        os.unlink(path, dir_fd=dir_fd)
+    except OSError:
+        pass
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:  # EPERM: someone else's
+        pass
+    return True
+
+
+def read_lock(name, dir_fd=None):
+    """A lock file's JSON object, or None. It is read without blocking or following a link (the
+    agent could make a lock a FIFO, or a link)."""
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0), dir_fd=dir_fd)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            data = json.loads(os.read(fd, 1 << 16).decode("utf-8"))
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def sweep_ide_locks():
+    """At start: delete the lock files that md-editors no longer running left behind (killed
+    before they could), and their sockets. Claude Code keeps a launcher mode lock ("pid": 1)
+    for ever.
+
+    In launcher mode the lock folder is the sandboxed agents' to write, so a lock may lie about
+    its md-editor and its folder (naming another project's live socket): a socket is deleted
+    only if nothing answers on it, and its lock is then left alone too."""
+    if os.name != "posix":  # os.kill(pid, 0) would end the process on Windows
+        return
+    for mode in ("native", "launcher"):
+        d = ide_lock_dir(mode)
+        try:
+            dfd = os.open(d, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+        except OSError:
+            continue
+        try:
+            names = os.listdir(dfd)
+        except OSError:
+            names = []
+        for name in names:
+            m = re.fullmatch(r"([0-9]+)\.lock", name)
+            if not m:
+                continue
+            data = read_lock(name, dfd)
+            if data is None or data.get("ideName") != "md-editor":
+                continue
+            pid = data.get("mdEditorHostPid")
+            if type(pid) is not int or pid <= 0 or (pid != os.getpid() and pid_alive(pid)):
+                continue
+            folders = data.get("workspaceFolders")
+            sock = None
+            if isinstance(folders, list) and folders and isinstance(folders[0], str) and os.path.isabs(folders[0]):
+                sock = os.path.join(folders[0], f".md-editor-ide-{m.group(1)}.sock")
+                try:
+                    if not stat.S_ISSOCK(os.lstat(sock).st_mode):
+                        sock = None
+                except (OSError, ValueError):
+                    sock = None
+            if sock and socket_alive(sock):  # someone's link is live there: not stale, whatever it says
+                continue
+            remove_file(name, dfd)
+            print(f"[ide] removed a stale lock file: {os.path.join(d, name)}", flush=True)
+            try:
+                if sock and stat.S_ISSOCK(os.lstat(sock).st_mode):
+                    os.unlink(sock)
+            except OSError:
+                pass
+        os.close(dfd)
+
+
+def inside(path, folder):
+    """Whether path is folder or inside it (both absolute and normalised)."""
+    return path == folder or path.startswith(folder.rstrip(os.sep) + os.sep)
+
+
+def read_inside(path, folder):
+    """The text of file `path` (a real path inside real path `folder`) as disk_text gives it, as
+    (text, exists): ("", False) when there is no such file, (None, True) when it is not text.
+
+    The folder is the agent's, which can swap a file that was just checked, or a folder above
+    it, for a link to a file elsewhere: the file is opened one name at a time from `folder`, never
+    following a link (a link found now is refused), and only a regular file is read."""
+    rel = os.path.relpath(path, folder)
+    parts = rel.split(os.sep)
+    if rel == os.curdir or parts[0] == os.pardir:
+        return None, True
+    nofollow, odir = getattr(os, "O_NOFOLLOW", 0), getattr(os, "O_DIRECTORY", 0)
+    if not nofollow or os.open not in os.supports_dir_fd:  # no safe way here: by name
+        text = disk_text(Path(path))
+        return text, text != "" or os.path.lexists(path)
+    try:
+        fd = os.open(folder, os.O_RDONLY | odir)
+    except OSError:
+        return None, True
+    try:
+        for name in parts[:-1]:
+            sub = os.open(name, os.O_RDONLY | odir | nofollow, dir_fd=fd)
+            os.close(fd)
+            fd = sub
+        if not stat.S_ISREG(os.stat(parts[-1], dir_fd=fd, follow_symlinks=False).st_mode):
+            return None, True
+        ffd = os.open(parts[-1], os.O_RDONLY | os.O_NONBLOCK | nofollow, dir_fd=fd)
+    except FileNotFoundError:
+        return "", False
+    except OSError:  # a link (ELOOP), or a file where a folder should be
+        return None, True
+    finally:
+        os.close(fd)
+    with os.fdopen(ffd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > TEXT_MAX:
+            return None, True
+        data = f.read(TEXT_MAX + 1)
+    return (decode_text(data) if len(data) <= TEXT_MAX else None), True
+
+
+def socket_alive(path):
+    """Whether something answers on Unix socket `path` (a socket a crashed process left
+    refuses the connection)."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1)
+    try:
+        s.connect(path)
+        return True
+    except socket.timeout:  # there, but busy
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def socat_path(path):
+    """A path as one parameter of a socat address: its special characters escaped."""
+    return re.sub(r"""([\\:,!'"()\[\]{} ])""", r"\\\1", path)
+
+
+def utf16_index(s, units):
+    """The index in s of the character `units` UTF-16 code units in (CodeMirror counts so)."""
+    if s.isascii():
+        return min(units, len(s))
+    n = 0
+    for i, ch in enumerate(s):
+        if n >= units:
+            return i
+        n += 2 if ord(ch) > 0xFFFF else 1
+    return len(s)
+
+
+def text_range(text, start, end):
+    """The text between two {line, character} positions."""
+    lines = text.split("\n")
+
+    def offset(pos):
+        line = min(pos["line"], len(lines) - 1)
+        return sum(len(x) + 1 for x in lines[:line]) + utf16_index(lines[line], pos["character"])
+    return text[offset(start):offset(end)]
+
+
+def ide_position(p):
+    """A {line, character} position from the browser (both from 0), or None."""
+    if not isinstance(p, dict):
+        return None
+    try:
+        line, ch = int(p.get("line")), int(p.get("character"))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if line < 0 or ch < 0:
+        return None
+    return {"line": min(line, 1 << 30), "character": min(ch, 1 << 30)}
+
+
+def ide_range(msg):
+    """A browser message's (start, end), in order; nothing (or half of it) is the empty range
+    at the start of the file."""
+    start, end = ide_position(msg.get("start")), ide_position(msg.get("end"))
+    if start is None or end is None:
+        start = end = {"line": 0, "character": 0}
+    if (end["line"], end["character"]) < (start["line"], start["character"]):
+        start, end = end, start
+    return start, end
+
+
+def line_span(start, end):
+    """The first and last lines (from 1) a range covers, as Claude Code counts them (a range
+    that ends at the start of a line does not cover it), or None for an empty range."""
+    if start == end:
+        return None
+    a, b = start["line"] + 1, end["line"] + 1
+    if end["character"] == 0 and b > a:
+        b -= 1
+    return a, b
+
+
+def typed_ref(path, cwd, span=None):
+    """The @-mention Send to Claude terminal types: `@path#La-b`, the path relative to the
+    session's folder when it is inside it (absolute otherwise), in quotes if it has spaces."""
+    base = (cwd or "").rstrip("/")
+    p = path[len(base) + 1:] if base and path.startswith(base + "/") else path
+    ref = "@" + (f'"{p}"' if re.search(r"\s", p) else p)
+    if span:
+        ref += f"#L{span[0]}" if span[0] == span[1] else f"#L{span[0]}-{span[1]}"
+    return ref
+
+
+def paste_bytes(text):
+    """text as one bracketed paste, so Claude Code takes it literally: CRs as LFs, and no
+    control characters (see PASTE_DROP_RE)."""
+    text = PASTE_DROP_RE.sub("", text.replace("\r\n", "\n").replace("\r", "\n"))
+    try:
+        data = text.encode("utf-8", "surrogateescape")  # a file name that is not UTF-8 as it is
+    except UnicodeEncodeError:
+        data = text.encode("utf-8", "replace")
+    return b"\x1b[200~" + data + b"\x1b[201~"
+
+
+def rpc_result(rid, result):
+    return {"jsonrpc": "2.0", "id": rid, "result": result}
+
+
+def rpc_error(rid, code, message):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": code, "message": message}}
+
+
+def tool_text(*texts, error=False):
+    out = {"content": [{"type": "text", "text": t} for t in texts]}
+    if error:
+        out["isError"] = True
+    return out
+
+
+class IdeConn:
+    """One connection from Claude Code."""
+
+    def __init__(self, client):
+        self.client = client
+        self.ready = False  # it has said it is connected (ide_connected)
+
+    def send(self, msg):
+        return self.client.send_frame(ws_frame(OP_TEXT, json.dumps(msg).encode()))
+
+    def drop(self):
+        with self.client.send_lock:
+            self.client._drop_locked()
+
+
+class IdeBridge:
+    """Claude Code's IDE link for one session (see above). Its state is guarded by the session's
+    lock, which it holds while it tells the browsers about it; it sends to Claude without it.
+
+    `state`: waiting (for Claude to connect), connected, or off (closed). `diffs`: the proposed
+    edits waiting for the user, by id, each from one connection and answering one request."""
+
+    def __init__(self, session, cwd, mode):
+        self.session, self.lock = session, session.lock
+        self.cwd, self.mode = os.path.realpath(cwd), mode
+        self.token = secrets.token_hex(32)
+        self.state = "waiting"
+        self.conn = None           # the IdeConn Claude is using
+        self.selection = None      # the latest selection_changed params, sent again on connecting
+        self.diffs = {}
+        self.waiters = {}          # our request id → [Event, IdeConn, its reply]
+        self.req_ids = itertools.count(1)
+        self.args, self.env = [], {}
+        self.sock_path = None
+        self.file_lock = threading.Lock()  # the lock file: written again, or deleted
+        self.next_check = time.monotonic() + IDE_LOCK_CHECK
+        self._listen()
+
+    # -- the listener and the lock file
+
+    def _listen(self):
+        native = self.mode == "native"
+        d = ide_lock_dir(self.mode)
+        if not native:
+            if not hasattr(socket, "AF_UNIX"):
+                raise IdeUnavailable("The IDE link to claude-sandbox needs Unix sockets, which this platform lacks.")
+            if not os.path.isdir(os.path.dirname(d)):
+                raise IdeUnavailable(f"{os.path.dirname(d)} does not exist: claude-sandbox has not run yet, or keeps "
+                                     "its configuration elsewhere (set CLAUDE_SANDBOX_SHARED_CONFIG).")
+        dfd = open_lock_dir(d)
+        try:
+            self._bind(native, d, dfd)
+        except BaseException:
+            os.close(dfd)
+            raise
+        self.dir_fd = dfd
+        if native:
+            self.env = {"CLAUDE_CODE_SSE_PORT": str(self.port)}
+        else:
+            relay = (f"socat TCP4-LISTEN:{self.port},bind=127.0.0.1,reuseaddr,fork "
+                     f"UNIX-CONNECT:{shlex.quote(socat_path(self.sock_path))}")
+            settings = {"env": {"CLAUDE_CODE_SSE_PORT": str(self.port)},
+                        "hooks": {"SessionStart": [{"hooks": [{"type": "command", "command":
+                                  f"(setsid {relay} </dev/null >/dev/null 2>&1 &)"}]}]}}
+            self.args = ["--settings", json.dumps(settings)]
+        self.server.bridge = self
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.5}, daemon=True).start()
+        where = self.sock_path or f"127.0.0.1:{self.port}"
+        print(f"[ide] waiting for Claude Code on {where} (lock file {self.lock_path})", flush=True)
+
+    def _bind(self, native, d, dfd):
+        """Listen, on a port whose lock file name is free in lock folder d (open as dfd), and
+        write the lock file."""
+        for _ in range(20):
+            server = sock = None
+            try:
+                if native:
+                    server = IdeTCPServer(("127.0.0.1", 0), IdeHandler)
+                    port = server.server_address[1]
+                else:
+                    port = IDE_PORTS[0] + secrets.randbelow(IDE_PORTS[1] - IDE_PORTS[0])
+                    sock = os.path.join(self.cwd, f".md-editor-ide-{port}.sock")
+                    if len(os.fsencode(sock)) > SUN_PATH_MAX:
+                        raise IdeUnavailable(f"The IDE link's socket would be {sock}, which is longer than a Unix "
+                                             f"socket's path can be ({SUN_PATH_MAX} bytes).")
+                    if os.path.lexists(sock):
+                        continue
+                    server = IdeUnixServer(sock, IdeHandler)
+            except OSError as exc:
+                if not native and exc.errno == errno.EADDRINUSE:  # made since lexists: another port
+                    continue
+                raise IdeUnavailable(f"The IDE link cannot listen: {exc.strerror or exc}.")
+            name = f"{port}.lock"
+            data = {"pid": os.getpid() if native else 1, "workspaceFolders": [self.cwd], "ideName": "md-editor",
+                    "transport": "ws", "authToken": self.token, "mdEditorHostPid": os.getpid()}
+            try:
+                write_lock(name, data, dfd)
+            except FileExistsError:  # every session on this machine shares the folder
+                server.server_close()
+                if sock:
+                    remove_file(sock)
+                continue
+            except OSError as exc:
+                server.server_close()
+                if sock:
+                    remove_file(sock)
+                raise IdeUnavailable(f"Cannot write {os.path.join(d, name)}: {exc.strerror or exc}.")
+            self.port, self.server, self.sock_path = port, server, sock
+            self.lock_name, self.lock_path, self.lock_data = name, os.path.join(d, name), data
+            return
+        raise IdeUnavailable("The IDE link found no free port.")
+
+    def check_lock(self):
+        """Every IDE_LOCK_CHECK seconds (from the listener's thread): write the lock file again
+        if something deleted it, such as a Claude Code on this machine whose config folder is
+        claude-sandbox's, which takes "pid": 1 for a process that has gone."""
+        now = time.monotonic()
+        if now < self.next_check:
+            return
+        self.next_check = now + IDE_LOCK_CHECK
+        with self.file_lock:
+            try:
+                if self.state == "off" or os.stat(self.lock_name, dir_fd=self.dir_fd, follow_symlinks=False):
+                    return
+            except FileNotFoundError:
+                pass
+            except OSError:
+                return
+            try:
+                write_lock(self.lock_name, self.lock_data, self.dir_fd)
+                print(f"[ide] the lock file {self.lock_path} had gone: written again", flush=True)
+            except OSError:
+                pass
+
+    def own_lock(self):
+        """Whether the lock file is still this link's (not another IDE's that took the port
+        after something deleted ours)."""
+        data = read_lock(self.lock_name, self.dir_fd)
+        return data is not None and data.get("authToken") == self.token
+
+    def close(self):
+        """End the link: the session has ended or is being replaced. Claude's waiting diffs
+        are answered as rejected and closed in the browsers, the lock file and the socket are
+        deleted, and the listener stops. Safe to call more than once."""
+        with self.lock:
+            if self.state == "off":
+                return
+            self.state = "off"
+            conn, self.conn = self.conn, None
+            diffs = list(self.diffs.values())
+            self.diffs.clear()
+            for d in diffs:
+                self.session._broadcast_json({"type": "diff-close", "id": d["id"]})
+            waiters = list(self.waiters.values())
+        for w in waiters:
+            w[0].set()
+        with self.file_lock:
+            if self.own_lock():
+                remove_file(self.lock_name, self.dir_fd)
+            os.close(self.dir_fd)
+            if self.sock_path:
+                remove_file(self.sock_path)
+        print("[ide] closed", flush=True)
+        threading.Thread(target=self._stop, args=(conn, diffs), daemon=True).start()
+
+    def _stop(self, conn, diffs):
+        if conn is not None:
+            for d in diffs:
+                if d["conn"] is conn:
+                    conn.send(rpc_result(d["rpc"], tool_text("DIFF_REJECTED", d["title"])))
+            conn.drop()
+        self.server.shutdown()
+        self.server.server_close()
+
+    # -- connections (called from the listener's handler threads)
+
+    def attach(self, client):
+        """Claude Code has connected (with the token): the newest connection replaces any
+        other, so a Claude that reconnects (/ide) is not refused. Returns its IdeConn, or None
+        if the link has closed."""
+        conn = IdeConn(client)
+        with self.lock:
+            if self.state == "off":
+                return None
+            old, self.conn = self.conn, conn
+            if old is not None:
+                self._forget(old)
+                if self.state == "connected":  # until the new one says it is
+                    self.state = "waiting"
+                    self._status()
+        if old is not None:
+            old.drop()
+            print("[ide] a new connection replaces the old one", flush=True)
+        return conn
+
+    def detach(self, conn):
+        with self.lock:
+            if self.conn is not conn:
+                return
+            self.conn = None
+            self._forget(conn)
+            if self.state == "connected":
+                self.state = "waiting"
+                self._status()
+        print("[ide] Claude Code disconnected", flush=True)
+
+    def _forget(self, conn):
+        """A connection has gone (call with the lock): its diffs can't be answered any more,
+        and nothing waits for its replies."""
+        for d in [d for d in self.diffs.values() if d["conn"] is conn]:
+            del self.diffs[d["id"]]
+            self.session._broadcast_json({"type": "diff-close", "id": d["id"]})
+        for w in self.waiters.values():
+            if w[1] is conn:
+                w[0].set()
+
+    def _status(self):
+        if self.session.bridge is self:
+            self.session._broadcast_status()
+
+    def live_conn(self):
+        """The connection Claude has said it is using, or None."""
+        with self.lock:
+            return self.conn if self.conn is not None and self.conn.ready else None
+
+    def is_connected(self):
+        return self.live_conn() is not None
+
+    # -- MCP from Claude
+
+    def receive(self, conn, op, payload):
+        """One message from Claude (on the connection's thread)."""
+        if op != OP_TEXT:
+            return
+        try:
+            msg = json.loads(payload.decode("utf-8"))
+        except ValueError:
+            conn.send(rpc_error(None, -32700, "parse error"))
+            return
+        if not isinstance(msg, dict):
+            conn.send(rpc_error(None, -32600, "expected one JSON-RPC message"))
+            return
+        method, rid = msg.get("method"), msg.get("id")
+        if method is None:  # an answer to a request of ours
+            with self.lock:
+                w = self.waiters.get(rid) if isinstance(rid, int) else None
+                if w is not None and w[1] is conn:
+                    w[2] = msg
+                    w[0].set()
+            return
+        params = msg.get("params")
+        params = params if isinstance(params, dict) else {}
+        if "id" not in msg:
+            return self._notification(conn, method, params)
+        try:
+            out = self._request(conn, rid, method, params)
+        except Exception as exc:  # a bug: still answer
+            traceback.print_exc()
+            out = rpc_error(rid, -32603, f"internal error: {type(exc).__name__}")
+        if out is not None:
+            conn.send(out)
+
+    def _notification(self, conn, method, params):
+        if method in ("notifications/initialized", "ide_connected"):
+            with self.lock:
+                if self.conn is not conn:
+                    return
+                conn.ready = True
+                if self.state == "waiting":
+                    self.state = "connected"
+                    self._status()
+                sel = self.selection
+            if method == "ide_connected":  # what Claude sends is printed escaped (!r), never raw
+                print(f"[ide] Claude Code connected (pid {repr(params.get('pid'))[:60]}, in its own namespace)",
+                      flush=True)
+            if method == "ide_connected" and sel is not None:
+                # Claude listens for selections only a moment after connecting: send it twice
+                conn.send(self._notify_msg("selection_changed", sel))
+                again = threading.Timer(IDE_RESEND, self._resend, args=(conn, sel))
+                again.daemon = True
+                again.start()
+        elif method == "notifications/cancelled":  # Claude gave up on an openDiff
+            rid = params.get("requestId")
+            with self.lock:
+                for d in [d for d in self.diffs.values() if d["conn"] is conn and d["rpc"] == rid]:
+                    del self.diffs[d["id"]]
+                    self.session._broadcast_json({"type": "diff-close", "id": d["id"]})
+        else:
+            print(f"[ide] ignored notification {str(method)[:80]!r}", flush=True)
+
+    def _resend(self, conn, sel):
+        with self.lock:
+            same = self.conn is conn and self.selection is sel
+        if same:
+            conn.send(self._notify_msg("selection_changed", sel))
+
+    def _request(self, conn, rid, method, params):
+        if method == "initialize":
+            want = params.get("protocolVersion")
+            return rpc_result(rid, {"protocolVersion": want if want in IDE_PROTOCOLS else IDE_PROTOCOLS[0],
+                                    "capabilities": {"tools": {}},
+                                    "serverInfo": {"name": "md-editor", "version": __version__},
+                                    "instructions": IDE_INSTRUCTIONS})
+        if method == "tools/list":
+            return rpc_result(rid, {"tools": IDE_TOOLS})
+        if method == "ping":
+            return rpc_result(rid, {})
+        if method == "tools/call":
+            args = params.get("arguments")
+            return self._call(conn, rid, params.get("name"), args if isinstance(args, dict) else {})
+        # a newer Claude Code calling something new shows up here
+        print(f"[ide] unknown method {str(method)[:80]!r}", flush=True)
+        return rpc_error(rid, -32601, f"method not found: {method}")
+
+    def _call(self, conn, rid, name, args):
+        if name == "getDiagnostics":
+            return rpc_result(rid, tool_text("[]"))
+        if name == "openDiff":
+            return self._open_diff(conn, rid, args)
+        if name in ("close_tab", "closeAllDiffTabs"):
+            title = args.get("tab_name") if name == "close_tab" else None
+            with self.lock:
+                hit = [d for d in self.diffs.values()
+                       if d["conn"] is conn and (name == "closeAllDiffTabs" or d["title"] == title)]
+                for d in hit:
+                    del self.diffs[d["id"]]
+                    self.session._broadcast_json({"type": "diff-close", "id": d["id"]})
+            for d in hit:  # Claude closed it itself, so this answer changes nothing
+                conn.send(rpc_result(d["rpc"], tool_text("TAB_CLOSED")))
+            return rpc_result(rid, tool_text("TAB_CLOSED"))
+        print(f"[ide] unknown tool {str(name)[:80]!r}", flush=True)
+        return rpc_error(rid, -32602, f"unknown tool: {name}")
+
+    def _open_diff(self, conn, rid, args):
+        """openDiff: show the proposed file beside the file on disk in every browser; the answer
+        waits for the user (decide). A file md-editor won't show gets an error, so Claude
+        falls back to asking in the terminal only."""
+        old, new, contents, title = (args.get(k) for k in ("old_file_path", "new_file_path", "new_file_contents",
+                                                            "tab_name"))
+        if new is None:
+            new = old
+        if not all(isinstance(v, str) for v in (old, new, contents, title)):
+            return rpc_error(rid, -32602, "openDiff needs old_file_path, new_file_path, new_file_contents and tab_name")
+        why, real, disk, exists = None, None, None, True
+        try:
+            real = os.path.realpath(old)
+            if os.path.realpath(new) != real:
+                why = "md-editor shows changes to one file at a time"
+            elif not os.path.isabs(old) or not inside(real, self.cwd) or real == self.cwd:
+                why = f"md-editor shows changes to files in {self.cwd} only"
+            elif ".git" in Path(os.path.relpath(real, self.cwd)).parts:
+                why = "md-editor does not show changes inside .git"
+            elif len(contents) > TEXT_MAX:
+                why = "the file is too large for md-editor to show"
+            else:
+                disk, exists = read_inside(real, self.cwd)  # never through a link swapped in since
+                if disk is None:
+                    why = "md-editor shows changes to text files only"
+        except (ValueError, OSError):
+            why = "md-editor cannot show a change to that path"
+        if why:
+            print(f"[ide] openDiff {old[:200]!r} not shown: {why}", flush=True)
+            return rpc_result(rid, tool_text(why, error=True))
+        lex = os.path.normpath(old)
+        rel = next((os.path.relpath(p, str(ROOT)) for p in (lex, real) if inside(p, str(ROOT)) and p != str(ROOT)),
+                   None)
+        with self.lock:
+            if self.conn is not conn:  # it has gone: no one to answer
+                return None
+            if len(self.diffs) >= IDE_DIFFS_MAX:
+                return rpc_result(rid, tool_text("too many changes are waiting in md-editor", error=True))
+            did = f"{DIFF_SALT}-{next(DIFF_IDS)}"
+            d = self.diffs[did] = {"id": did, "conn": conn, "rpc": rid, "title": title, "file": real, "path": rel,
+                                   "old": disk, "new": contents, "exists": exists}
+            self.session._broadcast_json(self.diff_message(d))
+        print(f"[ide] showing a proposed change to {real!r}", flush=True)
+        return None
+
+    def diff_message(self, d):
+        """What a browser gets for a waiting diff: `path` is ROOT-relative (null when the file
+        is outside ROOT), `file` absolute; `old` is the file on disk ("" for a new file, when
+        `exists` is false) and `new` the proposal, both with LF line ends, as the editor holds
+        text."""
+        new = d["new"].replace("\r\n", "\n").replace("\r", "\n")
+        return {"type": "diff", "id": d["id"], "path": d["path"], "file": d["file"], "title": d["title"],
+                "old": d["old"], "new": new, "exists": d["exists"]}
+
+    def diff_messages(self):
+        """The waiting diffs, for a browser that attaches (call with the lock)."""
+        return [self.diff_message(d) for d in self.diffs.values()]
+
+    def decide(self, did, accept, contents=None):
+        """The user's answer to diff `did` (the first browser's wins): Accept sends Claude the
+        text to write (the proposal as edited in the diff, `contents`; md-editor never writes
+        it), Reject denies the edit. False if it is not waiting.
+
+        The text goes back with the proposal's line ends: Claude Code proposes LF text (it reads
+        a CRLF file as LF, diffs the answer against that and writes the file's CRLFs back
+        itself), so CRLFs here would make every line of the file a change."""
+        with self.lock:
+            d = self.diffs.pop(did, None) if isinstance(did, str) else None
+            if d is None:
+                return False
+            self.session._broadcast_json({"type": "diff-close", "id": did})
+        if accept:
+            final = contents if isinstance(contents, str) else d["new"]
+            if final == d["new"].replace("\r\n", "\n").replace("\r", "\n"):
+                final = d["new"]  # unchanged: exactly as Claude proposed it
+            elif "\r\n" in d["new"] and "\r" not in final:  # the editor's LFs back to the proposal's CRLFs
+                final = final.replace("\n", "\r\n")
+            reply = tool_text("FILE_SAVED", final)
+        else:
+            reply = tool_text("DIFF_REJECTED", d["title"])
+        d["conn"].send(rpc_result(d["rpc"], reply))
+        print(f"[ide] {'accepted' if accept else 'rejected'} the change to {d['file']!r}", flush=True)
+        return True
+
+    # -- to Claude (from the browsers' handler threads)
+
+    @staticmethod
+    def _notify_msg(method, params):
+        return {"jsonrpc": "2.0", "method": method, "params": params}
+
+    def notify(self, method, params):
+        """Send Claude a notification; False when it is not connected."""
+        conn = self.live_conn()
+        return conn is not None and conn.send(self._notify_msg(method, params))
+
+    def select(self, path, start, end, text):
+        """The editor's selection in file `path` (absolute; inside the session's folder):
+        remembered, and sent to Claude when it is connected."""
+        params = {"text": text, "filePath": path, "fileUrl": Path(path).as_uri(),
+                  "selection": {"start": start, "end": end, "isEmpty": start == end}}
+        with self.lock:
+            self.selection = params
+        self.notify("selection_changed", params)
+
+    def clear_selection(self):
+        """The editor's selection is somewhere Claude may not see: Claude forgets the last one
+        (an empty range with no file clears it; one with no range at all it would ignore).
+        True if Claude was sent that."""
+        with self.lock:
+            if self.selection is None:  # nothing to forget
+                return False
+            self.selection = None
+        zero = {"line": 0, "character": 0}
+        return self.notify("selection_changed", {"text": "", "selection": {"start": zero, "end": zero, "isEmpty": True}})
+
+    def selection_text(self, path, start, end):
+        """The text of a range of file `path`: what the editor last said is selected there,
+        or else the file's (which the editor saves before an ask); None if it is not text."""
+        with self.lock:
+            sel = self.selection
+        if sel and sel["filePath"] == path and sel["selection"]["start"] == start and sel["selection"]["end"] == end:
+            return sel["text"]
+        text = read_inside(path, self.cwd)[0]
+        return None if text is None else text_range(text, start, end)
+
+    def ping(self, timeout=IDE_PING_TIMEOUT):
+        """Ping Claude and wait for the answer: it answers in order, so it has then handled
+        everything sent before. False if it is not connected or does not answer in time."""
+        with self.lock:
+            conn = self.conn if self.conn is not None and self.conn.ready else None
+            if conn is None:
+                return False
+            rid = next(self.req_ids)
+            w = self.waiters[rid] = [threading.Event(), conn, None]
+        try:
+            if not conn.send({"jsonrpc": "2.0", "id": rid, "method": "ping"}):
+                return False
+            w[0].wait(timeout)
+            return w[2] is not None and "result" in w[2]
+        finally:
+            with self.lock:
+                self.waiters.pop(rid, None)
+
+
+class IdeServer:
+    """Mixin for the listener of one IdeBridge (`bridge`): IdeHandler on each connection, in a
+    thread of its own. In launcher mode anything in the jail can connect (the socket is in the
+    folder it mounts), so at most IDE_CONNS_MAX connections are served at once (the rest are
+    closed straight away) and each has IDE_HANDSHAKE to show the token (IdeHandler.timeout):
+    idle connections cannot pile up threads and file descriptors in md-editor."""
+    daemon_threads = True
+    bridge = None
+
+    def __init__(self, *args, **kw):
+        self.slots = threading.BoundedSemaphore(IDE_CONNS_MAX)
+        super().__init__(*args, **kw)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+    def service_actions(self):  # each turn of serve_forever
+        if self.bridge is not None:
+            self.bridge.check_lock()
+
+
+class IdeTCPServer(IdeServer, socketserver.ThreadingTCPServer):
+    pass
+
+
+if hasattr(socketserver, "ThreadingUnixStreamServer"):
+    class IdeUnixServer(IdeServer, socketserver.ThreadingUnixStreamServer):
+        def server_bind(self):
+            """Bind with mode 0600. Linux makes the socket file with the socket's own mode (less
+            the umask); elsewhere it is changed just after, never through a symlink (the
+            folder is the agent's)."""
+            try:
+                os.fchmod(self.socket.fileno(), 0o600)
+                made = True
+            except OSError:
+                made = False
+            super().server_bind()
+            if not made and os.chmod in os.supports_follow_symlinks:
+                os.chmod(self.server_address, 0o600, follow_symlinks=False)
+
+
+class IdeHandler(WSReader, BaseHTTPRequestHandler):
+    """The IDE link's listener: a WebSocket upgrade on / that carries the lock file's token, and
+    nothing else (none of Handler's API is here). Claude Code sends no Origin, so none is
+    checked; a browser could not send the token's header. The request must come within
+    IDE_HANDSHAKE (StreamRequestHandler's timeout, lifted once it has upgraded)."""
+    server_version = "md-editor-ide"
+    timeout = IDE_HANDSHAKE
+
+    def log_message(self, fmt, *args):  # refusals are logged by refuse()
+        pass
+
+    def refuse(self, code, why):
+        print(f"[ide] refused a connection: {why}", flush=True)
+        body = (why + "\n").encode()
+        self.close_connection = True
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def do_GET(self):
+        bridge = self.server.bridge
+        if self.path != "/":  # Claude dials ws://127.0.0.1:<port>
+            return self.refuse(404, f"no such path: {self.path[:100]!r}")
+        tokens = self.headers.get_all("X-Claude-Code-Ide-Authorization") or []
+        given = tokens[0].encode("utf-8", "surrogateescape") if len(tokens) == 1 else b""
+        if not hmac.compare_digest(given, bridge.token.encode()):
+            return self.refuse(401, "missing or wrong X-Claude-Code-Ide-Authorization")
+        key = (self.headers.get("Sec-WebSocket-Key") or "").strip()
+        tokens = {t.strip().lower() for t in (self.headers.get("Connection") or "").split(",")}
+        if ((self.headers.get("Upgrade") or "").lower() != "websocket" or "upgrade" not in tokens
+                or (self.headers.get("Sec-WebSocket-Version") or "").strip() != "13" or not key):
+            return self.refuse(400, "expected a WebSocket upgrade")
+        protocols = {p.strip() for p in (self.headers.get("Sec-WebSocket-Protocol") or "").split(",")}
+        accept = base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+        self.close_connection = True
+        # no Sec-WebSocket-Extensions: permessage-deflate (which Claude offers) is refused
+        self.wfile.write(("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                          f"Sec-WebSocket-Accept: {accept}\r\n"
+                          + ("Sec-WebSocket-Protocol: mcp\r\n" if "mcp" in protocols else "") + "\r\n").encode())
+        self.connection.settimeout(None)  # Claude may be quiet for as long as it likes now
+        client = WSClient(self.connection)
+        conn = bridge.attach(client)
+        if conn is None:
+            client.close(1001)
+            return
+        try:
+            self.ws_serve(client, IDE_MAX_MESSAGE, lambda op, payload: bridge.receive(conn, op, payload))
+        except WSProtocolError as exc:
+            client.close(exc.code)
+            self.ws_drain()
+        except (OSError, EOFError, ValueError):
+            pass
+        finally:
+            bridge.detach(conn)
+            with client.send_lock:
+                client.alive = False
+
+    def not_found(self):
+        self.refuse(404, f"{self.command} is not served here")
+
+    do_HEAD = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = not_found
+
+
 # ---------------------------------------------------------------- http
 
 # Only our own page may use the server, since it reads and writes files and starts
@@ -2732,7 +3520,7 @@ APP_CSP = ("default-src 'self'; "
            "worker-src 'self' blob:; frame-src 'none'; object-src 'none'; base-uri 'self'; form-action 'self'")
 
 
-class Handler(SimpleHTTPRequestHandler):
+class Handler(WSReader, SimpleHTTPRequestHandler):
     def __init__(self, *a, **kw):
         super().__init__(*a, directory=str(STATIC), **kw)
 
@@ -2887,7 +3675,7 @@ class Handler(SimpleHTTPRequestHandler):
         try:
             if u.path == "/api/config":
                 return self.send_json({"root": str(ROOT), "initial": INITIAL, "skills": list_skills(),
-                                       "files": list_files(), "agent": agent_info(), "ask": ask_info()})
+                                       "files": list_files(), "agent": agent_info()})
             if u.path == "/api/term":
                 return self.term_socket()
             if u.path == "/api/download":
@@ -2965,16 +3753,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json({"root": str(ROOT), "initial": initial, "files": list_files()})
             if u.path in POST_API:  # /api/stat, new, rename, delete, git/discard
                 return self.answer(POST_API[u.path], req)
-            if u.path in ("/api/ask", "/api/ask/prepare"):
-                info = ask_info()
-                if not info["available"]:
-                    return self.send_json({"error": info["reason"]}, 503)
-                if u.path == "/api/ask/prepare":
-                    return self.send_json(prepare_ask(req))
-                print(f"[ask] {req.get('mode')}: {req.get('instruction', '')[:80]!r}", flush=True)
-                return self.send_json(ask_claude(req))
-        except subprocess.TimeoutExpired:
-            return self.send_json({"error": "Claude timed out"}, 504)
+        except subprocess.TimeoutExpired:  # Chrome, printing a PDF
+            return self.send_json({"error": "timed out"}, 504)
         except RuntimeError as exc:
             return self.send_json({"error": str(exc)}, 502)
         except (ValueError, KeyError) as exc:
@@ -3038,86 +3818,8 @@ class Handler(SimpleHTTPRequestHandler):
             with client.send_lock:
                 client.alive = False
 
-    def ws_drain(self):
-        """After a close frame for a protocol error: send FIN, then read and discard what the
-        browser is still sending (say the rest of an oversized message) until it closes, for
-        up to WS_DRAIN. Closing with unread data would reset the connection, which can lose
-        the close frame, so the browser would see 1006 instead of our code."""
-        seconds, left = WS_DRAIN
-        deadline = time.monotonic() + seconds
-        try:
-            self.connection.shutdown(socket.SHUT_WR)
-            while left > 0:
-                wait = deadline - time.monotonic()
-                if wait <= 0:
-                    break
-                self.connection.settimeout(wait)
-                chunk = self.connection.recv(min(left, 65536))
-                if not chunk:
-                    break
-                left -= len(chunk)
-        except OSError:  # includes the timeout
-            pass
-
-    def ws_read(self, n, client=None):
-        """n bytes from the browser, else EOFError. Each 64 KiB of a long payload counts as
-        hearing from the browser (`client.last_seen`): it cannot answer a ping mid-frame."""
-        data = bytearray()
-        while len(data) < n:
-            chunk = self.rfile.read(min(n - len(data), 1 << 16))
-            if not chunk:
-                raise EOFError
-            data += chunk
-            if client is not None:
-                client.last_seen = time.monotonic()
-        return bytes(data)
-
     def ws_loop(self, client):
-        parts, part_op, part_len = None, None, 0
-        while True:
-            b0, b1 = self.ws_read(2)
-            client.last_seen = time.monotonic()
-            fin, op, n = b0 & 0x80, b0 & 0x0F, b1 & 0x7F
-            if b0 & 0x70 or not b1 & 0x80:  # no extensions negotiated; clients must mask
-                raise WSProtocolError(1002)
-            if n == 126:
-                n = struct.unpack("!H", self.ws_read(2))[0]
-            elif n == 127:
-                n = struct.unpack("!Q", self.ws_read(8))[0]
-            if op >= 0x8:
-                if not fin or n > 125:
-                    raise WSProtocolError(1002)
-            elif (part_len if op == OP_CONT else 0) + n > WS_MAX_MESSAGE:
-                raise WSProtocolError(1009)
-            key = self.ws_read(4)
-            payload = ws_unmask(self.ws_read(n, client), key)
-            if op == OP_CLOSE:
-                if n == 1:  # a status code takes two bytes
-                    raise WSProtocolError(1002)
-                client.send_frame(ws_frame(OP_CLOSE, payload[:2]))  # echo the status code
-                return
-            if op == OP_PING:
-                client.send_frame(ws_frame(OP_PONG, payload))
-            elif op == OP_PONG:
-                pass
-            elif op == OP_CONT:
-                if parts is None:
-                    raise WSProtocolError(1002)
-                parts.append(payload)
-                part_len += n
-                if fin:
-                    msg, msg_op = b"".join(parts), part_op
-                    parts, part_op, part_len = None, None, 0
-                    self.ws_message(client, msg_op, msg)
-            elif op in (OP_TEXT, OP_BIN):
-                if parts is not None:
-                    raise WSProtocolError(1002)
-                if fin:
-                    self.ws_message(client, op, payload)
-                else:
-                    parts, part_op, part_len = [payload], op, n
-            else:
-                raise WSProtocolError(1002)
+        self.ws_serve(client, WS_MAX_MESSAGE, lambda op, payload: self.ws_message(client, op, payload))
 
     def ws_message(self, client, op, payload):
         if op == OP_BIN:
@@ -3133,15 +3835,38 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if not isinstance(msg, dict):
             return
-        if msg.get("type") == "resize":
+        kind = msg.get("type")
+        if kind == "resize":
             try:
                 cols, rows = int(msg["cols"]), int(msg["rows"])
             except (KeyError, TypeError, ValueError, OverflowError):
                 return
             nudge, client.sized = not client.sized, True
             TERM.resize(cols, rows, nudge)
-        elif msg.get("type") == "restart":
+        elif kind == "restart":
             TERM.restart()
+        elif kind == "selection":
+            TERM.selection(msg)
+        elif kind in ("ask", "mention"):
+            client.writing = True  # it may wait for Claude, and for the agent to read its input
+            try:
+                if kind == "ask":   # a session still starting is waited for: the page says so
+                    waiting = {"type": "waiting", "what": kind}
+                    if "seq" in msg:
+                        waiting["seq"] = msg["seq"]
+                    res = TERM.ask(msg, lambda: client.alive,
+                                   lambda: client.send_frame(ws_frame(OP_TEXT, json.dumps(waiting).encode())))
+                else:
+                    res = TERM.mention(msg, lambda: client.alive)
+            finally:
+                client.last_seen = time.monotonic()
+                client.writing = False
+            res = dict(res, type="sent", what=kind)
+            if "seq" in msg:
+                res["seq"] = msg["seq"]
+            client.send_frame(ws_frame(OP_TEXT, json.dumps(res).encode()))
+        elif kind == "diff-decision":
+            TERM.diff_decision(client, msg)
 
 
 INITIAL = None
@@ -3161,7 +3886,7 @@ def _interrupt(signum, frame):
 
 
 def main():
-    global ROOT, INITIAL, AGENT_CMD, ASK_CMD
+    global ROOT, INITIAL, AGENT_CMD, IDE_LINK
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path", nargs="?", default=".", help="folder or .md file to edit (default: current folder)")
     ap.add_argument("--port", type=int, default=8765)
@@ -3169,20 +3894,20 @@ def main():
     ap.add_argument("--agent", metavar="CMD", default=os.environ.get("MDEDIT_AGENT", DEFAULT_AGENT),
                     help="command run in the side-panel terminal, in the open folder "
                          f"(default: $MDEDIT_AGENT or '{DEFAULT_AGENT}'; 'none' turns the terminal off)")
-    ap.add_argument("--ask-agent", metavar="CMD", default=os.environ.get("MDEDIT_ASK_AGENT", DEFAULT_ASK_AGENT),
-                    help="how Ask Claude runs `claude -p`: a claude-sandbox-compatible launcher, or "
-                         f"'claude' to run it natively (default: $MDEDIT_ASK_AGENT or '{DEFAULT_ASK_AGENT}'; "
-                         "'none' turns Ask Claude off)")
+    ap.add_argument("--ide-link", metavar="auto|off|native|launcher",
+                    default=os.environ.get("MDEDIT_IDE_LINK") or "auto",
+                    help="whether the terminal's Claude Code session connects back to md-editor, which then "
+                         "sends it the editor's selection and shows its proposed edits as diffs. auto links "
+                         "claude (native) and claude-sandbox (launcher) agents; native or launcher links "
+                         "another agent that runs one of them (default: $MDEDIT_IDE_LINK or 'auto')")
     args = ap.parse_args()
-    for flag, value in (("--agent", args.agent), ("--ask-agent", args.ask_agent)):
-        try:
-            cmd = parse_command(value)
-        except ValueError as exc:
-            ap.error(f"{flag}: {exc}")
-        if flag == "--agent":
-            AGENT_CMD = cmd
-        else:
-            ASK_CMD = cmd
+    try:
+        AGENT_CMD = parse_command(args.agent)
+    except ValueError as exc:
+        ap.error(f"--agent: {exc}")
+    IDE_LINK = args.ide_link.strip().lower()
+    if IDE_LINK not in ("auto", "off", "native", "launcher"):
+        ap.error(f"--ide-link: expected auto, off, native or launcher, not {args.ide_link!r}")
 
     target = Path(args.path).expanduser().resolve()
     if target.suffix.lower() in MD_EXT:
@@ -3201,17 +3926,19 @@ def main():
     info = agent_info()
     print(f"Terminal: {info['cmd']}" if info["available"] else f"Terminal unavailable: {info['reason']}",
           flush=True)
-    info = ask_info()
-    print(f"Ask Claude: {info['cmd']} ({info['mode']})" if info["available"]
-          else f"Ask Claude unavailable: {info['reason']}", flush=True)
+    if info["available"]:
+        mode = ide_mode() if IDE_LINK != "off" else None
+        print(f"IDE link: {mode} mode" if mode else "IDE link: off", flush=True)
+        if mode:
+            sweep_ide_locks()
     # stop cleanly on Ctrl+C, SIGTERM, and SIGHUP unless it is ignored (nohup), so the
-    # terminal's and running Ask Claude calls' process groups are killed rather than orphaned
+    # terminal's process group is killed rather than orphaned, and the IDE link's lock file
+    # and socket are deleted
     for name in ("SIGINT", "SIGTERM", "SIGHUP"):
         sig = getattr(signal, name, None)
         if sig is not None and signal.getsignal(sig) in (signal.SIG_DFL, signal.default_int_handler):
             signal.signal(sig, _interrupt)
     atexit.register(TERM.kill)
-    atexit.register(end_asks)
     atexit.register(end_searches)
     if not args.no_browser:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
@@ -3221,7 +3948,6 @@ def main():
         pass
     finally:
         TERM.kill()
-        end_asks()
         end_searches()
         server.server_close()
 

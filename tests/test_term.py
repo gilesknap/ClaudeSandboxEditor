@@ -116,7 +116,7 @@ def test_handshake_and_first_status(srv):
         st = c.wait_status()
         assert c.frames[0].op == 1
         assert st == {"type": "status", "id": None, "state": "none", "cmd": BASH, "cwd": None,
-                      "code": None, "message": None}
+                      "code": None, "message": None, "ide": "off", "ide_reason": None, "diffs": []}
         assert not c.wait(lambda: any(f.op == 2 for f in c.frames), 0.5), "no replay for a 'none' session"
     finally:
         c.close()

@@ -1,5 +1,5 @@
-"""The editor in headless Chromium (Playwright): the side-panel terminal (bash standing in for
-Claude Code) and an Ask Claude round trip through fakes/fake-sandbox.
+"""The editor in headless Chromium (Playwright): the side-panel terminal, with bash standing in
+for Claude Code (test_e2e_session.py has Ask Claude and the IDE link).
 
 Skipped when Playwright or its Chromium is missing (`uv run playwright install chromium`);
 MD_EDITOR_E2E=require turns the skip into a failure, as in CI. The page loads its libraries
@@ -22,10 +22,9 @@ except ImportError:
         raise
     pytest.skip("Playwright is not installed (it needs Python 3.10+)", allow_module_level=True)
 
-pytestmark = [pytest.mark.e2e, needs_linux]   # fakes/fake-sandbox needs Linux tools
+pytestmark = [pytest.mark.e2e, needs_linux]   # the terminal runs bash on a PTY, read through /proc
 
 DOC = "# E2E\n\nFirst paragraph here, long enough to select.\n\nSecond paragraph.\n"
-SELECTED = "First paragraph here, long enough to select."
 
 
 @pytest.fixture(scope="module")
@@ -44,7 +43,7 @@ def browser():
 @pytest.fixture(scope="module")
 def srv(shared_servers):
     (shared_servers.root / "a.md").write_text(DOC, encoding="utf-8")
-    return shared_servers.start(agent="bash --norc --noprofile -i", ask_agent=str(FAKES / "fake-sandbox"))
+    return shared_servers.start(agent="bash --norc --noprofile -i")
 
 
 @pytest.fixture
@@ -61,10 +60,6 @@ def page(browser, srv):
     yield pg
     ctx.close()
     assert not errors, errors
-
-
-def editor_value(page):
-    return page.evaluate("() => document.querySelector('.CodeMirror').CodeMirror.getValue()")
 
 
 def wait_term_line(page, pattern, timeout=10000):
@@ -87,11 +82,11 @@ def panel_width(page):
 
 # ---------------------------------------------------------------- terminal
 
-def test_terminal_tab_is_the_default(page):
-    expect(page.get_by_role("tab", name="Terminal")).to_have_attribute("aria-selected", "true")
+def test_the_panel_is_the_terminal(page):
+    expect(page.locator("#panel-title")).to_have_text("Claude Code")
     expect(page.locator("#term-wrap")).to_be_visible()
     expect(page.locator("#term .xterm")).to_be_visible()
-    expect(page.locator("#cards")).to_be_hidden()
+    expect(page.get_by_role("tab", name=re.compile("Suggestions"))).to_have_count(0)
     expect(page.get_by_role("button", name="Restart")).to_be_visible()
 
 
@@ -323,31 +318,3 @@ def test_panel_width_drag_persists(page):
     page.reload()
     expect(page.locator("#doc-name")).to_have_text("a.md")
     assert panel_width(page) == pytest.approx(after, abs=1)
-
-
-# ---------------------------------------------------------------- Ask Claude
-
-def test_ask_claude_suggestion_accepted(page, srv):
-    ask = page.locator("#toolbar").get_by_role("button", name="✦ Ask Claude")
-    expect(ask).to_be_enabled()
-    with page.expect_request("**/api/ask/prepare") as prepare:   # the base session is made early
-        page.locator(".CodeMirror-line", has_text=SELECTED).click(click_count=3)
-        expect(page.locator("#ask-pill")).to_be_visible()
-    assert prepare.value.header_value("origin") == srv.origin
-    assert page.evaluate("() => document.querySelector('.CodeMirror').CodeMirror.getSelection()").strip() == SELECTED
-    page.keyboard.press("Control+j")
-    expect(page.locator("#askbar")).to_be_visible()
-    page.locator("#ask-presets").get_by_role("button", name="Tighten", exact=True).click()
-    expect(page.get_by_role("tab", name=re.compile("Suggestions"))).to_have_attribute("aria-selected", "true")
-    card = page.locator("#cards .card").first
-    expect(card).to_have_class(re.compile(r"\bready\b"), timeout=30000)
-    expect(card).to_contain_text("ECHO:")
-    card.get_by_role("button", name="Accept").click()
-    expect(card).to_contain_text("Accepted")
-    text = editor_value(page)
-    assert SELECTED not in text and "ECHO:" in text
-    assert text.startswith("# E2E\n\n") and text.endswith("\n\nSecond paragraph.\n")
-    assert len(srv.bases()) == 1 and srv.calls()[-1]["parent"] == srv.bases()[0]["session"], "the card forked it"
-    expect(page.locator("#save-state")).to_have_text("Saved", timeout=10000)
-    assert "ECHO:" in (srv.root / "a.md").read_text(encoding="utf-8")
-    assert not [f for f in os.listdir(srv.root) if f.startswith(".md-editor-ask-")]

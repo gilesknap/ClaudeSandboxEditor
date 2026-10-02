@@ -272,6 +272,28 @@ def test_inline_view_navigation_and_revert(page, repo):
     expect(page.locator(f"{VIEW} .diff-inline .diff-del-line")).to_have_count(1)
 
 
+def test_diff_editors_report_the_working_files_selection(page):
+    """What is selected in a diff is what Claude is told about (Term.select, which the IDE link
+    passes on): lines of the working file, from either view."""
+    page.evaluate("() => { window.sels = []; Term.select = s => window.sels.push(s); }")
+    open_scm(page)
+    scm_row(page, "src/app.py").click()
+    expect(page.locator(f"{VIEW} .CodeMirror-merge")).to_be_visible()
+    page.evaluate(f"""() => document.querySelector('{VIEW} .CodeMirror-merge-editor .CodeMirror').CodeMirror
+                          .setSelection({{line: 1, ch: 4}}, {{line: 2, ch: 0}})""")
+    page.wait_for_function("() => window.sels.length && window.sels.at(-1).start.line === 1")
+    assert page.evaluate("window.sels.at(-1)") == {"path": "src/app.py", "start": {"line": 1, "character": 4},
+                                                   "end": {"line": 2, "character": 0}, "text": 'print("hello")\n'}
+    # the inline view's rows are mapped back to the file's lines, the removed ones left out
+    page.locator(f"{VIEW} .diff-head [data-view=inline]").click()
+    expect(page.locator(f"{VIEW} .diff-inline .CodeMirror")).to_be_visible()
+    page.evaluate(f"""() => document.querySelector('{VIEW} .diff-inline .CodeMirror').CodeMirror
+                          .setSelection({{line: 1, ch: 0}}, {{line: 3, ch: 5}})""")
+    page.wait_for_function("() => window.sels.at(-1).end.line === 2")
+    assert page.evaluate("window.sels.at(-1)") == {"path": "src/app.py", "start": {"line": 1, "character": 0},
+                                                   "end": {"line": 2, "character": 12}, "text": '    print("hello")\n    return 1'}
+
+
 def test_deleted_and_untracked_files(page):
     open_scm(page)
     scm_row(page, "src/old.py").click()

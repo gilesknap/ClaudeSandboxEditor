@@ -1,6 +1,6 @@
 # MD Collaborative Editor
 
-A local markdown editor that renders exactly like GitHub, with Claude built in. You can highlight any passage and ask Claude to rewrite, tighten, restyle or critique it, then accept the suggestion or keep the original.
+A local markdown editor that renders exactly like GitHub, with Claude Code built in. You can highlight any passage and ask the Claude Code session in the side panel to rewrite, tighten, restyle or critique it: like VS Code's Claude Code extension, md-editor tells the session which file and lines you have selected, and Claude's proposed edits can come back as diffs to accept or reject.
 
 ## Install
 
@@ -28,44 +28,62 @@ md-editor ~/notes               # edit any folder
 md-editor ~/proj/README.md      # edit one file (its folder becomes the root)
 md-editor --port 9000 --no-browser
 md-editor --agent claude        # side-panel terminal runs Claude Code without the sandbox
-md-editor --ask-agent claude    # Ask Claude runs claude -p without the sandbox
+md-editor --ide-link off        # the terminal's Claude Code does not connect back to md-editor
 ```
 
-The editor itself needs only Python 3.9+ (standard library, no dependencies). By default *Ask Claude* and the side-panel terminal both run Claude Code inside [claude-sandbox](https://pypi.org/project/claude-sandbox/), which needs [uv](https://docs.astral.sh/uv/), rootless podman (or docker) and `/dev/net/tun` on the host, and Linux or macOS. With `--ask-agent claude` or `--agent claude` they use the `claude` CLI on your PATH instead; uv can't install `claude`, because it isn't a Python package. Without any of these, everything except Claude still works. The page loads its libraries from a CDN, so the browser needs internet access.
+The editor itself needs only Python 3.9+ (standard library, no dependencies). By default the side-panel terminal, which *Ask Claude* talks to, runs Claude Code inside [claude-sandbox](https://pypi.org/project/claude-sandbox/), which needs [uv](https://docs.astral.sh/uv/), rootless podman (or docker) and `/dev/net/tun` on the host, and Linux or macOS. With `--agent claude` it uses the `claude` CLI on your PATH instead; uv can't install `claude`, because it isn't a Python package. Without any of these, everything except Claude still works. The page loads its libraries from a CDN, so the browser needs internet access.
 
 The server listens on 127.0.0.1 only and checks the `Host` and `Origin` of every request, so other websites can't use it, even by DNS rebinding; forwarding the port to another local port (8765 to 8766, say) still works.
 
-To work on the editor itself, clone the repo and run `uv run md-editor docs`, which uses the code in the checkout. Run the tests with `uv run pytest`; the browser tests also need `uv run playwright install chromium` (and Python 3.10 or later), and are skipped without it. The tests use stand-ins for claude-sandbox and Claude Code, so they need neither, and GitHub Actions runs them on Python 3.9 and 3.13 for every push and pull request. The terminal tests, the browser tests and the tests that go through the claude-sandbox stand-in need Linux (they use util-linux 2.35+ `script`, GNU tools and `/proc`), so on other systems they are skipped.
+To work on the editor itself, clone the repo and run `uv run md-editor docs`, which uses the code in the checkout. Run the tests with `uv run pytest`; the browser tests also need `uv run playwright install chromium` (and Python 3.10 or later), and are skipped without it. The tests use stand-ins for Claude Code (a fake agent, and a client that replays the messages Claude Code sends an IDE), so they need neither claude-sandbox nor Claude Code, and GitHub Actions runs them on Python 3.9 and 3.13 for every push and pull request. The terminal, IDE link and browser tests need Linux (they use util-linux 2.35+ `script`, GNU tools and `/proc`), so on other systems they are skipped.
 
 ## Working with Claude
 
-1. **Highlight** text in the editor or in the rendered preview. In the preview a pop-up opens straight away; in the editor click the small *✦ Ask Claude* pill or press <kbd>Ctrl</kbd>+<kbd>J</kbd>.
-2. **Choose** a preset (*My style*, *Improve*, *Tighten*, *Expand*, *Simplify*, *Fix grammar*, *More formal/casual*, *To bullets/prose*, *Critique*) or type your own instruction. An instruction ending in `?` is treated as a question: Claude replies with a comment and leaves the text alone.
-3. A **card** appears on the *Suggestions* tab of the Claude panel, and the passage is highlighted in purple while Claude works and in amber when the suggestion is ready. Each card offers:
-   - **Changes / Preview / Edit**: a word-level diff, the rendered result, or a text box for tweaking it by hand;
-   - **Accept**: replace the passage (Ctrl+Z undoes it);
-   - **Keep original**: discard the suggestion;
-   - **Retry**: ask for a different version;
-   - **Refine…**: give feedback such as "shorter" or "keep the first sentence" and get a revised version.
-4. With nothing selected, the request applies to the whole document.
+There is one Claude Code session: the one in the side panel's terminal (see [Claude Code in the side panel](#claude-code-in-the-side-panel)). As with VS Code's Claude Code extension, it knows which file you have open and what you have selected, and everything you ask goes to it.
 
-You can run several requests at once, and you can keep editing while Claude works, because each card tracks its passage as the text moves. *My style* uses the `nisbet-writing-style` skill; any skill in `~/.claude/skills` appears as a preset. The model menu in the top bar picks Opus, Sonnet or Haiku.
+1. **Highlight** text in the editor or in the rendered preview. In the preview a pop-up opens straight away; in the editor click the small *✦ Ask Claude* pill or press <kbd>Ctrl</kbd>+<kbd>J</kbd>. With nothing selected, the question is about the whole file.
+2. **Choose** a preset (*My style*, *Improve*, *Tighten*, *Expand*, *Simplify*, *Fix grammar*, *More formal/casual*, *To bullets/prose*, *Critique*) or type your own question or instruction and press <kbd>Enter</kbd>.
+3. The panel shows the terminal, and the question goes to Claude Code with <kbd>Enter</kbd> pressed for you, so Claude starts straight away. A file with unsaved changes is saved first (a short message says so), so that Claude reads what you see. Claude answers in the terminal, where you can carry on the conversation, and makes any change to the file itself: the editor shows it as it lands.
 
-### Where requests run
+If the session has only just started, the question waits until Claude Code is ready for it. If Claude Code is asking *you* something in the terminal (whether it may make an edit or run a command, say), the question is not sent and a message says why: the <kbd>Enter</kbd> would answer Claude's question, with its default "Yes". Answer it in the terminal (or accept or reject the [proposed change](#reviewing-claudes-edits)), then ask again.
 
-Each request runs `claude -p` (headless Claude Code), with its tools limited to reading files and using skills, so it uses your Claude login and needs no API key.
+*My style* uses the `nisbet-writing-style` skill; any skill in `~/.claude/skills` appears as a preset. Choose Claude's model in the session itself, with `/model`.
 
-- By default it runs inside claude-sandbox, as `uvx claude-sandbox@latest shell -c …` in the open folder (the requirements are the [terminal's](#claude-code-in-the-side-panel)). The request reaches the container through a short-lived file, `.md-editor-ask-….txt`, in the open folder, so the folder must be writable. Documents larger than about 100 kB can't be passed into the sandbox, so *Ask Claude* reports an error for them. claude-sandbox stops the folder's container when its last session ends, so unless the Terminal tab has a session running in the same folder, every request waits for the container to start again; a terminal session started just as a request finishes can find the container stopping, and **Restart** fixes that.
-- `--ask-agent` (or the `MDEDIT_ASK_AGENT` environment variable) picks how requests run: `md-editor --ask-agent claude` runs `claude -p` natively, without the sandbox, and `--ask-agent none` turns *Ask Claude* off (the button is greyed out and says why).
-- The document is sent to Claude once per version. When the *✦ Ask Claude* pill or the ask bar appears, a Claude session that holds the document starts in the background, and each card continues a copy of it, sending only the selection and the instruction (and, after small edits, a diff), so later cards are quicker and cheaper. *Retry* and *Refine* continue the card's own conversation. These sessions belong to the folder `~/.cache/md-editor/ask` (in the container, or in your own home folder when run natively), so they stay out of your project's `/resume` list.
+How the selection reaches Claude depends on md-editor's **[IDE link](#the-ide-link)** to the session, whose state the panel's header shows:
+
+- **IDE linked**: Claude Code is connected to md-editor as its IDE. It follows the file and the lines you select as you select them (its prompt shows "⧉ 3 lines selected"), and a question goes with the selected text attached, as in VS Code. A question about a whole file starts with a reference to it, such as `@notes.md Critique this…`.
+- **IDE link…** (waiting for Claude Code to connect) or **No IDE link**: the question is typed in after a reference to the lines, such as `@notes.md#L12-20 Tighten this…`, and Claude reads them from the file.
+
+### Reviewing Claude's edits
+
+claude-sandbox runs Claude Code in auto mode, so by default its edits land on disk straight away and you review them afterwards: the editor flashes each change, the change bars in the gutter mark it, and **Source Control** lists the files Claude touched, each with a diff in which any change can be put back (see [Reviewing changes](#reviewing-changes)).
+
+To review each edit before it is made, switch Claude Code to ask first: press <kbd>Shift</kbd>+<kbd>Tab</kbd> in the terminal until its footer says *manual mode* (or start every session that way, with `--agent 'uvx claude-sandbox@latest --permission-mode default'`). Then, while the IDE link is up, each edit Claude wants to make opens in md-editor as a **proposed change**: a tab such as `notes.md (proposed)`, with the file as it is on the left and Claude's version on the right. Claude Code also asks in the terminal ("Opened changes in md-editor"), and whichever you answer first counts; until you answer, *Ask Claude* sends nothing, as its <kbd>Enter</kbd> would answer "Yes" in the terminal.
+
+- You can edit the right-hand side; the arrows between the sides put a change back as it was.
+- **Accept** (<kbd>Ctrl</kbd>+<kbd>Enter</kbd>) lets Claude write the right-hand side, your edits included. md-editor itself writes nothing: Claude does, and the editor shows the result.
+- **Reject** (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd>), or closing the tab, tells Claude no; Claude stops and waits for you in the terminal.
+- Answering Claude's own question in the terminal instead closes the tab.
+- While a change waits, the file is read-only (in its own tab, under a banner, and in its Source Control diff) and is not saved, so nothing you type can race Claude's write. A change that arrives while you are typing in another file opens in a tab beside it, with a short message, rather than taking the keyboard away.
+- A waiting change comes back if you reload the page, even with the Claude panel hidden. It belongs to the session, not to the open folder: opening another folder, or *Close saved*, leaves it waiting.
+
+### Changes in 0.4.0
+
+*Ask Claude* used to run each request as a separate, headless Claude Code (`claude -p`) and show the result as a card on a **Suggestions** tab. It now asks the one session in the side panel, as above, and these are gone:
+
+- the Suggestions tab and its cards (Accept, Keep original, Retry, Refine, and comments for questions ending in `?`); the panel is now the terminal alone;
+- the model menu in the top bar: choose the model in the session, with `/model`;
+- the `--ask-agent` option (md-editor now refuses it) and the `MDEDIT_ASK_AGENT` and `MDEDIT_ASK_TIMEOUT` environment variables. md-editor no longer uses `~/.cache/md-editor/ask`, which you can delete.
+
+New are the [IDE link](#the-ide-link) (`--ide-link`, `MDEDIT_IDE_LINK`) and proposed changes shown as diffs.
 
 ## Claude Code in the side panel
 
-The ✦ panel has two tabs: **Suggestions** holds the *Ask Claude* cards, and **Terminal** runs a full interactive Claude Code session in the folder you have open. Ask it to work on your documents and its edits appear in the editor as it saves them. Drag the panel's left edge to widen it.
+The ✦ panel runs a full interactive Claude Code session in the folder you have open: the session that *Ask Claude* and *Send to Claude terminal* talk to. Ask it to work on your documents and its edits appear in the editor as it saves them. Its header shows the state of the IDE link (see [Working with Claude](#working-with-claude)). Drag the panel's left edge to widen it.
 
 By default the terminal runs `uvx claude-sandbox@latest`, which runs Claude Code inside a [claude-sandbox](https://pypi.org/project/claude-sandbox/) container for the open folder. That needs [uv](https://docs.astral.sh/uv/), rootless podman (or docker) and `/dev/net/tun` on the host; the first start pulls the container image, so it takes a while.
 
-- The session starts the first time the Terminal tab is shown. It survives page reloads and ends when md-editor quits. After a reload or reconnect the last 512 KiB of output is replayed, the terminal modes Claude Code set (its full screen, mouse reporting, bracketed paste) are restored, and Claude Code redraws its screen.
+- The session starts the first time the panel is shown. It survives page reloads and ends when md-editor quits. After a reload or reconnect the last 512 KiB of output is replayed, the terminal modes Claude Code set (its full screen, mouse reporting, bracketed paste) are restored, and Claude Code redraws its screen.
 - There is one session, shared by every browser tab, so it is best open in one tab at a time: it has one size, set by the tab that resized it last, and other tabs draw it wrongly until they resize it.
 - **Restart** ends the session and starts a new one in the open folder. When a session ends by itself, press <kbd>Enter</kbd> to start another.
 - If you open a different folder, the session stays where it was and a notice offers to restart it in the new folder.
@@ -74,13 +92,34 @@ By default the terminal runs `uvx claude-sandbox@latest`, which runs Claude Code
 
 The terminal needs Linux or macOS, because it runs on a pseudo-terminal. Only the editor's own page can connect to it, because the server checks the `Host` and `Origin` of every request.
 
+### The IDE link
+
+md-editor is the session's IDE, in the way VS Code is with Claude Code's extension: Claude Code connects to md-editor and speaks Claude Code's IDE protocol to it. md-editor uses that connection to tell Claude which file and lines you have selected, to put `@` references into its prompt, and to show the edits Claude asks permission for as diffs. Claude Code looks for an IDE when it starts by reading *lock files* (`<port>.lock`, each naming a port and a secret token) in its configuration folder's `ide/`, and connects to `127.0.0.1:<port>` with that token. md-editor sets this up afresh each time the session starts, and removes it when the session ends:
+
+- **In claude-sandbox** (the default `--agent`, and any agent not called `claude`), Claude runs in a jail with a network of its own and none of md-editor's environment, so the link takes three parts:
+  - md-editor listens on a Unix socket in the open folder, `.md-editor-ide-<port>.sock` (readable by you only, and never shown in the editor). The jail sees the folder, and so the socket, at the same path.
+  - md-editor writes the lock file into the jail's `~/.claude/ide`, which is `~/.config/terminal-config/.claude/ide` on your machine (or under `$CLAUDE_SANDBOX_SHARED_CONFIG`). Nothing happens until that folder exists, which it does once claude-sandbox has run.
+  - md-editor adds `--settings '{…}'` to the agent's command line. claude-sandbox hands it on to Claude Code, and it sets `CLAUDE_CODE_SSE_PORT` (which makes Claude connect to md-editor) and a `SessionStart` hook that starts `socat` inside the jail to relay the jail's `127.0.0.1:<port>` to the socket.
+- **Natively** (`--agent claude`), md-editor listens on `127.0.0.1`, writes the lock file into `~/.claude/ide` (or `$CLAUDE_CONFIG_DIR/ide`), and sets `CLAUDE_CODE_SSE_PORT` for the session.
+
+`--ide-link off` (or `MDEDIT_IDE_LINK=off`) turns the link off; *Ask Claude* and *Send to Claude terminal* then always type `@path#L12-20` references into the terminal. The link is made only for agents md-editor recognises: `claude` (native mode) and claude-sandbox (`claude-sandbox` or `claude-container` anywhere in the command; launcher mode). Any other agent (`--agent bash`, say) gets no link and nothing added to its command line. If your agent is a wrapper that runs one of those, `--ide-link native` or `--ide-link launcher` links it anyway.
+
+The panel's header shows the link's state: **IDE linked** once Claude Code has connected (its prompt then shows `⧉ In notes.md`, or `⧉ 3 lines selected`, for what is on screen in the editor), **IDE link…** while md-editor waits for it, and **No IDE link** when there is none; hover over it for details. If it still says **IDE link…** some seconds after Claude Code has started, the link did not connect:
+
+- Claude Code only looks for an IDE for its first 30 seconds. Type `/ide` in the terminal and choose md-editor to connect by hand, or **Restart** the session.
+- Look for lines starting `[ide]` in md-editor's output. *No IDE link* in the header, with the reason in its tooltip, means md-editor could not set the link up: no claude-sandbox configuration folder yet, an open folder whose path is too long for the socket (a Unix socket's path can be at most 107 bytes, so the folder's path at most about 80), or a lock folder it could not write.
+- In claude-sandbox, the relay needs `socat` in the container (the claude-sandbox image has it) and Claude Code's hooks: `disableAllHooks` in its settings, or a managed policy that allows only managed hooks, stops it. A security module that stops the container from connecting to a socket made on the host (SELinux, for instance) blocks it as well.
+- md-editor deletes its lock files and sockets when it exits, and on its next start removes any that a crashed md-editor left behind.
+
+Everything still works without the link, typed into the terminal instead; you lose only the selected text being attached exactly, the "⧉ N lines selected" indicator, and proposed changes shown in md-editor.
+
 ## Working with Claude Code in a terminal
 
 Documents are plain files on disk. When Claude Code, or anything else, edits a file that is open in a tab, the editor updates within about a second and briefly flashes the changed text, whether or not that tab is the one on screen. If you had unsaved edits at that moment, a banner asks which version to keep (and if you undo them, the file on disk is loaded). A file deleted or moved on disk keeps its tab, struck through, until you close it or save it again; it is only written back when you ask (<kbd>Ctrl</kbd>+<kbd>S</kbd>, or *Save to re-create it* in its banner), never by autosave, so Claude's `rm` or `git mv` sticks. Markdown files are saved automatically shortly after you stop typing; other files are saved when you press <kbd>Ctrl</kbd>+<kbd>S</kbd> (see [Editing any file](#editing-any-file)).
 
 ## Security model
 
-md-editor itself runs **unsandboxed** on your machine and serves the editor to your browser on `127.0.0.1`. Claude, in the side-panel terminal and behind *Ask Claude*, runs **inside claude-sandbox** and is treated as untrusted: a prompt-injected or misbehaving agent fully controls the names and contents of every file under the open folder (including `.git`), and the bytes it writes to its terminal. The job of these boundaries is that nothing the agent does inside the sandbox can run code on the host or touch files outside the open folder.
+md-editor itself runs **unsandboxed** on your machine and serves the editor to your browser on `127.0.0.1`. Claude, in the side-panel terminal, runs **inside claude-sandbox** and is treated as untrusted: a prompt-injected or misbehaving agent fully controls the names and contents of every file under the open folder (including `.git`), and the bytes it writes to its terminal. The job of these boundaries is that nothing the agent does inside the sandbox can run code on the host or touch files outside the open folder.
 
 What md-editor trusts: you, the person at the browser, and the libraries it loads from their pinned CDNs. What it defends against, given an agent that controls the open folder:
 
@@ -89,6 +128,8 @@ What md-editor trusts: you, the person at the browser, and the libraries it load
 - **Agent files opened in the browser cannot script the page.** `/raw/` serves a file with a sandboxing CSP and `nosniff`, and downloads (rather than renders) anything active — HTML, SVG, XML, JavaScript, PDF — unless it is loaded as an image. Files are streamed, so opening a huge one does not read it all into memory.
 - **git runs no command the repository's configuration names.** See [Source control](#source-control).
 - **PDF export** renders its HTML outside the folder, resolves image paths so none reach outside it, blocks scripts and embedded documents in the print page, and writes the `.pdf` without following a symlink. See [Exporting to PDF](#exporting-to-pdf).
+
+- **The IDE link gives Claude nothing more.** Only Claude can use it: connecting needs the token in the lock file (which every sandbox on the machine can read, as it can the login stored beside it), and in claude-sandbox the socket in the open folder too; a browser cannot send the token at all. Over the link Claude can only show you a proposed change and get text back: md-editor never writes a file for it (Claude writes an accepted change itself), runs nothing, shows nothing outside the open folder (it reads a file there without following a symlink, so one swapped in after its check leads nowhere), and offers Claude Code's `executeCode` tool to no one. The lock folder in claude-sandbox can be written by the agent, so md-editor never follows a symlink there, and on starting removes a lock left by a crashed md-editor only when nothing answers on its socket. What a client sends is printed to md-editor's console escaped, never as terminal control codes, and the link's listener serves a few connections at a time, each given 10 seconds to show the token, so idle connections cannot pile up in md-editor.
 
 Sending keystrokes to the side-panel terminal is not a boundary: that terminal *is* the sandboxed agent, so the editor's *Send to Claude terminal* typing text there is expected.
 
@@ -108,7 +149,7 @@ The Explorer shows every file in the open folder as a tree, loading each folder 
 
 ### Tabs
 
-Each open file has a tab above the editor. A single click in the Explorer opens a *preview* tab, shown in italics, which the next single click replaces; double-click the file or the tab, start editing or ask Claude about it to keep it open. Middle-click a tab or click its × to close it (<kbd>Alt</kbd>+<kbd>W</kbd> closes the active one, and right-click a tab for more). A tab keeps its own undo history, selection and scroll position, and *Ask Claude* cards stay with the file they were made in, so you can accept a suggestion while another file is on screen. The open tabs are remembered for each folder and come back when you reload or open that folder again.
+Each open file has a tab above the editor. A single click in the Explorer opens a *preview* tab, shown in italics, which the next single click replaces; double-click the file or the tab, start editing or ask Claude about it to keep it open. Middle-click a tab or click its × to close it (<kbd>Alt</kbd>+<kbd>W</kbd> closes the active one, and right-click a tab for more). A tab keeps its own undo history, selection and scroll position. The open tabs are remembered for each folder and come back when you reload or open that folder again.
 
 ### Editing any file
 
@@ -153,7 +194,7 @@ Press <kbd>Ctrl</kbd>+<kbd>P</kbd> to go to a file by name. Type some of the let
 
 ### Send to the Claude terminal
 
-**Send to Claude terminal** in the menus of the Explorer, the tabs, the Source Control list and the search results types `@path` into the Claude Code prompt in the side panel. In an editor, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>L</kbd>, or **Send selection to Claude terminal** in its right-click menu, types `@path#L12-20` for the selected lines (`@path#L12` for one line, and just `@path` with nothing selected), so you can ask Claude about them. Nothing is sent until you press <kbd>Enter</kbd> in the terminal: the text arrives as a single paste, so Claude Code takes it as it is rather than opening its file picker, and the Terminal tab comes to the front with the focus. The path is relative to the folder the terminal runs in, or absolute for a file outside it.
+**Send to Claude terminal** in the menus of the Explorer, the tabs, the Source Control list and the search results puts `@path` in the Claude Code prompt in the side panel. In an editor, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>L</kbd>, or **Send selection to Claude terminal** in its right-click menu, puts `@path#L12-20` there for the selected lines (`@path#L12` for one line, and just `@path` with nothing selected), so you can ask Claude about them. Nothing is sent until you press <kbd>Enter</kbd> in the terminal, which comes to the front with the focus. With the IDE link up, Claude Code inserts the reference itself, as it does for VS Code; otherwise, and for a path with a space in it (which Claude Code would insert without the quotes it needs), it is typed in as a single paste, so Claude Code takes it as it is rather than opening its file picker. The path is relative to the folder the terminal runs in, or absolute for a file outside it.
 
 The editor's right-click menu also has Ask Claude, Cut, Copy, Paste and Select all; <kbd>Shift</kbd>+right-click gives the browser's own menu.
 
@@ -170,7 +211,8 @@ The editor's right-click menu also has Ask Claude, Cut, Copy, Paste and Select a
 | <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>L</kbd> | Send the selected lines (or the file) to the Claude terminal |
 | <kbd>Alt</kbd>+<kbd>F5</kbd>, <kbd>Shift</kbd>+<kbd>Alt</kbd>+<kbd>F5</kbd> | Next / previous change, in a diff or in a file with change bars |
 | <kbd>Ctrl</kbd>+<kbd>O</kbd> | Open another folder or file |
-| <kbd>Ctrl</kbd>+<kbd>J</kbd> | Ask Claude about the selection |
+| <kbd>Ctrl</kbd>+<kbd>J</kbd> | Ask Claude about the selection (in the Claude terminal) |
+| <kbd>Ctrl</kbd>+<kbd>Enter</kbd>, <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Enter</kbd> | Accept / reject the change Claude proposes, in its tab |
 | Arrows, <kbd>Enter</kbd>, <kbd>Space</kbd>, <kbd>F2</kbd>, <kbd>Delete</kbd>, <kbd>@</kbd> | Move, open, preview, rename, delete and send to the Claude terminal in the Explorer |
 
 On a Mac, use <kbd>Cmd</kbd> for <kbd>Ctrl</kbd> and <kbd>Option</kbd> for <kbd>Alt</kbd>; replace is <kbd>Cmd</kbd>+<kbd>Option</kbd>+<kbd>F</kbd>.
@@ -189,16 +231,16 @@ Click **📂** in the top bar (or *Open…* in the Explorer, or press <kbd>Ctrl<
 
 ## Exporting to PDF
 
-Click **⬇ PDF** in the top bar. The document is rendered in GitHub's light style (even in dark mode) on A4 pages, with maths and diagrams included and without Claude's highlights. It is saved as `<name>.pdf` beside the markdown file and downloaded by the browser. Images resolve because their paths are rewritten to point at the files in the open folder, each checked to stay inside it. The print page is rendered outside the folder and carries a Content-Security-Policy that allows only images and stylesheets (no scripts or embedded documents), and the `.pdf` is written without following a symlink, so neither the agent-supplied HTML nor a planted file name can read or overwrite anything outside the folder. This uses headless Google Chrome or Chromium; set `MDEDIT_CHROME=/path/to/chrome` if it isn't found on the PATH. For the browser's own print dialog, use Print in the browser's menu (<kbd>Ctrl</kbd>+<kbd>P</kbd> is [quick open](#quick-open) here); the print stylesheet prints only the rendered document.
+Click **⬇ PDF** in the top bar. The document is rendered in GitHub's light style (even in dark mode) on A4 pages, with maths and diagrams included. It is saved as `<name>.pdf` beside the markdown file and downloaded by the browser. Images resolve because their paths are rewritten to point at the files in the open folder, each checked to stay inside it. The print page is rendered outside the folder and carries a Content-Security-Policy that allows only images and stylesheets (no scripts or embedded documents), and the `.pdf` is written without following a symlink, so neither the agent-supplied HTML nor a planted file name can read or overwrite anything outside the folder. This uses headless Google Chrome or Chromium; set `MDEDIT_CHROME=/path/to/chrome` if it isn't found on the PATH. For the browser's own print dialog, use Print in the browser's menu (<kbd>Ctrl</kbd>+<kbd>P</kbd> is [quick open](#quick-open) here); the print stylesheet prints only the rendered document.
 
 ## Files
 
 All code lives in `src/md_collab_editor/`:
 
-- `server.py`: HTTP server (file API, folder browsing and root switching, change events, the file tree, create / rename / delete, quick open's file list, find in files (`git grep` or a walk), git status, base versions and discard for source control, `/api/ask` → `claude -p` (in claude-sandbox by default), `/api/pdf` → headless Chrome, `/api/term` → WebSocket onto the side-panel terminal's PTY)
+- `server.py`: HTTP server (file API, folder browsing and root switching, change events, the file tree, create / rename / delete, quick open's file list, find in files (`git grep` or a walk), git status, base versions and discard for source control, `/api/pdf` → headless Chrome, `/api/term` → WebSocket onto the side-panel terminal's PTY, and the IDE link: Claude Code's IDE protocol, for the selection, `@` references and proposed changes)
 - `static/index.html`, `static/app.css`: layout and GitHub-style theme
 - `static/render.js`: markdown → HTML, with source offsets on every block so preview selections map back to the source
-- `static/app.js`: editor, preview and scroll sync, selection mapping, ask bar, suggestion cards and word diff
+- `static/app.js`: editor, preview and scroll sync, selection mapping, the ask bar
 - `static/ui.js`: shared helpers (requests, context menus, dialogs, status bar items, the polling of open files and folders)
 - `static/activity.js`: the activity bar and the resizable side bar
 - `static/tabs.js`: editor tabs and open files (saving, autosave, changes on disk)
@@ -206,4 +248,5 @@ All code lives in `src/md_collab_editor/`:
 - `static/scm.js`: the Source Control panel, diff tabs (CodeMirror's merge addon), discard, and the change bars in the gutter
 - `static/linediff.js`, `static/scm-worker.js`: line diffs (diff_match_patch), and a worker that works out the change bars off the main thread
 - `static/search.js`: quick open, the Search panel (find in files) and Send to Claude terminal from the editor
-- `static/term.js`: the side-panel terminal (xterm.js)
+- `static/term.js`: the side-panel terminal (xterm.js), and the editor's side of the IDE link (the selection, asks, mentions)
+- `static/proposal.js`: Claude's proposed changes, as diff tabs to accept or reject

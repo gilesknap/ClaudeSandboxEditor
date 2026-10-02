@@ -1,7 +1,30 @@
 // Claude Code in the side panel: an xterm.js terminal joined by a WebSocket (/api/term)
 // to a PTY on the server, which runs the agent command (by default claude-sandbox).
-// The terminal and its socket are created the first time the Terminal tab is really on
-// screen, so a hidden panel never starts a sandbox. app.js calls the hooks at the bottom.
+// The terminal is created the first time the panel is really on screen, and its first resize
+// starts the session, so a hidden panel never starts a sandbox. Until then the page is joined
+// all the same (without a terminal, so the output is dropped), for the IDE link's messages:
+// the terminal makes a connection of its own when it is created, which replays the output.
+// app.js calls the hooks at the bottom.
+//
+// The same socket carries the editor's side of md-editor's IDE link to that session (the
+// server speaks Claude Code's IDE protocol to it). Text JSON from here: `selection` (the
+// file and selection on screen, debounced; the server passes it on when the link is up),
+// `ask` (a question about a selection: the server sends the selection over the link, then
+// types the question and Enter, or types "@path#L1-5 question" when there is no link),
+// `mention` (Send to Claude terminal: an at-mention over the link, else typed) and
+// `diff-decision`. From the server: `status` (with `ide`: off | waiting | connected, shown
+// in the panel's header, and `diffs`, the proposals still waiting), `diff` (Claude asks to
+// show a proposed edit: proposal.js opens it as a tab), `diff-close` (that proposal was
+// answered or withdrawn), `waiting` (an ask waits for a session that is still starting) and
+// `sent` (how an ask or mention went: {ok, via: 'ide' | 'typed'} or {ok: false, error}, shown
+// as a toast).
+//
+//   Term.select({path, start, end, text})   the selection on screen (ROOT-relative path;
+//                                            start/end {line, character}, 0-based)
+//   Term.ask(question, {path, start, end, text}) → Promise<bool>   zero-width (or no)
+//                                            start/end: about the whole file
+//   Term.mention(path, {from, to}?) → Promise<bool>   1-based lines; path '' is the folder
+//   Term.ide() → 'off' | 'waiting' | 'connected' | null
 
 const Term = (() => {
   const RECONNECT_MAX = 10000;
@@ -23,14 +46,18 @@ const Term = (() => {
     },
   };
 
+  const SEL_DELAY = 150;      // ms: selection messages are debounced
+  const SEL_TEXT_MAX = 65536; // characters of a selection sent (Claude Code keeps 2,000)
   let conf = null;            // {available, cmd, reason} from /api/config
-  let wrap, box, notice, restartBtn;
+  let wrap, box, notice, restartBtn, ideEl;
+  let sel = null, selSent = null, selT = null;   // the selection message, the last one sent
+  let outbox = [];            // diff decisions made while disconnected
   let term = null, fitter = null, broken = false;
   let ws = null, retries = 0, retryT = null, announced = false;
   let fresh = false;          // the next status is the first on this connection
   let expectReplay = false;   // the next binary frame is the scrollback replay
   let replaying = 0;          // replies xterm makes to queries in a replay are not sent
-  let pending = [], pendingLen = 0;   // input typed before the session can take it
+  let pending = [], pendingLen = 0;   // input before the session can take it: text, or a message (ask, mention)
   let lost = false;           // the connection to a session on screen dropped; keys go nowhere
   let shownId;                // id of the session whose output the terminal holds
   let status = { state: 'none', id: null, cwd: null };
@@ -43,7 +70,7 @@ const Term = (() => {
   const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const samePath = (a, b) => a.replace(/\/+$/, '') === b.replace(/\/+$/, '');
   const open = () => ws && ws.readyState === WebSocket.OPEN;
-  // on screen: the panel is shown and the Terminal tab is active
+  // on screen: the Claude panel is shown
   const shown = () => !!(conf && conf.available && !broken && wrap && wrap.getClientRects().length);
 
   function theme() {
@@ -64,8 +91,11 @@ const Term = (() => {
     box = document.getElementById('term');
     notice = document.getElementById('term-notice');
     restartBtn = document.getElementById('term-restart');
+    ideEl = document.getElementById('term-ide');
     restartBtn.onclick = () => restart();
     if (!conf.available) unavailable(conf.reason || 'unknown reason.');
+    // with several pages open, the one in front says what is selected
+    window.addEventListener('focus', () => sendSelection(true));
   }
 
   function unavailable(reason) {
@@ -75,7 +105,7 @@ const Term = (() => {
       <p><strong>Terminal unavailable</strong></p>
       <p>${esc(reason)}</p>
       <p>Choose the command with <code>md-editor --agent CMD</code> (or the <code>MDEDIT_AGENT</code> environment variable),
-      e.g. <code>--agent claude</code> for Claude Code without the sandbox. The Suggestions tab works either way.</p>
+      e.g. <code>--agent claude</code> for Claude Code without the sandbox. <em>Ask Claude</em> sends its questions to this terminal, so it is off too.</p>
     </div>`;
   }
 
@@ -103,6 +133,8 @@ const Term = (() => {
     });
     new ResizeObserver(scheduleFit).observe(box);
     try { fitter.fit(); } catch {}
+    // a connection made while the panel was hidden had no terminal for the replay: start afresh
+    if (ws) { const old = ws; ws = null; try { old.close(); } catch {} }
     connect();
   }
 
@@ -135,6 +167,7 @@ const Term = (() => {
     fresh = true;
     expectReplay = false;
     sent = { cols: 0, rows: 0 };
+    selSent = null;   // a new connection (perhaps a new server) is told the selection again
     s.onopen = () => { if (s !== ws) return; retries = 0; announced = false; syncSize(); };
     s.onmessage = ev => { if (s === ws) receive(ev.data); };
     s.onclose = () => {
@@ -143,7 +176,7 @@ const Term = (() => {
       // keys typed at a dead panel must not reach whatever session answers the reconnect
       // (a restarted server's, or one another tab restarted)
       if (shownId !== undefined) { lost = true; clearPending(); }
-      if (!announced) {
+      if (!announced && term) {
         announced = true;
         term.write('\r\n\x1b[2m[disconnected — reconnecting…]\x1b[22m\r\n');
       }
@@ -159,9 +192,18 @@ const Term = (() => {
     if (typeof data === 'string') {
       let m;
       try { m = JSON.parse(data); } catch { return; }
-      if (m && m.type === 'status') onStatus(m);
+      if (!m) return;
+      if (m.type === 'status') onStatus(m);
+      else if (m.type === 'diff' && m.id != null) {
+        window.Proposals?.open(m, d => decide(Object.assign({ type: 'diff-decision', id: m.id }, d)));
+      } else if (m.type === 'diff-close' && m.id != null) window.Proposals?.close(m.id);
+      else if (m.type === 'waiting') toast('Claude Code is still starting: the question goes in when it is ready.', 'ok');
+      else if (m.type === 'sent' && m.ok === false) {   // the server's answer to an ask or a mention
+        toast(m.error || `The Claude terminal could not take the ${m.what === 'ask' ? 'question' : 'text'}.`);
+      }
       return;
     }
+    if (!term) { expectReplay = false; return; }   // joined while the panel is hidden: no terminal yet
     const bytes = new Uint8Array(data);
     if (expectReplay) {   // the server sends one, possibly empty, after the first status
       expectReplay = false;
@@ -174,14 +216,27 @@ const Term = (() => {
   function onStatus(m) {
     const first = fresh;
     fresh = false;
+    const newSession = m.id !== status.id;
     // a new connection replays the scrollback (the server puts the terminal modes in force
     // where it begins first), and a new session starts clean
-    if (first || m.id !== shownId) { term.reset(); shownId = m.id; }
-    expectReplay = first && (m.state === 'running' || m.state === 'exited');
+    if (term && (first || m.id !== shownId)) { term.reset(); shownId = m.id; }
+    expectReplay = !!term && first && (m.state === 'running' || m.state === 'exited');
     status = m;
     lost = false;
     if (m.state === 'exited' || m.state === 'failed') clearPending();
     renderNotice();
+    renderIde();
+    // the proposals the server still waits on: any other shown here is an earlier server's
+    // (md-editor restarted) or was answered while this page was away
+    window.Proposals?.sync(Array.isArray(m.diffs) ? m.diffs : []);
+    // a new connection (perhaps to a new server), or a new session (whose link starts with no
+    // selection), is told what is selected
+    if (first || (newSession && m.state === 'running')) sendSelection(true);
+    if (first) {
+      const out = outbox;
+      outbox = [];
+      for (const d of out) decide(d);   // the server answers one it no longer waits on with diff-close
+    }
     flush();
   }
 
@@ -196,24 +251,33 @@ const Term = (() => {
   const REPLY = /^\x1b(\[[?>]?[\d;]*(\$y|[cnRt])|\[<[\d;]*[Mm]|\[M[\s\S]{3}|\][\s\S]*(\x07|\x1b\\)|P[\s\S]*\x1b\\)$/;
   const PENDING_MAX = 1 << 20;
 
-  // Keys typed while connecting, or while a replay is drawn, wait here rather than being lost.
+  // Keys typed while connecting, or while a replay is drawn, wait here rather than being lost;
+  // so do asks and mentions, which the server types into the session, so they stay in order.
   function flush() {
     if (!ready() || !pending.length) return;
-    const queued = pending.join('');
+    const queued = pending;
     clearPending();
-    sendBytes(enc.encode(queued));
+    let text = '';
+    for (const p of queued) {
+      if (typeof p === 'string') { text += p; continue; }
+      if (text) { sendBytes(enc.encode(text)); text = ''; }
+      send(JSON.stringify(p));
+    }
+    if (text) sendBytes(enc.encode(text));
   }
 
   function clearPending() { pending = []; pendingLen = 0; }
 
-  // Input for the session (typed keys, or Send to Claude terminal's text): sent now if it can
-  // take it, else queued behind any earlier input. False if it goes nowhere: the connection to
-  // the session on screen dropped, or the queue is full.
+  // Input for the session (typed keys or text as a string; an ask or mention as a message for
+  // the server): sent now if it can take it, else queued behind any earlier input. False if it
+  // goes nowhere: the connection to the session on screen dropped, or the queue is full.
   function input(s) {
     if (lost) return false;
-    if (ready()) { flush(); sendBytes(enc.encode(s)); return true; }
-    if (pendingLen + s.length > PENDING_MAX) return false;
-    pending.push(s); pendingLen += s.length;
+    const msg = typeof s === 'string' ? null : JSON.stringify(s);
+    if (ready()) { flush(); if (msg) send(msg); else sendBytes(enc.encode(s)); return true; }
+    const n = msg ? msg.length : s.length;
+    if (pendingLen + n > PENDING_MAX) return false;
+    pending.push(s); pendingLen += n;
     return true;
   }
 
@@ -259,6 +323,94 @@ const Term = (() => {
     syncSize();
     send(JSON.stringify({ type: 'restart' }));
     term.focus();
+  }
+
+  // ---------------------------------------------------------------- the editor's side of the IDE link
+
+  const running = () => open() && !fresh && status.state === 'running';
+  const toast = (msg, kind = 'err') => window.UI?.toast(msg, { kind });
+
+  // The selection on screen; the server keeps the last one and passes it on over the link.
+  function select(s) {
+    clearTimeout(selT);
+    if (!s || typeof s.path !== 'string' || !s.start || !s.end) return;
+    const text = String(s.text || '');
+    sel = { type: 'selection', path: s.path, start: s.start, end: s.end, text: text.length > SEL_TEXT_MAX ? text.slice(0, SEL_TEXT_MAX) : text };
+    selT = setTimeout(sendSelection, SEL_DELAY);
+  }
+
+  function sendSelection(force = false) {
+    clearTimeout(selT);
+    if (!sel || !open()) return;
+    const j = JSON.stringify(sel);
+    if (j === selSent && force !== true) return;
+    selSent = j;
+    send(j);
+  }
+
+  // a diff decision is never lost to a dropped connection: it goes when the socket is back
+  function decide(d) {
+    if (open() && !fresh) send(JSON.stringify(d));
+    else outbox.push(d);
+  }
+
+  // Show the panel and wait (up to 5 s) for a session that is still connecting.
+  async function reach() {
+    if (!conf || !conf.available || broken) { toast('The Claude terminal is not available.'); return false; }
+    window.App?.showTerminal?.();
+    if (!term) { toast('The Claude terminal is not available.'); return false; }
+    for (let i = 0; i < 50 && !running() && !ended(); i++) await new Promise(r => setTimeout(r, 100));
+    if (!running()) {
+      toast(ended() ? 'The Claude session has ended: restart it in the terminal first.' : 'The Claude terminal is not running yet; try again when it has started.');
+      return false;
+    }
+    return true;
+  }
+
+  async function ask(question, s) {
+    question = String(question || '').trim();
+    if (!question || !(await reach())) return false;
+    const msg = { type: 'ask', text: question };
+    if (s && typeof s.path === 'string') {
+      select(s);
+      sendSelection(true);   // the selection the server sends with the question
+      msg.path = s.path;
+      const a = s.start, b = s.end;
+      if (a && b && (a.line !== b.line || a.character !== b.character)) Object.assign(msg, { start: a, end: b });
+    }
+    if (!input(msg)) { toast('The Claude terminal could not take the question.'); return false; }
+    term?.focus();
+    return true;
+  }
+
+  // an @-mention of a file or folder (and lines) in Claude Code's prompt, without Enter
+  async function mention(path, range) {
+    if (!(await reach())) return false;
+    const msg = { type: 'mention', path: path || '' };
+    if (range && range.from) {   // whole lines: the end is the start of the line after the last
+      msg.start = { line: range.from - 1, character: 0 };
+      msg.end = { line: Math.max(range.to || range.from, range.from), character: 0 };
+    }
+    if (!input(msg)) { toast('The Claude terminal could not take the text.'); return false; }
+    term?.focus();
+    return true;
+  }
+
+  const IDE = {
+    connected: ['IDE linked', 'Claude Code is connected to md-editor: it sees the file and the lines you select, Ask Claude sends your selection with the question, and an edit it asks permission for opens here as a diff to accept or reject.'],
+    waiting: ['IDE link…', 'Waiting for Claude Code to connect to md-editor (it looks when it starts; /ide in Claude Code connects by hand). Until then, files and lines are typed into the terminal as @path#L1-5.'],
+    off: ['No IDE link', 'Claude Code is not connected to md-editor: files and lines are typed into the terminal as @path#L1-5.'],
+  };
+
+  function renderIde() {
+    if (!ideEl) return;
+    const st = status.state === 'running' && IDE[status.ide] ? status.ide : null;
+    ideEl.hidden = !st;
+    if (!st) return;
+    ideEl.dataset.state = st;
+    ideEl.textContent = IDE[st][0];
+    const why = status.ide_reason ? ` (${status.ide_reason})` : '';
+    ideEl.title = IDE[st][1] + (st === 'off' ? why : '');
   }
 
   // ---------------------------------------------------------------- notices
@@ -308,26 +460,33 @@ const Term = (() => {
       root = r || '';
       if (term) renderNotice();
     },
-    // the panel or tab may have been shown: start the terminal on first sight, else refit
+    // the panel may have been shown: start the terminal on first sight, else refit. While it is
+    // hidden the page is joined all the same (no terminal, no session started), so a proposed
+    // edit waiting for an answer still opens, and Claude is told the selection.
     visible() {
-      if (!shown()) return false;
+      if (!shown()) {
+        if (!term && !ws && conf && conf.available) connect();
+        return false;
+      }
       if (!term) create(); else syncSize();
       return shown();
     },
     fit: syncSize,
     focus() { if (term && shown()) term.focus(); },
-    // for Send to Claude terminal (ui.js): has this connection's status reported a running
-    // session (so its folder is known), its folder, and typing into it (bracketed: as one
-    // paste, so Claude Code takes it literally). The text goes through the same queue as
-    // typed keys, so text sent while the replay is drawn, or while reconnecting, is not lost.
+    // has this connection's status reported a running session (so its folder is known), its
+    // folder, and typing into it (bracketed: as one paste, so Claude Code takes it literally).
+    // Text, asks and mentions go through the same queue as typed keys, so what is sent while
+    // the replay is drawn, or while reconnecting, is not lost and stays in order.
     available: () => !!(conf && conf.available && !broken),
-    running: () => open() && !fresh && status.state === 'running',
+    running,
     state: () => status.state,   // none | running | exited | failed
     cwd: () => status.cwd || null,
+    ide: () => (status.state === 'running' && status.ide) || null,
     sendText(text, { bracketed = false } = {}) {
       if (!term || ended()) return false;
       return input(bracketed ? `\x1b[200~${text}\x1b[201~` : text);
     },
+    select, ask, mention,
   };
 })();
 window.Term = Term;

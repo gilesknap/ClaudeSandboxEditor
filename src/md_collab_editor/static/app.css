@@ -7,12 +7,9 @@
   --border: #d1d9e0;
   --accent: #0969da;
   --claude: #8250df;
-  --claude-bg: rgba(130, 80, 223, 0.14);
   --ready-bg: rgba(212, 167, 44, 0.22);
   --ok: #1a7f37;
   --err: #cf222e;
-  --ins-bg: #dafbe1; --ins-fg: #116329;
-  --del-bg: #ffebe9; --del-fg: #82071e;
   --shadow: 0 8px 24px rgba(140, 149, 159, 0.25);
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif;
@@ -26,12 +23,9 @@
   --border: #3d444d;
   --accent: #4493f8;
   --claude: #ab7df8;
-  --claude-bg: rgba(171, 125, 248, 0.2);
   --ready-bg: rgba(187, 128, 9, 0.3);
   --ok: #3fb950;
   --err: #f85149;
-  --ins-bg: rgba(46, 160, 67, 0.25); --ins-fg: #7ee787;
-  --del-bg: rgba(248, 81, 73, 0.2); --del-fg: #ffa198;
   --shadow: 0 8px 24px rgba(1, 4, 9, 0.8);
 }
 
@@ -147,13 +141,8 @@ body.no-sidebar #sidebar, body.no-claude #claude { display: none; }
 .CodeMirror-dialog { background: var(--bg-subtle); color: var(--fg); border-color: var(--border) !important; }
 .CodeMirror-dialog input { background: var(--bg); color: var(--fg); }
 
-/* ---------- Claude marks in the editor */
-.claude-mark.pending { background: var(--claude-bg); border-bottom: 2px dashed var(--claude); }
-.claude-mark.ready { background: var(--ready-bg); border-bottom: 2px solid #d4a72c; }
-.claude-mark.error { border-bottom: 2px wavy var(--err); }
-.claude-mark.focus { outline: 2px solid var(--claude); }
+/* ---------- changes from disk in the editor */
 .remote-flash { background: rgba(9, 105, 218, 0.2); transition: background 1s; }
-.accepted-flash { background: var(--ins-bg); }
 
 /* ---------- preview (GitHub look) */
 .markdown-body { background: transparent; }
@@ -162,8 +151,6 @@ body.no-sidebar #sidebar, body.no-claude #claude { display: none; }
   font-size: 16px;
 }
 #preview > [data-s] { border-radius: 4px; }
-#preview .claude-hl { box-shadow: -8px 0 0 var(--claude-bg), 8px 0 0 var(--claude-bg); background: var(--claude-bg); }
-#preview .claude-hl-ready { box-shadow: -8px 0 0 var(--ready-bg), 8px 0 0 var(--ready-bg); background: var(--ready-bg); }
 .markdown-body .math-block { overflow-x: auto; margin-bottom: 16px; }
 .markdown-body .mermaid-box { text-align: center; margin-bottom: 16px; }
 .markdown-body .mermaid-error { color: var(--err); }
@@ -188,61 +175,15 @@ body.no-sidebar #sidebar, body.no-claude #claude { display: none; }
 #ask-presets { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
 #ask-presets button { font-size: 12px; padding: 1px 8px; border-radius: 12px; }
 #ask-presets button.skill { border-color: var(--claude); color: var(--claude); font-weight: 600; }
-#ask-presets button.comment { border-style: dashed; }
 #ask-form { display: flex; gap: 6px; }
 #ask-input {
   flex: 1; min-width: 0; padding: 5px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg-subtle);
 }
 #ask-input:focus { outline: 2px solid var(--claude); border-color: transparent; }
 #ask-form button { background: var(--claude); color: #fff; border: 0; }
-
-/* ---------- cards */
-#cards { overflow: auto; flex: 1; padding: 8px; display: flex; flex-direction: column; gap: 8px; }
 .hint { padding: 8px; font-size: 13px; }
-.card {
-  background: var(--bg); border: 1px solid var(--border); border-left: 3px solid var(--claude);
-  border-radius: 8px; padding: 8px;
-}
-.card.ready { border-left-color: #d4a72c; }
-.card.error { border-left-color: var(--err); }
-.card.accepted, .card.kept, .card.dismissed, .card.cancelled { opacity: 0.55; border-left-color: var(--border); }
-.card-head { display: flex; align-items: center; gap: 6px; }
-.badge { font-size: 11px; font-weight: 600; border: 1px solid var(--border); border-radius: 10px; padding: 0 7px; white-space: nowrap; }
-.card.pending .badge { color: var(--claude); border-color: var(--claude); }
-.card.accepted .badge { color: var(--ok); border-color: var(--ok); }
-.card-label { font-weight: 600; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card-meta { font-size: 11px; white-space: nowrap; }
-.card-excerpt { font-size: 12px; margin: 4px 0; cursor: pointer; font-style: italic; }
-.card-excerpt:hover { color: var(--fg); }
-.card-history { font-size: 12px; margin-bottom: 4px; }
-.card-body .seg { margin: 4px 0; }
-.card-view {
-  max-height: 45vh; overflow: auto; border: 1px solid var(--border); border-radius: 6px;
-  padding: 8px; background: var(--bg-subtle); font-size: 13px;
-}
-.card-view.markdown-body { font-size: 13px; }
-.card-view textarea {
-  width: 100%; border: 0; background: transparent; font: 12px/1.5 var(--mono); resize: vertical; outline: none;
-}
-.diff { white-space: pre-wrap; font: 12.5px/1.55 var(--mono); word-break: break-word; }
-.diff ins { background: var(--ins-bg); color: var(--ins-fg); text-decoration: none; border-radius: 2px; }
-.diff del { background: var(--del-bg); color: var(--del-fg); border-radius: 2px; }
-.warn { font-size: 12px; margin-top: 6px; padding: 4px 6px; border-radius: 6px; background: var(--ready-bg); }
-.card-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-.card-actions:empty { display: none; }
-.card-actions button { font-size: 12px; }
-.refine input {
-  width: 100%; margin-top: 6px; padding: 3px 8px; font-size: 12px;
-  border: 1px solid var(--border); border-radius: 6px; background: var(--bg-subtle);
-}
-.spinner {
-  display: inline-block; width: 12px; height: 12px; vertical-align: -2px;
-  border: 2px solid var(--claude-bg); border-top-color: var(--claude); border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
 
-/* ---------- Claude panel: tabs, resize handle and terminal */
+/* ---------- Claude panel: header, resize handle and terminal */
 #panel-resize {
   position: absolute; top: 0; bottom: 0; left: -3px; width: 5px; z-index: 6;
   cursor: col-resize; touch-action: none;
@@ -250,22 +191,19 @@ body.no-sidebar #sidebar, body.no-claude #claude { display: none; }
 #panel-resize:hover, body.panel-resizing #panel-resize { background: var(--accent); opacity: 0.5; }
 body.panel-resizing { user-select: none; }
 body.panel-resizing, body.panel-resizing * { cursor: col-resize !important; }
-#panel-head { padding: 0 8px 0 2px; align-items: stretch; gap: 8px; }
-#panel-tabs { display: flex; min-width: 0; }
-.tab {
-  background: none; border: 0; border-bottom: 2px solid transparent; border-radius: 0; margin-bottom: -1px;
-  padding: 9px 8px 7px; font-weight: 600; color: var(--fg-muted); white-space: nowrap;
+#panel-head { padding: 0 8px 0 10px; gap: 8px; min-height: 37px; }
+#panel-title { white-space: nowrap; }
+/* the IDE link's state (term.js): a dot and a word */
+.ide-state {
+  display: inline-flex; align-items: center; gap: 5px; min-width: 0; overflow: hidden;
+  font-size: 11px; font-weight: normal; color: var(--fg-muted); white-space: nowrap; cursor: default;
 }
-.tab:hover { color: var(--fg); border-color: transparent; }
-.tab.on, .tab.on:hover { color: var(--fg); border-bottom-color: var(--claude); }
-.tab .count {
-  display: inline-block; min-width: 16px; margin-left: 5px; padding: 0 5px; border-radius: 8px;
-  background: var(--claude); color: #fff; font-size: 11px; line-height: 16px; text-align: center;
-}
-.tab .count[hidden] { display: none; }
+.ide-state[hidden] { display: none; }
+.ide-state::before { content: ""; flex: none; width: 7px; height: 7px; border-radius: 50%; background: var(--fg-muted); }
+.ide-state[data-state="connected"]::before { background: var(--ok); }
+.ide-state[data-state="waiting"]::before { background: transparent; box-shadow: inset 0 0 0 1.5px var(--fg-muted); }
+.ide-state[data-state="off"]::before { opacity: 0.5; }
 .tab-actions { display: flex; align-items: center; gap: 6px; }
-#claude[data-tab="terminal"] #cards, #claude[data-tab="terminal"] #clear-cards,
-#claude[data-tab="suggestions"] #term-wrap, #claude[data-tab="suggestions"] #term-restart { display: none; }
 #term-restart[hidden] { display: none; }
 #term-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
 #term-notice {
@@ -344,7 +282,6 @@ body.panel-resizing, body.panel-resizing * { cursor: col-resize !important; }
   #main.split #preview-pane { display: none; }
   #main.split #editor-pane { border-right: 0; }
   #preview { padding: 16px 16px 50vh; }
-  #model { display: none; }
 }
 
 /* ---------- quick open and find in files (search.js) */
@@ -437,7 +374,6 @@ body.panel-resizing, body.panel-resizing * { cursor: col-resize !important; }
   #askbar, #ask-pill, #browser, .ctx-menu, .modal-back, .qo-back, #toast { display: none !important; }
   #main, #workbench, #editor-area, #main.edit #preview-pane, #preview-pane { display: block !important; overflow: visible; }
   #preview { padding: 0; max-width: none; font-size: 11pt; }
-  #preview .claude-hl, #preview .claude-hl-ready { background: none; box-shadow: none; }
   .markdown-body .anchor { display: none; }
   .markdown-body pre, .markdown-body table, .markdown-body img, .markdown-body .markdown-alert { break-inside: avoid; }
   .markdown-body h1, .markdown-body h2, .markdown-body h3 { break-after: avoid; }
@@ -653,7 +589,6 @@ button.primary.danger { background: var(--err); }
   .activity-btn { width: 36px; }
   .etab { max-width: 160px; }
 }
-.card-file { flex: none; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
 
 /* ---------- source control, diff tabs and change bars (scm.js) */
 :root {
@@ -771,3 +706,10 @@ button.primary.danger { background: var(--err); }
   #stat-branch .stat-repo { display: none; }
   .diff-base { display: none; }
 }
+
+/* ---------- Claude's proposed changes (proposal.js): a diff tab with Accept and Reject */
+.proposal-tab .diff-head { border-top: 2px solid var(--claude); }
+.proposal-tab .diff-title { color: var(--claude); }
+.proposal-tab .diff-tools button.primary, .proposal-tab .diff-tools .proposal-reject { font-size: 12px; padding: 1px 10px; margin-left: 4px; }
+.proposal-tab .diff-tools button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
+.proposal-note { flex: none; padding: 3px 12px; font-size: 12px; border-bottom: 1px solid var(--border); background: var(--bg-subtle); }

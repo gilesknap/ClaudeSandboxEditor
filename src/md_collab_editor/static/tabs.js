@@ -6,7 +6,7 @@
 // ({name, mode, mime} or null)}; treat it as read-only outside tabs.js. Every tab or
 // other user of a file shares its model, so dirty state, saving and on-disk changes are
 // handled once per file. The main editor shows the active file tab's doc via cm.swapDoc, so
-// undo history, selection, scroll and marks (Ask Claude cards) stay with each file. A second
+// undo history, selection, scroll and marks stay with each file. A second
 // editor on the same file (the diff view) must use Tabs.linkedDoc(model), never model.doc.
 //
 // Tab kinds: 'file' (text in the main editor), 'image' (viewer on /raw/), 'binary' (binary
@@ -20,14 +20,16 @@
 //                                      → Promise<tab|null>. Opens or activates a file tab;
 //                                      line/ch are 0-based; sel takes CodeMirror positions.
 //   Tabs.openCustom({id, title, tooltip, path, kind, state, preview = true, focus = true,
-//                    model, render(el, tab), onShow(tab), onHide(tab), dispose(tab),
-//                    save(tab), onRename(tab, newPath)}) → tab
+//                    activate = true, model, render(el, tab), onShow(tab), onHide(tab),
+//                    dispose(tab), save(tab), onRename(tab, newPath), waiting(tab)}) → tab
 //       A tab with the same id is activated instead (and the passed model reference released).
 //       render runs once, the first time the tab is shown, with an element filling the editor
 //       area. model: a reference from Tabs.acquire(path) the tab takes over (released when the
 //       tab closes); the tab then shows that file's ● and Ctrl+S / close prompts use it.
 //       kind + state: with Tabs.registerType(kind, restore) the tab is remembered across
 //       reloads; restore(state) → spec (or a Promise of one, or null to drop it).
+//       waiting(tab) → true: the tab waits for the user's answer (Claude's proposed change),
+//       so Close saved leaves it, and closeAll (opening another folder) keeps it.
 //   Tabs.update(tab, {title, tooltip}) relabel a tab
 //   Tabs.close(tab, {force}) → Promise<bool>   prompts Save / Don't save / Cancel when needed
 //   Tabs.pin(tab)                      make a preview tab permanent
@@ -52,10 +54,16 @@
 //   Tabs.reload(model) → Promise<bool> load the file from disk again, dropping unsaved changes
 //                                      (scm.js, after a discard)
 //   Tabs.confirmLeave(message) → Promise<bool>  Save all / Don't save / Cancel for every dirty file
-//   Tabs.closeAll()                    close everything without asking (after confirmLeave)
+//   Tabs.closeAll()                    close everything without asking (after confirmLeave),
+//                                      except the tabs that are `waiting`
 //   Tabs.restore() → Promise           reopen the tabs remembered for the current root
 //   Tabs.setStatus(text, cls)          message in the top bar's save-state slot
 //   Tabs.autosave(category) → bool     the autosave setting for 'md' / 'other'
+//   Tabs.hold(path, {msg, actions}) → release()   while Claude's proposed change to a file
+//                                      waits for an answer (proposal.js): its tab is read-only
+//                                      under a banner (msg, [[label, fn]…]) and it is not
+//                                      saved, so nothing races Claude's own write. Also for a
+//                                      file opened later; holds stack. Tabs.held(model) → bool
 //   Tabs.on(event, fn) → off()         events:
 //       'activate' (tab, prevTab)   'deactivate' (tab)   'open' (tab)   'close' (tab)
 //       'change' (model, change)    any edit of a model's doc (also from linked docs)
@@ -63,6 +71,7 @@
 //       'saved' (model)             written to disk by us
 //       'disk-change' (model, {deleted}) reloaded / found changed or deleted on disk
 //       'dispose' (model)           closed: nothing uses it any more
+//       'hold' (path)               a hold on the file began or ended (Tabs.held says which)
 //       'rename' (from, to)         after renamePath
 
 const Tabs = (() => {
@@ -85,6 +94,7 @@ const Tabs = (() => {
   const models = new Map();        // path → model
   const loading = new Map();       // path → Promise<{model}|{info}|{error}>
   const types = new Map();         // custom tab kind → restore(state)
+  const holds = new Map();         // path → [{root, banner}] (Tabs.hold), latest last
   const handlers = new Map();
   let seq = 0;
   let restoring = false;
@@ -271,6 +281,10 @@ const Tabs = (() => {
     }
     if (!m || models.get(m.path) !== m) return false;
     clearTimeout(m.saveT);
+    if (heldBy(m)) {   // Claude's proposed change is waiting: its write must not be raced
+      if (!auto && m.dirty) setState(m, 'Not saved: answer Claude\'s proposed change first', 'err');
+      return false;
+    }
     if (m.saving) {   // one write at a time: wait for the one under way, then go again
       await m.saving;
       return save(m, force, auto);
@@ -449,12 +463,67 @@ const Tabs = (() => {
     if (activeModel() === m) renderBanner();
   }
 
+  // ---------------------------------------------------------------- holds (Claude's proposals)
+
+  function heldBy(m) {
+    const list = m && holds.get(m.path);
+    const h = list && list.filter(x => x.root === UI.root());
+    return h && h.length ? h[h.length - 1] : null;
+  }
+
+  // the main editor is read-only while the file on screen is held
+  function syncReadOnly() {
+    if (!cm) return;
+    const ro = !!(active && active.type === 'file' && heldBy(active.model));
+    if (cm.getOption('readOnly') !== ro) cm.setOption('readOnly', ro);
+  }
+
+  // A doc linked to the model's, for a second editor on the file (a diff view). Its edits are
+  // the model's, so while the file is held they are refused, as in the main editor.
+  let heldToastAt = 0;
+  function linkedDoc(m) {
+    const d = m.doc.linkedDoc({ sharedHist: true, mode: m.doc.modeOption });
+    d.on('beforeChange', (doc, change) => {
+      if (!heldBy(m)) return;
+      change.cancel();
+      if (Date.now() - heldToastAt > 2000) {
+        heldToastAt = Date.now();
+        UI.toast(`${UI.basename(m.path)} is read-only until you accept or reject Claude's proposed change.`, { kind: 'err' });
+      }
+    });
+    return d;
+  }
+
+  function hold(path, banner) {
+    const rec = { root: UI.root(), banner };
+    if (!holds.has(path)) holds.set(path, []);
+    holds.get(path).push(rec);
+    const changed = () => {
+      const m = models.get(path);
+      if (!m) return;
+      if (heldBy(m)) clearTimeout(m.saveT);
+      else if (m.dirty && autosave(m.category) && !m.deleted) scheduleSave(m);   // what waited
+      if (activeModel() === m) { renderBanner(); syncReadOnly(); }
+      emit('hold', path);
+    };
+    changed();
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      const list = (holds.get(path) || []).filter(x => x !== rec);
+      if (list.length) holds.set(path, list); else holds.delete(path);
+      changed();
+    };
+  }
+
   function renderBanner() {
     const el = $('#banner');
     const m = activeModel();
-    if (!m || !m.banner) { el.hidden = true; return; }
-    el.replaceChildren(Object.assign(document.createElement('span'), { textContent: m.banner.msg }));
-    for (const [label, fn] of m.banner.actions) {
+    const banner = m && (m.banner || (heldBy(m) || {}).banner);
+    if (!banner) { el.hidden = true; return; }
+    el.replaceChildren(Object.assign(document.createElement('span'), { textContent: banner.msg }));
+    for (const [label, fn] of banner.actions || []) {
       const b = Object.assign(document.createElement('button'), { type: 'button', textContent: label });
       b.onclick = fn;
       el.append(b);
@@ -511,6 +580,8 @@ const Tabs = (() => {
     if (t.model) return t.model.dirty;
     return !!(t.type === 'custom' && t.spec.isDirty && t.spec.isDirty(t));
   }
+  // it waits for the user's answer (spec.waiting): neither Close saved nor closeAll closes it
+  const waits = t => t.type === 'custom' && !!t.spec.waiting?.(t);
   // closing it would drop unsaved changes: it is the last holder of a dirty file
   const losesWork = t => (t.model ? t.model.dirty && t.model.refs <= 1 : tabDirty(t));
 
@@ -573,7 +644,7 @@ const Tabs = (() => {
       { label: 'Close', kbd: 'Alt+W', action: () => close(t) },
       { label: 'Close others', disabled: !others.length, action: () => closeMany(others) },
       { label: 'Close to the right', disabled: tabs.indexOf(t) === tabs.length - 1, action: () => closeMany(tabs.slice(tabs.indexOf(t) + 1)) },
-      { label: 'Close saved', action: () => closeMany(tabs.filter(x => !tabDirty(x))) },
+      { label: 'Close saved', action: () => closeMany(tabs.filter(x => !tabDirty(x) && !waits(x))) },
       { label: 'Close all', action: () => closeMany(tabs.slice()) },
       '-',
       { label: 'Keep open', disabled: !t.preview, action: () => pin(t) },
@@ -708,6 +779,7 @@ const Tabs = (() => {
       const swapped = cm.getDoc() !== m.doc;
       if (swapped) cm.swapDoc(m.doc);
       applyEditorOptions(m);
+      syncReadOnly();
       ensureMode(m);
       if (wasHidden && !swapped) cm.refresh();   // back from a viewer: remeasure, restore the scroll
       UI.store.set('mdedit.last', tab.path);
@@ -854,13 +926,18 @@ const Tabs = (() => {
     return tab;
   }
 
+  // a tab that persist() remembers
+  const remembered = t => t.type !== 'custom' || !!(t.spec.kind && types.has(t.spec.kind) && t.spec.state !== undefined);
+
   function update(tab, { title, tooltip, path } = {}) {
     if (title !== undefined) tab.title = title;
     if (tooltip !== undefined) tab.spec.tooltip = tooltip;
     if (path !== undefined) tab.path = path;
     renderStrip();
     if (tab === active) renderHead();
-    persist();
+    // only for a tab that is remembered: a proposal's moves on the root event, before the new
+    // folder's remembered tabs are read back, which this would overwrite
+    if (remembered(tab)) persist();
   }
 
   // ---------------------------------------------------------------- renames and deletions
@@ -960,9 +1037,15 @@ const Tabs = (() => {
 
   function closeAll() {
     restoring = true;   // keep the remembered tabs of the root being left
-    try { for (const t of tabs.slice()) remove(t, { replaced: true }); }
+    try { for (const t of tabs.slice()) if (!waits(t)) remove(t, { replaced: true }); }
     finally { restoring = false; }
-    mru = [];
+    if (active) {   // one that is kept steps back
+      const t = active;
+      emit('deactivate', t);
+      try { t.spec.onHide?.(t); } catch (e) { console.error(e); }
+      if (t.view) t.view.hidden = true;
+    }
+    mru = mru.filter(t => tabs.includes(t));
     showEmpty();
     renderStrip();
   }
@@ -1022,7 +1105,7 @@ const Tabs = (() => {
   document.addEventListener('keydown', e => {
     if (e.defaultPrevented || !(e.target instanceof Element)) return;
     if (e.target.closest('#term, .modal-back, .qo-back')) return;
-    // text boxes (the folder browser's path, the ask bar, a card's editor) keep the key
+    // text boxes (the folder browser's path, the ask bar) keep the key
     if (e.target.matches('input, select, textarea:not(.CodeMirror textarea), [contenteditable="true"]')) return;
     if (e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey && e.code === 'KeyW' && active) {
       e.preventDefault();
@@ -1047,9 +1130,9 @@ const Tabs = (() => {
     active: () => active, activeModel, list: () => tabs.slice(),
     model: p => models.get(p), models: () => [...models.values()],
     acquire, release,
-    linkedDoc: m => m.doc.linkedDoc({ sharedHist: true, mode: m.doc.modeOption }),
+    linkedDoc,
     loadMode, save, saveAll, anyDirty, renamePath, renameBlocked, pathDeleted, reload, cancelAutosave,
-    confirmLeave, closeAll, restore, registerType, setStatus, autosave,
+    confirmLeave, closeAll, restore, registerType, setStatus, autosave, hold, held: m => !!heldBy(m),
     on, cm: () => cm, categoryOf,
   };
 })();

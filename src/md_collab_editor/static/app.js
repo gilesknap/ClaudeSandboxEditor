@@ -20,10 +20,9 @@ const cur = {
 MD.setDocPath(() => cur.path || '');
 let blocks = [];          // [{el, s, e}] from the last render
 let blockLines = [];      // [{el, line}] for scroll sync
-let cards = [];           // Ask Claude cards, each bound to its file's model (c.model)
-let cardSeq = 0;
 let skills = [];
-let askConf = { available: false, reason: '' };   // /api/config's "ask": can Ask Claude run?
+// Ask Claude sends its questions to the Claude terminal, so it runs when that does
+let askConf = { available: false, reason: '' };
 
 // ------------------------------------------------------------------ editor
 
@@ -58,6 +57,7 @@ function sendSelectionToTerminal() {
 
 function cmd(name) {
   if (!cur.md && !['undo', 'redo', 'ask'].includes(name)) return;   // markdown formatting
+  if (cm.isReadOnly() && name !== 'ask') return;   // a file Claude has proposed a change to
   const doc = cm.getDoc();
   const sel = doc.getSelection();
   const wrap = (a, b, ph) => {
@@ -182,7 +182,7 @@ cm.getWrapperElement().addEventListener('contextmenu', e => {
   SPELL.suggest(w.text).then(list => {
     if (spellMenu.hidden || !sugg.isConnected) return;
     sugg.replaceChildren(...(list.length ? list.map(s => item(s, () => {
-      if (cm.getRange(from, to) === w.text) cm.replaceRange(s, from, to, '+spell');
+      if (!cm.isReadOnly() && cm.getRange(from, to) === w.text) cm.replaceRange(s, from, to, '+spell');
     }, 'sugg')) : [Object.assign(document.createElement('span'), { className: 'muted', textContent: 'No suggestions' })]));
   });
 });
@@ -215,21 +215,7 @@ function renderPreview() {
   blocks = MD.render(cm.getValue(), $('#preview'));
   blockLines = blocks.filter(b => b.s >= 0).map(b => ({ el: b.el, line: cm.posFromIndex(b.s).line }));
   pane.scrollTop = top;
-  highlightPreviewCards();
   updateStats();
-}
-
-function highlightPreviewCards() {
-  for (const b of blocks) b.el.classList.remove('claude-hl', 'claude-hl-ready');
-  for (const c of cards) {
-    if (c.model !== cur.model) continue;
-    const r = c.marker?.find();
-    if (!r || !['pending', 'ready'].includes(c.status)) continue;
-    const s = cm.indexFromPos(r.from), e = cm.indexFromPos(r.to);
-    for (const b of blocks) {
-      if (b.s >= 0 && b.s < e && b.e > s) b.el.classList.add(c.status === 'pending' ? 'claude-hl' : 'claude-hl-ready');
-    }
-  }
 }
 
 function updateStats() {
@@ -245,12 +231,31 @@ function updateStats() {
 cm.on('cursorActivity', () => {
   const c = cm.getCursor();
   $('#stat-cursor').textContent = `Ln ${c.line + 1}, Col ${c.ch + 1}`;
+  trackSelection();
 });
+
+// What is on screen, for Claude (Term.select; over the IDE link Claude Code shows "⧉ 3 lines
+// selected" and attaches the lines to the next prompt): the file tab's selection (a preview
+// selection is set as the editor's), or just the file. scm.js reports its diff editors.
+const lspPos = p => ({ line: p.line, character: p.ch });
+function editorSelection(model = cur.model) {
+  if (!model) return null;
+  const doc = model.doc;
+  const from = doc.getCursor('from'), to = doc.getCursor('to');
+  return { path: model.path, start: lspPos(from), end: lspPos(to), text: doc.getRange(from, to) };
+}
+function trackSelection() {
+  const t = Tabs.active();
+  if (!t) return;
+  if (t.type === 'file') Term.select(editorSelection(t.model));
+  else if (t.type !== 'custom' && t.path) Term.select({ path: t.path, start: { line: 0, character: 0 }, end: { line: 0, character: 0 }, text: '' });
+}
 
 // task-list checkboxes toggle the source
 $('#preview').addEventListener('change', e => {
   const b = e.target;
   if (b.type !== 'checkbox' || b.dataset.off === undefined) return;
+  if (cm.isReadOnly()) { b.checked = !b.checked; return; }   // a file Claude has proposed a change to
   const p = cm.posFromIndex(+b.dataset.off);
   cm.replaceRange(b.checked ? 'x' : ' ', p, { line: p.line, ch: p.ch + 1 }, '+task');
 });
@@ -351,6 +356,7 @@ Tabs.on('activate', t => {
   renderPreview();
   if (md) $('#preview-pane').scrollTop = cur.model.previewTop || 0;
   if (cur.model) { const c = cm.getCursor(); $('#stat-cursor').textContent = `Ln ${c.line + 1}, Col ${c.ch + 1}`; }
+  trackSelection();
 });
 
 // ------------------------------------------------------------------ selection → source range
@@ -426,7 +432,6 @@ cm.getWrapperElement().addEventListener('mouseup', () => setTimeout(() => {
   if (!cm.somethingSelected() || !askConf.available) { pill.hidden = true; return; }
   const c = cm.cursorCoords(cm.getCursor('to'), 'window');
   placeFloating(pill, c.left, c.bottom + 6);
-  if (pill.hidden) prepareAsk();
   pill.hidden = false;
 }, 0));
 cm.on('keydown', () => { pill.hidden = true; });
@@ -440,6 +445,8 @@ function placeFloating(el, x, y) {
 }
 
 // ------------------------------------------------------------------ ask bar
+// A question goes to the Claude session in the side panel (Term.ask), about the selection or,
+// with nothing selected, the whole file; Claude answers there and makes any edit itself.
 
 const PRESETS = [
   { label: 'Improve', instr: 'Rewrite this so it reads better: clearer and more fluent, with the same meaning and roughly the same length.' },
@@ -451,10 +458,10 @@ const PRESETS = [
   { label: 'More casual', instr: 'Rewrite this in a friendlier, more conversational tone.' },
   { label: 'To bullets', instr: 'Restructure this as a markdown bulleted list.' },
   { label: 'To prose', instr: 'Rewrite this as flowing prose paragraphs.' },
-  { label: 'Critique', mode: 'comment', instr: 'Critique this passage: clarity, structure, argument and style. Be specific and brief.' },
+  { label: 'Critique', instr: 'Critique this passage: clarity, structure, argument and style. Be specific and brief, and change nothing.' },
 ];
 
-let askTarget = null;   // {from, to} captured when the bar opened
+let askTarget = null;   // {from, to, whole, model} captured when the bar opened
 
 function currentRange(source) {
   if (source === 'preview' && previewRange) return previewRange;
@@ -477,43 +484,28 @@ function buildPresets() {
   for (const p of all) {
     const b = Object.assign(document.createElement('button'), { type: 'button', textContent: p.label, title: p.title || p.instr });
     if (p.cls) b.classList.add(p.cls);
-    if (p.mode === 'comment') b.classList.add('comment');
-    b.onclick = () => submitAsk(p.instr, p.mode || 'replace', p.label);
+    b.onclick = () => submitAsk(p.instr);
     box.appendChild(b);
   }
 }
 
-// Ask the server to make the session that holds this document before the first card needs
-// it (the server keeps one per document version, so an unchanged document is skipped).
-let prepared = null;
-function prepareAsk() {
-  if (!askConf.available || !cur.path) return;
-  const body = { path: cur.path, doc: cm.getValue(), model: $('#model').value };
-  if (prepared && ['path', 'doc', 'model'].every(k => prepared[k] === body[k])) return;
-  prepared = body;
-  api('POST', '/api/ask/prepare', body).catch(() => { if (prepared === body) prepared = null; });
-}
-
-// Ask Claude can't run (see askConf.reason): show why on the Suggestions tab.
+// Ask Claude can't run (the terminal is off, see askConf.reason): show the panel, which says why.
 function showAskUnavailable() {
-  showClaudePanel();
-  setPanelTab('suggestions', false);
-  renderCards();
-  cm.refresh();
+  App.showTerminal();
+  UI.toast(`Ask Claude needs the Claude terminal, which is unavailable: ${askConf.reason || 'unknown reason.'}`, { kind: 'err', ms: 6000 });
 }
 
 function openAsk(source, focus) {
   if (!askConf.available) { if (focus) showAskUnavailable(); return; }
   if (!cur.model) return;
-  prepareAsk();
-  askTarget = currentRange(source);
+  askTarget = Object.assign(currentRange(source), { model: cur.model });
   if (source !== 'preview') previewRange = null;
   const bar = $('#askbar');
   bar.hidden = false;
   bar.classList.toggle('whole', !!askTarget.whole);
   $('#ask-input').placeholder = askTarget.whole
-    ? 'Nothing selected: ask Claude about the whole document… (Enter)'
-    : 'Ask Claude to… (Enter to send · end with ? for a comment · Esc closes)';
+    ? 'Nothing selected: ask Claude about the whole file… (Enter sends it to the Claude terminal)'
+    : 'Ask Claude… (Enter sends it to the Claude terminal, Esc closes)';
   let x, y;
   const sel = window.getSelection();
   if (source === 'preview' && sel.rangeCount && !sel.isCollapsed) {
@@ -537,7 +529,7 @@ $('#ask-form').onsubmit = e => {
   e.preventDefault();
   const v = $('#ask-input').value.trim();
   if (!v) return;
-  submitAsk(v, v.endsWith('?') ? 'comment' : 'replace', v);
+  submitAsk(v);
   $('#ask-input').value = '';
 };
 $('#ask-input').addEventListener('keydown', e => { if (e.key === 'Escape') closeAsk(); });
@@ -552,251 +544,27 @@ document.addEventListener('keydown', e => {
   if (e.key === 'Escape' && !$('#askbar').hidden) closeAsk();
 });
 
-function submitAsk(instr, mode, label) {
+// The question goes to the Claude session, with the selection (or the whole file). A file with
+// unsaved changes is saved first, so Claude reads what is on screen.
+async function submitAsk(instr) {
   if (!askTarget) return;
   const t = askTarget;
   closeAsk();
   if (!cm.hasFocus()) window.getSelection().removeAllRanges();
-  createCard({ from: t.from, to: t.to, whole: !!t.whole, instruction: instr, mode, label });
-}
-
-// ------------------------------------------------------------------ Claude cards
-
-// Cards belong to their file's model: the marks live on its Doc, so a card keeps tracking its
-// passage (and Accept works) while another tab is active.
-function markCard(c, cls) {
-  const doc = c.model.doc;
-  const r = c.marker?.find();
-  c.marker?.clear();
-  if (!r && c.marker) { c.marker = null; return; }
-  const from = r ? r.from : doc.posFromIndex(c.from), to = r ? r.to : doc.posFromIndex(c.to);
-  c.marker = doc.markText(from, to, { className: `claude-mark ${cls} card-${c.id}`, clearWhenEmpty: false, inclusiveLeft: false, inclusiveRight: false });
-}
-
-function createCard({ model = cur.model, from, to, whole, instruction, mode, label }) {
-  if (!model) return;
-  const c = { id: ++cardSeq, model, from, to, whole, instruction, mode, label, status: 'pending', original: model.doc.getValue().slice(from, to), result: '', view: 'diff' };
-  markCard(c, 'pending');
-  cards.unshift(c);
-  // a card lives as long as its file is open: keep a preview tab from being replaced under it
-  for (const t of Tabs.list()) if (t.model === model && t.preview) Tabs.pin(t);
-  showClaudePanel();
-  setPanelTab('suggestions', false);   // cards don't outlive a reload, so the remembered tab stays
-  run(c);
-}
-
-async function run(c, feedback) {
-  const r = c.marker?.find();
-  if (!r) { c.status = 'error'; c.error = 'The highlighted text was deleted.'; renderCards(); return; }
-  const doc = c.model.doc.getValue();
-  const start = c.model.doc.indexFromPos(r.from), end = c.model.doc.indexFromPos(r.to);
-  c.original = doc.slice(start, end);
-  c.status = 'pending';
-  c.started = Date.now();
-  c.error = null;
-  markCard(c, 'pending');
-  renderCards();
-  highlightPreviewCards();
-  const body = {
-    path: c.model.path, doc, start, end, mode: c.mode, model: $('#model').value,
-    instruction: feedback || c.instruction,
-  };
-  if (feedback && c.result) body.previous = c.result;
-  if (feedback === null && c.result) {   // Retry
-    body.instruction = c.instruction + '\n\n(Give a noticeably different version from the previous attempt.)';
-    body.previous = c.result;
+  const m = t.model;
+  if (!m || Tabs.model(m.path) !== m) return;
+  const name = UI.basename(m.path);
+  if (m.dirty) {
+    if (await Tabs.save(m)) UI.toast(`Saved ${name} first, so that Claude reads what you see.`, { kind: 'ok' });
+    else UI.toast(`${name} could not be saved: Claude will read the version on disk.`, { kind: 'err' });
   }
-  if (body.previous && c.session) body.session = c.session;   // the server forks the card's session
-  try {
-    const res = await api('POST', '/api/ask', body);
-    if (c.status === 'cancelled') return;
-    c.session = res.session || null;
-    if (c.mode === 'replace') {
-      const lead = c.original.match(/^\s*/)[0], trail = c.original.match(/\s*$/)[0];
-      c.result = lead + res.result.trim() + trail;
-    } else c.result = res.result.trim();
-    c.meta = `${res.seconds}s${res.cost ? ` · $${res.cost.toFixed(3)}` : ''}`;
-    c.status = 'ready';
-    c.view = 'diff';
-    if (feedback) c.history = [...(c.history || []), feedback];
-    markCard(c, 'ready');
-  } catch (e) {
-    if (c.status === 'cancelled') return;
-    c.status = 'error';
-    c.error = e.message;
-    markCard(c, 'error');
-  }
-  renderCards();
-  highlightPreviewCards();
-}
-
-function finish(c, status) {
-  c.status = status;
-  c.marker?.clear();
-  c.marker = null;
-  renderCards();
-  highlightPreviewCards();
-}
-
-function accept(c) {
-  const r = c.marker?.find();
-  if (!r) { c.status = 'error'; c.error = 'The highlighted text was deleted, so there is nowhere to put the result.'; renderCards(); return; }
-  const text = c.editing ?? c.result;
-  const doc = c.model.doc;
-  doc.replaceRange(text, r.from, r.to, '+claude');
-  const end = doc.posFromIndex(doc.indexFromPos(r.from) + text.length);
-  const m = doc.markText(r.from, end, { className: 'accepted-flash' });
-  setTimeout(() => m.clear(), 2000);
-  c.editing = undefined;
-  finish(c, 'accepted');
-}
-
-function renderCards() {
-  const open = cards.filter(c => ['pending', 'ready'].includes(c.status)).length;
-  $('#cards-count').textContent = open;
-  $('#cards-count').hidden = !open;
-  const box = $('#cards');
-  box.replaceChildren();
-  if (!cards.length) {
-    box.innerHTML = askConf.available
-      ? `<p class="muted hint">Highlight text in the editor or the preview, then pick an action from the pop-up (or press <kbd>Ctrl</kbd>+<kbd>J</kbd>). With nothing selected, the request applies to the whole document.</p>`
-      : `<div class="muted hint"><p><strong>Ask Claude unavailable</strong></p><p>${esc(askConf.reason || 'unknown reason.')}</p>
-         <p>Choose how it runs with <code>md-editor --ask-agent CMD</code> (or the <code>MDEDIT_ASK_AGENT</code> environment variable).</p></div>`;
-    return;
-  }
-  for (const c of cards) box.appendChild(cardEl(c));
-}
-
-function cardEl(c) {
-  const el = document.createElement('div');
-  el.className = `card ${c.status} ${c.mode}`;
-  const excerpt = c.whole ? 'Whole document' : c.original.trim().replace(/\s+/g, ' ');
-  const statusText = { pending: 'Thinking…', ready: c.mode === 'comment' ? 'Comment' : 'Suggestion', accepted: 'Accepted', kept: 'Kept original', dismissed: 'Dismissed', error: 'Error', cancelled: 'Cancelled' }[c.status];
-  el.innerHTML = `
-    <div class="card-head">
-      <span class="badge">${statusText}</span>
-      <span class="card-label" title="${esc(c.instruction)}">${esc(c.label)}</span>
-      <span class="card-file muted" title="${esc(c.model.path)}">${esc(c.model.path.split('/').pop())}</span>
-      <span class="muted card-meta">${c.status === 'pending' ? '<span class="spinner"></span>' : esc(c.meta || '')}</span>
-    </div>
-    <div class="card-excerpt muted" title="Click to show in the editor">“${esc(excerpt.length > 140 ? excerpt.slice(0, 140) + '…' : excerpt)}”</div>
-    ${(c.history || []).length ? `<div class="card-history muted">↳ ${c.history.map(esc).join('<br>↳ ')}</div>` : ''}
-    <div class="card-body"></div>
-    <div class="card-actions"></div>`;
-  const body = el.querySelector('.card-body');
-  const actions = el.querySelector('.card-actions');
-  const btn = (label, fn, cls = '') => {
-    const b = Object.assign(document.createElement('button'), { textContent: label, className: cls });
-    b.onclick = fn;
-    actions.appendChild(b);
-    return b;
-  };
-
-  if (c.status === 'error') body.innerHTML = `<div class="err">${esc(c.error)}</div>`;
-
-  if (c.status === 'pending') {
-    btn('Cancel', () => finish(c, 'cancelled'));
-  } else if (c.status === 'ready' && c.mode === 'replace') {
-    const tabs = document.createElement('div');
-    tabs.className = 'seg small';
-    for (const [v, t] of [['diff', 'Changes'], ['render', 'Preview'], ['edit', 'Edit']]) {
-      const b = Object.assign(document.createElement('button'), { textContent: t, className: c.view === v ? 'on' : '' });
-      b.onclick = () => { c.view = v; if (v === 'edit' && c.editing === undefined) c.editing = c.result; renderCards(); };
-      tabs.appendChild(b);
-    }
-    body.appendChild(tabs);
-    const view = document.createElement('div');
-    view.className = 'card-view';
-    if (c.view === 'diff') view.innerHTML = `<div class="diff">${wordDiff(c.original, c.editing ?? c.result)}</div>`;
-    else if (c.view === 'render') { view.className += ' markdown-body'; MD.render(c.editing ?? c.result, view); }
-    else {
-      const ta = Object.assign(document.createElement('textarea'), { value: c.editing ?? c.result });
-      ta.rows = Math.min(16, (c.editing ?? c.result).split('\n').length + 2);
-      ta.oninput = () => { c.editing = ta.value; };
-      view.appendChild(ta);
-    }
-    body.appendChild(view);
-    const r = c.marker?.find();
-    if (r && c.model.doc.getRange(r.from, r.to) !== c.original) {
-      body.insertAdjacentHTML('beforeend', '<div class="warn">The highlighted text has been edited since this was requested; Accept will overwrite those edits.</div>');
-    }
-    btn('Accept', () => accept(c), 'primary');
-    btn('Keep original', () => finish(c, 'kept'));
-    btn('Retry', () => run(c, null));
-  } else if (c.status === 'ready' && c.mode === 'comment') {
-    const view = document.createElement('div');
-    view.className = 'card-view markdown-body';
-    MD.render(c.result, view);
-    body.appendChild(view);
-    btn('Apply this feedback', () => {
-      const r = c.marker?.find();
-      if (!r) return;
-      finish(c, 'dismissed');
-      createCard({ model: c.model, from: c.model.doc.indexFromPos(r.from), to: c.model.doc.indexFromPos(r.to), whole: c.whole, mode: 'replace', label: 'Apply feedback',
-        instruction: `Revise this passage to address the following feedback:\n\n${c.result}` });
-    }, 'primary');
-    btn('Dismiss', () => finish(c, 'dismissed'));
-  } else if (c.status === 'error') {
-    btn('Retry', () => run(c));
-    btn('Dismiss', () => finish(c, 'dismissed'));
-  }
-
-  if (c.status === 'ready') {
-    const f = document.createElement('form');
-    f.className = 'refine';
-    f.innerHTML = `<input placeholder="${c.mode === 'comment' ? 'Follow-up question…' : 'Refine: e.g. shorter, keep the first sentence…'}">`;
-    f.onsubmit = e => { e.preventDefault(); const v = f.firstChild.value.trim(); if (v) run(c, v); };
-    el.appendChild(f);
-  }
-
-  el.querySelector('.card-excerpt').onclick = async () => {
-    if (!c.marker?.find()) return;
-    if (cur.model !== c.model) await Tabs.open(c.model.path, { preview: false });
-    const r = c.marker?.find();
-    if (!r || cur.model !== c.model) return;
-    cm.setSelection(r.from, r.to);
-    cm.scrollIntoView({ from: r.from, to: r.to }, 80);
-    cm.focus();
-  };
-  el.onmouseenter = () => document.querySelectorAll(`.card-${c.id}`).forEach(n => n.classList.add('focus'));
-  el.onmouseleave = () => document.querySelectorAll(`.card-${c.id}`).forEach(n => n.classList.remove('focus'));
-  return el;
-}
-
-$('#clear-cards').onclick = () => {
-  cards = cards.filter(c => ['pending', 'ready'].includes(c.status));
-  renderCards();
-};
-
-// a closed file takes its cards with it
-Tabs.on('dispose', m => {
-  const gone = cards.filter(c => c.model === m);
-  if (!gone.length) return;
-  for (const c of gone) { c.status = 'cancelled'; c.marker?.clear(); c.marker = null; }
-  cards = cards.filter(c => c.model !== m);
-  renderCards();
-});
-
-// Word-level diff (LCS) rendered as <del>/<ins>.
-function wordDiff(a, b) {
-  const tok = s => s.match(/\s+|[\p{L}\p{N}'’]+|[^\s\p{L}\p{N}]/gu) || [];
-  const A = tok(a), B = tok(b), n = A.length, m = B.length;
-  if (n * m > 4e6) return `<del>${esc(a)}</del><ins>${esc(b)}</ins>`;
-  const dp = new Uint32Array((n + 1) * (m + 1));
-  for (let i = n - 1; i >= 0; i--)
-    for (let j = m - 1; j >= 0; j--)
-      dp[i * (m + 1) + j] = A[i] === B[j] ? dp[(i + 1) * (m + 1) + j + 1] + 1 : Math.max(dp[(i + 1) * (m + 1) + j], dp[i * (m + 1) + j + 1]);
-  const out = [];
-  let i = 0, j = 0;
-  const push = (t, s) => { const l = out.at(-1); if (l && l[0] === t) l[1] += s; else out.push([t, s]); };
-  while (i < n && j < m) {
-    if (A[i] === B[j]) { push('=', A[i]); i++; j++; }
-    else if (dp[(i + 1) * (m + 1) + j] >= dp[i * (m + 1) + j + 1]) push('-', A[i++]);
-    else push('+', B[j++]);
-  }
-  while (i < n) push('-', A[i++]);
-  while (j < m) push('+', B[j++]);
-  return out.map(([t, s]) => t === '=' ? esc(s) : t === '-' ? `<del>${esc(s)}</del>` : `<ins>${esc(s)}</ins>`).join('');
+  const doc = m.doc;
+  const len = doc.getValue().length;
+  const from = doc.posFromIndex(Math.min(t.from, len)), to = doc.posFromIndex(Math.min(t.to, len));
+  const sel = t.whole
+    ? { path: m.path, start: lspPos(doc.getCursor()), end: lspPos(doc.getCursor()), text: '' }
+    : { path: m.path, start: lspPos(from), end: lspPos(to), text: doc.getRange(from, to) };
+  Term.ask(instr, sel);
 }
 
 // ------------------------------------------------------------------ file browser
@@ -871,7 +639,7 @@ async function switchRoot(path) {
   catch (e) { $('#browser-msg').textContent = e.message; $('#browser-msg').className = 'err'; return; }
   $('#browser').hidden = true;
   UI.stat.bump();
-  Tabs.closeAll();   // Ask Claude cards go with their files
+  Tabs.closeAll();
   setRoot(r.root);
   fileList = r.files;
   await Tabs.restore();
@@ -919,7 +687,7 @@ async function exportPdf() {
   btn.disabled = true;
   setSaveState('Exporting PDF…');
   try {
-    // render a clean light-theme copy so dark mode and Claude highlights stay out of the PDF
+    // render a clean light-theme copy so dark mode stays out of the PDF
     const wasDark = document.documentElement.dataset.theme === 'dark';
     if (wasDark) MD.initMermaid(false);
     const box = document.createElement('div');
@@ -984,8 +752,6 @@ function setTheme(dark) {
   UI.emit('theme', dark);
 }
 $('#theme').onclick = () => setTheme(document.documentElement.dataset.theme !== 'dark');
-$('#model').value = store.get('mdedit.model', '');
-$('#model').onchange = () => store.set('mdedit.model', $('#model').value);
 
 // unsaved files: autosaved ones are saved now, and the browser asks before leaving
 window.addEventListener('beforeunload', e => {
@@ -995,36 +761,18 @@ window.addEventListener('beforeunload', e => {
   e.returnValue = '';
 });
 
-// ------------------------------------------------------------------ Claude panel: tabs and width
+// ------------------------------------------------------------------ Claude panel: the terminal and its width
 
 const panel = $('#claude');
 
-// 'terminal' (Claude Code, term.js) or 'suggestions' (the Ask Claude cards)
-function setPanelTab(tab, persist = true) {
-  if (tab !== 'terminal') tab = 'suggestions';
-  panel.dataset.tab = tab;
-  for (const b of document.querySelectorAll('#panel-tabs .tab')) {
-    b.classList.toggle('on', b.dataset.tab === tab);
-    b.setAttribute('aria-selected', b.dataset.tab === tab ? 'true' : 'false');
-  }
-  if (persist) store.set('mdedit.panelTab', tab);
-  Term.visible();
-}
-document.querySelectorAll('#panel-tabs .tab').forEach(b => b.onclick = () => {
-  setPanelTab(b.dataset.tab);
-  if (b.dataset.tab === 'terminal') Term.focus();
-});
-setPanelTab(store.get('mdedit.panelTab', 'terminal'), false);
-
-// for the other modules (ui.js: Send to Claude terminal)
+// for the other modules (term.js: Ask Claude and Send to Claude terminal show the panel)
 window.App = {
   cm,
   showTerminal() {
     showClaudePanel();
-    setPanelTab('terminal');
     cm.refresh();
+    Term.visible();
   },
-  setPanelTab,
 };
 
 const PANEL_MIN = 280;
@@ -1085,18 +833,17 @@ $('#panel-resize').addEventListener('dblclick', () => {
   fitColumns();
 
   const conf = await api('GET', '/api/config');
-  skills = conf.skills;
+  skills = conf.skills || [];
   fileList = conf.files;
   Term.init(conf.agent);
-  askConf = conf.ask || { available: false, reason: 'This md-editor server has no Ask Claude support.' };
+  const agentOk = !!conf.agent?.available;
+  askConf = { available: agentOk, reason: conf.agent?.reason || 'this md-editor server has no terminal support.' };
   const askBtn = $('#toolbar [data-cmd="ask"]');
   askBtn.disabled = !askConf.available || !cur.model;
-  askBtn.title = askConf.available ? `Ask Claude about the selection (Ctrl+J), via ${askConf.cmd}` : `Ask Claude unavailable: ${askConf.reason}`;
-  renderCards();
-  const agentOk = !!conf.agent?.available;
-  $('#tab-terminal').title = agentOk ? `Claude Code (${conf.agent.cmd}) in the open folder` : 'Claude Code terminal (unavailable)';
+  askBtn.title = askConf.available ? 'Ask Claude about the selection, in the Claude terminal (Ctrl+J)' : `Ask Claude unavailable: ${askConf.reason}`;
+  $('#panel-title').title = agentOk ? `Claude Code (${conf.agent.cmd}) in the open folder` : 'Claude Code terminal (unavailable)';
   setRoot(conf.root);
-  setPanelTab(agentOk ? store.get('mdedit.panelTab', 'terminal') : 'suggestions', false);
+  Term.visible();   // starts the terminal if the panel is on screen
   buildPresets();
   // read before the remembered tabs come back: activating one rewrites the URL
   let fromHash = '';
